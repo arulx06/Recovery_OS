@@ -35,10 +35,11 @@ import os
 import random
 import sys
 from collections import Counter
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
-os.environ.setdefault("DATABASE_URL", "sqlite:///./policy_eval.db")
+os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # Same realistic failure-type mix as scripts/run_synthetic_batch.py, so the
@@ -68,6 +69,7 @@ def run(count: int, seed: int):
     from app.models import RevenueCase
     from app.services import policy_engine, ml_policy
     from app.ml import ground_truth, scorer
+    from app.ml.costs import ACTION_COST
 
     try:
         scorer._load()  # fail fast with a clear message if untrained
@@ -83,6 +85,8 @@ def run(count: int, seed: int):
     revenue = {"baseline": {"at_risk": 0.0, "recovered": 0.0}, "ml": {"at_risk": 0.0, "recovered": 0.0}}
     contacts = {"baseline": 0, "ml": 0}
     escalations = {"baseline": 0, "ml": 0}
+    action_costs = {"baseline": 0.0, "ml": 0.0}
+    evaluation_time = datetime(2026, 1, 7, 12, 0, 0)
 
     CONTACT_ACTIONS = policy_engine.CONTACT_ACTIONS
 
@@ -114,7 +118,7 @@ def run(count: int, seed: int):
             db.add(case)
             db.flush()
 
-            decision = decide_fn(db, case)
+            decision = decide_fn(db, case, now=evaluation_time)
             action = decision.chosen_action
             chosen_actions[arm] = action
 
@@ -130,6 +134,7 @@ def run(count: int, seed: int):
             if recovered:
                 revenue[arm]["recovered"] += float(amount)
             results[arm][action] += 1
+            action_costs[arm] += ACTION_COST[action]
             if action in CONTACT_ACTIONS:
                 contacts[arm] += 1
             if action == "ESCALATE":
@@ -137,9 +142,10 @@ def run(count: int, seed: int):
 
     db.commit()
     db.close()
+    engine.dispose()
 
     print(f"Ran {count} matched scenarios per policy (seed={seed})")
-    print("SYNTHETIC SIMULATION BENCHMARK — not production Razorpay lift.\n")
+    print("SYNTHETIC SIMULATION BENCHMARK - not production Razorpay lift.\n")
 
     print(f"{'Metric':<28}{'Baseline':>14}{'ML / Adaptive':>16}")
     print("-" * 58)
@@ -152,16 +158,18 @@ def run(count: int, seed: int):
     def row(label, b, m, fmt="{:,.0f}"):
         print(f"{label:<28}{fmt.format(b):>14}{fmt.format(m):>16}")
 
-    row("Revenue at risk (₹)", at_risk_b, at_risk_m)
-    row("Revenue recovered (₹)", rec_b, rec_m)
+    row("Revenue at risk (INR)", at_risk_b, at_risk_m)
+    row("Revenue recovered (INR)", rec_b, rec_m)
     row("Recovery rate", rec_b / at_risk_b * 100 if at_risk_b else 0, rec_m / at_risk_m * 100 if at_risk_m else 0, fmt="{:.1f}%")
-    row("Customer contacts", contacts["baseline"], contacts["ml"], fmt="{:d}")
+    row("Contact actions selected", contacts["baseline"], contacts["ml"], fmt="{:d}")
     row("Escalations", escalations["baseline"], escalations["ml"], fmt="{:d}")
+    row("Action cost proxy (INR)", action_costs["baseline"], action_costs["ml"])
+    row("Realized net value (INR)", rec_b - action_costs["baseline"], rec_m - action_costs["ml"])
 
     incremental = rec_m - rec_b
     print("-" * 58)
     sign = "+" if incremental >= 0 else ""
-    print(f"{'Incremental recovered (₹)':<28}{'':<14}{sign}{incremental:,.0f}")
+    print(f"{'Incremental recovered (INR)':<28}{'':<14}{sign}{incremental:,.0f}")
 
     print("\nAction distribution:")
     all_actions = sorted(set(results['baseline']) | set(results['ml']))

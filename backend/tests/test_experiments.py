@@ -3,35 +3,17 @@ import pytest
 from app.core.database import SessionLocal
 from app.models import ExperimentCase
 from app.services import experiment_runner
-from app.ml import train as train_module, scorer
+from app.ml import scorer
 
 
 @pytest.fixture(scope="module", autouse=True)
-def trained_model():
-    """These tests need a real trained model for ml_policy.decide_ml to
-    score against — train a small one for speed, restore whatever was
-    there afterward (same pattern as test_ml_policy.py)."""
-    import shutil
-    from pathlib import Path
-    backup_dir = Path(train_module.MODEL_PATH).parent / "_test_backup"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    backup_path = backup_dir / "model.joblib"
-    had_existing = train_module.MODEL_PATH.exists()
-    if had_existing:
-        shutil.copy(train_module.MODEL_PATH, backup_path)
-
-    train_module.train(n=6000, seed=42, save=True)
+def trained_model(trained_model_path):
+    original_path = scorer.MODEL_PATH
+    scorer.MODEL_PATH = trained_model_path
     scorer.reset_cache()
-
     yield
-
-    if had_existing:
-        shutil.copy(backup_path, train_module.MODEL_PATH)
-    else:
-        train_module.MODEL_PATH.unlink(missing_ok=True)
     scorer.reset_cache()
-    backup_path.unlink(missing_ok=True)
-    backup_dir.rmdir()
+    scorer.MODEL_PATH = original_path
 
 
 @pytest.fixture
@@ -87,6 +69,7 @@ def test_summary_shape(db_session):
     summary = experiment_runner.summarize_run(db_session, run_id)
 
     assert summary["case_count"] == 30
+    assert summary["scenario_count"] == 15
     for arm in ("baseline", "adaptive"):
         arm_summary = summary["arms"][arm]
         assert arm_summary["cases"] == 15
@@ -94,6 +77,9 @@ def test_summary_shape(db_session):
         assert 0.0 <= arm_summary["recovery_rate"] <= 1.0
         assert isinstance(arm_summary["action_distribution"], dict)
         assert sum(arm_summary["action_distribution"].values()) == 15
+        assert arm_summary["realized_net_value"] == pytest.approx(
+            arm_summary["amount_recovered"] - arm_summary["action_cost_proxy"]
+        )
 
     assert summary["incremental_recovered"] == (
         summary["arms"]["adaptive"]["amount_recovered"] - summary["arms"]["baseline"]["amount_recovered"]
@@ -108,6 +94,7 @@ def test_post_experiments_runs_and_returns_summary(client):
     body = resp.json()
     assert body["found"] is True
     assert body["case_count"] == 24
+    assert body["scenario_count"] == 12
 
 
 def test_post_experiments_rejects_count_out_of_range(client):
@@ -155,3 +142,15 @@ def test_export_csv_has_one_row_per_case(client):
 def test_export_csv_missing_run_404s(client):
     resp = client.get("/experiments/does-not-exist/export.csv")
     assert resp.status_code == 404
+
+
+def test_post_experiments_rejects_missing_model_without_persisting(client, monkeypatch):
+    def missing_model(*args, **kwargs):
+        raise scorer.ModelNotTrainedError("model unavailable for test")
+
+    monkeypatch.setattr(scorer, "_load", missing_model)
+    resp = client.post("/experiments", json={"count": 5, "seed": 1})
+    assert resp.status_code == 503
+
+    with SessionLocal() as db:
+        assert db.query(ExperimentCase).count() == 0

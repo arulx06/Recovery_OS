@@ -6,9 +6,9 @@ function formatRupees(n: number): string {
   return `₹${n.toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
 }
 
-function ArmCard({ label, arm, highlight }: { label: string; arm: ArmSummary; highlight?: boolean }) {
+function ArmCard({ label, arm }: { label: string; arm: ArmSummary }) {
   return (
-    <div className={`rounded-xl border p-4 ${highlight ? "border-emerald-700 bg-emerald-950/30" : "border-white/10 bg-white/5"}`}>
+    <div className="rounded-xl border border-white/10 bg-white/5 p-4">
       <div className="mb-3 flex items-center justify-between">
         <h3 className="text-sm font-medium">{label}</h3>
         <span className="text-xs text-gray-500">{arm.cases} cases</span>
@@ -20,10 +20,14 @@ function ArmCard({ label, arm, highlight }: { label: string; arm: ArmSummary; hi
         <dd className="text-right font-semibold">{formatRupees(arm.amount_recovered)}</dd>
         <dt className="text-gray-500">Recovery rate</dt>
         <dd className="text-right">{(arm.recovery_rate * 100).toFixed(1)}%</dd>
-        <dt className="text-gray-500">Contacts</dt>
+        <dt className="text-gray-500">Contact actions selected</dt>
         <dd className="text-right">{arm.contacts}</dd>
         <dt className="text-gray-500">Escalations</dt>
         <dd className="text-right">{arm.escalations}</dd>
+        <dt className="text-gray-500">Action cost proxy</dt>
+        <dd className="text-right">{formatRupees(arm.action_cost_proxy)}</dd>
+        <dt className="text-gray-500">Realized net value</dt>
+        <dd className="text-right">{formatRupees(arm.realized_net_value)}</dd>
       </dl>
       <div className="mt-3 border-t border-white/10 pt-3">
         <div className="mb-1 text-xs uppercase tracking-wide text-gray-500">Action distribution</div>
@@ -117,7 +121,7 @@ export default function ExperimentPanel() {
           <div>
             <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
               <div className="text-sm">
-                Incremental recovered:{" "}
+                Incremental gross recovered (synthetic):{" "}
                 <span className={result.incremental_recovered >= 0 ? "font-semibold text-emerald-400" : "font-semibold text-red-400"}>
                   {result.incremental_recovered >= 0 ? "+" : ""}
                   {formatRupees(result.incremental_recovered)}
@@ -134,7 +138,7 @@ export default function ExperimentPanel() {
 
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               <ArmCard label="Baseline (fixed policy)" arm={result.arms.baseline} />
-              <ArmCard label="Adaptive (ML policy)" arm={result.arms.adaptive} highlight={result.incremental_recovered >= 0} />
+              <ArmCard label="Adaptive (ML policy)" arm={result.arms.adaptive} />
             </div>
 
             <div className="mt-3 text-right text-[10px] text-gray-600">run_id: {result.run_id}</div>

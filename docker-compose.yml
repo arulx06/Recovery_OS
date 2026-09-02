@@ -1,6 +1,5 @@
-version: "3.9"
-
-# Day 1: just the two stateful services the backend needs locally.
+# Local development services. PostgreSQL is required; Redis is reserved for
+# future scheduling work and is not used by the current application runtime.
 # The backend and frontend run with `uvicorn` / `npm run dev` directly
 # during development — no need to containerize them yet.
 

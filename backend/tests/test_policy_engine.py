@@ -1,9 +1,10 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
 
 from app.core.database import SessionLocal
+from app.core.time import utc_now
 from app.models import RevenueCase, Action
 from app.services import policy_engine
 
@@ -87,7 +88,7 @@ def test_wait_is_unaffected_by_amount_cap(db_session):
 def test_max_contacts_per_case_blocks_further_contact(db_session):
     case = make_case(db_session, failure_category="CUSTOMER_AUTHENTICATION", amount=Decimal("500"))
     config = policy_engine.GuardrailConfig(max_contacts_per_case=2)
-    now = datetime.utcnow()
+    now = utc_now()
 
     # Seed 2 prior contact actions directly (simulating history from earlier decisions).
     for i in range(2):
@@ -106,7 +107,7 @@ def test_max_contacts_per_case_blocks_further_contact(db_session):
 def test_max_contacts_per_7_days_blocks_further_contact(db_session):
     case = make_case(db_session, failure_category="MANDATE_ISSUE", amount=Decimal("500"))
     config = policy_engine.GuardrailConfig(max_contacts_per_case=10, max_contacts_per_7_days=1)
-    now = datetime.utcnow()
+    now = utc_now()
 
     db_session.add(Action(
         revenue_case_id=case.id, action_type="CONTACT_CUSTOMER",
@@ -122,7 +123,7 @@ def test_max_contacts_per_7_days_blocks_further_contact(db_session):
 def test_cooldown_blocks_contact_too_soon_after_last_one(db_session):
     case = make_case(db_session, failure_category="CUSTOMER_AUTHENTICATION", amount=Decimal("500"))
     config = policy_engine.GuardrailConfig(min_contact_interval_hours=12)
-    now = datetime.utcnow()
+    now = utc_now()
 
     db_session.add(Action(
         revenue_case_id=case.id, action_type="CONTACT_CUSTOMER",
@@ -138,7 +139,7 @@ def test_cooldown_blocks_contact_too_soon_after_last_one(db_session):
 def test_cooldown_clears_after_interval_elapses(db_session):
     case = make_case(db_session, failure_category="CUSTOMER_AUTHENTICATION", amount=Decimal("500"))
     config = policy_engine.GuardrailConfig(min_contact_interval_hours=12)
-    now = datetime.utcnow()
+    now = utc_now()
 
     db_session.add(Action(
         revenue_case_id=case.id, action_type="CONTACT_CUSTOMER",

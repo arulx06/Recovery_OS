@@ -106,6 +106,7 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
             {
                 "id": d.id,
                 "chosen_action": d.chosen_action,
+                "expected_value": float(d.expected_value) if d.expected_value is not None else None,
                 "alternatives": d.alternatives,
                 "guardrails_applied": d.guardrails_applied,
                 "explanation": d.explanation,

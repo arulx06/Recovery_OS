@@ -52,7 +52,7 @@ export default function App() {
           <h1 className="text-2xl font-semibold tracking-tight">RecoveryOS</h1>
           <p className="mt-1 max-w-2xl text-sm text-gray-400">
             Adaptive revenue recovery controller for Razorpay. When a payment fails,
-            RecoveryOS decides whether to wait, retry, contact the customer, send a
+            RecoveryOS decides whether to wait for a native retry, contact the customer, send a
             payment link, collect a promise-to-pay, escalate — or deliberately do
             nothing — and measures which decisions actually recover the most money
             with the least customer friction.

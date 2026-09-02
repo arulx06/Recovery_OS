@@ -9,11 +9,9 @@ app/services/ptp_followup.py for what "processing" means.
 Usage:
     python scripts/process_followups.py
 """
-import os
 import sys
 from pathlib import Path
 
-os.environ.setdefault("DATABASE_URL", "sqlite:///./recoveryos.db")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.database import SessionLocal

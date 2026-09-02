@@ -2,7 +2,7 @@
 
 ## One-line pitch
 
-When a Razorpay payment fails, RecoveryOS decides whether to wait, retry,
+When a Razorpay payment fails, RecoveryOS decides whether to wait for a native retry,
 contact the customer, send a payment link, collect a promise-to-pay,
 escalate — or do nothing — and measures which decisions recover the most
 money with the least customer friction.
@@ -23,7 +23,7 @@ Razorpay Test Mode (payments / subscriptions)
 ┌───────────────────────────────────────────────────────────┐
 │                     FastAPI application                    │
 │                                                              │
-│  Webhook Gateway (verify signature, dedupe, order events)  │
+│  Webhook Gateway (verify signature, require ID, dedupe)    │
 │                │                                             │
 │                ▼                                             │
 │  Recovery Case Orchestrator ──▶ Failure Intelligence Engine │
@@ -33,22 +33,21 @@ Razorpay Test Mode (payments / subscriptions)
 │                     cooldowns, stopping rules)               │
 │                │                                             │
 │                ▼                                             │
-│  Recovery Policy Engine (P(recovery | action, context),     │
-│                            expected value)                   │
+│  Baseline Policy Engine (live webhook path)                 │
+│  Adaptive ML Policy (offline synthetic experiments only)    │
 │                │                                             │
 │                ▼                                             │
 │  Action Executor ─┬─ WAIT                                    │
 │                    ├─ CREATE_PAYMENT_LINK (Razorpay)          │
-│                    ├─ CONTACT_CUSTOMER (LLM dialogue /        │
-│                    │                    PTP extraction)       │
+│                    ├─ CONTACT_CUSTOMER (draft stored only)    │
 │                    ├─ ESCALATE                                │
 │                    └─ STOP                                    │
 └───────────────────────────────────────────────────────────┘
-              │                              │
-              ▼                              ▼
-        PostgreSQL                     Redis + RQ worker
-   (cases, events, decisions,        (scheduled/delayed actions,
-    actions, audit trail)             re-evaluation timers)
+              │
+              ▼
+        PostgreSQL
+   (cases, events, decisions,
+    actions, audit trail)
               │
               ▼
    Measurement / Attribution Engine
@@ -68,15 +67,16 @@ into a structured promise-to-pay, or drafting a compliant outbound message.
 
 ```
 DETECTED → DIAGNOSED → DECISION_READY ─┬─ WAITING (re-evaluate later)
-                                        ├─ ACTION_SCHEDULED → ACTION_EXECUTED → AWAITING_OUTCOME
+                                         ├─ ACTION_SCHEDULED → AWAITING_OUTCOME
                                         ├─ HUMAN_REVIEW
                                         ├─ DISPUTED
                                         ├─ STOPPED
                                         └─ RECOVERED
 ```
 
-All transitions go through the orchestrator — nothing else is allowed to
-mutate `revenue_cases.state` directly.
+State changes are currently performed by the orchestrator, policy engine,
+action executor, ML policy, and manual PTP processor. `ACTION_EXECUTED` is an
+action status, not a persisted case state.
 
 ## Layer responsibilities
 
@@ -87,11 +87,11 @@ mutate `revenue_cases.state` directly.
 | Guardrail Engine | case + merchant policy | Filter to legally/business-allowed actions | No |
 | Recovery Model | context + candidate actions | Estimate P(recovery) / expected value | ML |
 | Policy Engine | predictions + guardrails | Pick the best allowed action | Algorithmic |
-| Communication Agent | chosen action + context | Draft customer-facing message | LLM |
-| PTP Extractor | customer reply | Extract `{amount, date, confidence}` | LLM (structured output) |
+| Communication adapter | chosen action + context | Draft and store a message; no delivery transport | Template or Anthropic LLM |
+| PTP Extractor | customer reply | Extract and validate `{amount, date, confidence}` | Regex heuristic or Anthropic JSON prompt |
 | Outcome Engine | payment events | Determine whether recovery succeeded | No |
 | Attribution Engine | action/outcome history | Compute recovered money, experiment metrics | No |
-| Explanation Layer | model/rules/decision | Human-readable "why this action" | Deterministic + ML explanation |
+| Explanation API | model/rules/decision | Detail at `GET /cases/{id}`; not rendered by the current frontend | Deterministic + ML explanation |
 
 ## Data model (Day 1 schema lock)
 
@@ -121,8 +121,33 @@ See `backend/app/models.py` for the authoritative column-level definitions.
 ## Build order rationale (why this phase order)
 
 Event pipeline → state machine → guardrails → a working recovery action →
-measurement → ML policy → LLM → polish. Each phase depends on the one
+ML policy → LLM → measurement UI. Each phase depends on the one
 before it being trustworthy: there's no point scoring an ML policy against
 input/state semantics that aren't correct yet, and there's no point
 measuring "money recovered" before the policy is stable. See `README.md`
 for the full 14-day phase table.
+
+## Adaptive objective
+
+The offline adaptive policy ranks guardrail-allowed actions by:
+
+`P(recovery | context, action) * amount_at_risk - notional_action_cost`
+
+The current INR 5/15/50 action costs are transparent proxies, not empirically
+calibrated customer-friction values. At normal invoice sizes, recovery
+probability multiplied by amount dominates those costs. This explains why an
+adaptive run can recover more synthetic revenue while also selecting more
+contact-type actions or escalations than the restrained baseline. A contact
+count is an action-selection count, not evidence of message delivery. Experiment
+reports expose both friction counts and realized notional net value. No claim
+is made that the current objective has solved the product's revenue/friction
+tradeoff.
+
+## Delayed-action status
+
+Redis and RQ are reserved dependencies only: there are no queue, worker, or
+scheduler imports in the application. `WAIT` and `WAIT_FOR_NATIVE_RETRY` are
+stored as `SCHEDULED` actions but are not automatically revisited.
+`FOLLOW_UP_PTP` is partially implemented through a due-row processor and is
+manual-only unless an operator invokes `scripts/process_followups.py` from an
+external cron. General delayed re-evaluation is not implemented.

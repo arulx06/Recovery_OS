@@ -15,6 +15,7 @@ persistence and aggregation around calling it.
 """
 import random
 import uuid
+from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
@@ -22,6 +23,8 @@ from sqlalchemy.orm import Session
 from app.models import RevenueCase, ExperimentCase
 from app.services import policy_engine, ml_policy
 from app.ml import ground_truth
+from app.ml import scorer
+from app.ml.costs import ACTION_COST
 
 SCENARIO_PROFILES = [
     ({"failure_category": "INSUFFICIENT_BALANCE"}, 22),
@@ -50,8 +53,10 @@ def run_experiment(db: Session, count: int = 500, seed: int | None = None) -> st
     beyond what SQL aggregation needs.
     """
     seed = seed if seed is not None else random.randrange(2**31)
+    scorer._load()  # fail before persisting a mislabeled adaptive fallback run
     run_id = str(uuid.uuid4())
     rng = random.Random(seed)
+    evaluation_time = datetime(2026, 1, 7, 12, 0, 0)
 
     CONTACT_ACTIONS = policy_engine.CONTACT_ACTIONS
 
@@ -76,7 +81,7 @@ def run_experiment(db: Session, count: int = 500, seed: int | None = None) -> st
             db.add(case)
             db.flush()
 
-            decision = decide_fn(db, case)
+            decision = decide_fn(db, case, now=evaluation_time)
             action = decision.chosen_action
 
             if action not in outcome_cache:
@@ -121,6 +126,7 @@ def summarize_run(db: Session, run_id: str) -> dict:
         "run_id": run_id,
         "found": True,
         "case_count": len(rows),
+        "scenario_count": len(rows) // 2,
         "created_at": min(r.created_at for r in rows).isoformat() if rows else None,
         "arms": {},
     }
@@ -131,6 +137,7 @@ def summarize_run(db: Session, run_id: str) -> dict:
         recovered_amt = sum(float(r.amount_recovered or 0) for r in arm_rows)
         contacts = sum(r.contacts_made or 0 for r in arm_rows)
         escalations = sum(1 for r in arm_rows if r.chosen_action == "ESCALATE")
+        action_cost = sum(ACTION_COST[r.chosen_action] for r in arm_rows if r.chosen_action)
 
         action_dist: dict[str, int] = {}
         for r in arm_rows:
@@ -144,6 +151,8 @@ def summarize_run(db: Session, run_id: str) -> dict:
             "recovery_rate": (recovered_amt / at_risk) if at_risk else 0.0,
             "contacts": contacts,
             "escalations": escalations,
+            "action_cost_proxy": action_cost,
+            "realized_net_value": recovered_amt - action_cost,
             "action_distribution": action_dist,
         }
 

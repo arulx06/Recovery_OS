@@ -11,7 +11,6 @@ Nothing here is a migration substitute — Alembic owns schema changes
 from Phase 1 onward. This file is the source of truth for model shape.
 """
 import uuid
-from datetime import datetime
 
 from sqlalchemy import (
     Column, String, Integer, Numeric, DateTime, ForeignKey, JSON, Boolean, Text
@@ -20,6 +19,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
+from app.core.time import utc_now
 
 
 def gen_uuid():
@@ -33,7 +33,7 @@ class Customer(Base):
     external_ref = Column(String, nullable=True)  # e.g. Razorpay customer id
     name = Column(String, nullable=True)
     contact_channel = Column(String, nullable=True)  # email/phone, simulated
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     revenue_cases = relationship("RevenueCase", back_populates="customer")
 
@@ -65,10 +65,10 @@ class RevenueCase(Base):
 
     state = Column(String, nullable=False, default="DETECTED")
     # DETECTED -> DIAGNOSED -> DECISION_READY -> WAITING / ACTION_SCHEDULED
-    # -> ACTION_EXECUTED -> AWAITING_OUTCOME -> RECOVERED / STOPPED / DISPUTED / HUMAN_REVIEW
+    # -> AWAITING_OUTCOME -> RECOVERED / STOPPED / DISPUTED / HUMAN_REVIEW
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     customer = relationship("Customer", back_populates="revenue_cases")
     events = relationship("PaymentEvent", back_populates="revenue_case")
@@ -89,7 +89,7 @@ class PaymentEvent(Base):
     event_type = Column(String, nullable=False)  # payment.failed, payment.captured, etc.
     raw_payload = Column(JSON, nullable=True)
 
-    received_at = Column(DateTime, default=datetime.utcnow)
+    received_at = Column(DateTime, default=utc_now)
 
     revenue_case = relationship("RevenueCase", back_populates="events")
 
@@ -107,7 +107,7 @@ class Decision(Base):
     guardrails_applied = Column(JSON, nullable=True)
     explanation = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     revenue_case = relationship("RevenueCase", back_populates="decisions")
 
@@ -126,7 +126,7 @@ class Action(Base):
     executed_at = Column(DateTime, nullable=True)
     result = Column(JSON, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     revenue_case = relationship("RevenueCase", back_populates="actions")
 
@@ -142,7 +142,7 @@ class PromiseToPay(Base):
     confidence = Column(Numeric(3, 2), nullable=True)
     status = Column(String, default="PENDING")  # PENDING | KEPT | BROKEN
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     revenue_case = relationship("RevenueCase", back_populates="promises")
 
@@ -158,7 +158,7 @@ class CustomerMessage(Base):
     body = Column(Text, nullable=False)
     extracted = Column(JSON, nullable=True)  # LLM-parsed structured intent, if any
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
 
 class AuditEvent(Base):
@@ -170,7 +170,7 @@ class AuditEvent(Base):
 
     event = Column(String, nullable=False)
     detail = Column(JSON, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     revenue_case = relationship("RevenueCase", back_populates="audit_events")
 
@@ -192,4 +192,4 @@ class ExperimentCase(Base):
     recovered = Column(Boolean, default=False)
     hours_to_recovery = Column(Numeric(6, 2), nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)

@@ -26,6 +26,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.models import RevenueCase, Decision
+from app.core.time import utc_now
 from app.services import policy_engine
 from app.services.policy_engine import GuardrailConfig, DEFAULT_GUARDRAILS, ALL_ACTIONS
 from app.ml import scorer
@@ -51,7 +52,7 @@ def decide_ml(
     if case.state != "DIAGNOSED":
         return None
 
-    now = now or datetime.utcnow()
+    now = now or utc_now()
     case.state = "DECISION_READY"
 
     if policy_engine.attempt_count(db, case) > config.max_total_attempts:
@@ -107,4 +108,7 @@ def decide_ml(
             f"{'no allowed actions passed guardrails' if not allowed_actions else 'model not trained'}."
         )
 
-    return policy_engine.record_decision(db, case, chosen_action, alternatives, explanation, config, now)
+    return policy_engine.record_decision(
+        db, case, chosen_action, alternatives, explanation, config, now,
+        expected_value=top["expected_value"] if ranked else None,
+    )

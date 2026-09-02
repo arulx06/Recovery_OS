@@ -55,7 +55,7 @@ def weighted_profile(rng: random.Random) -> dict:
 
 
 def run(count: int, seed: int):
-    os.environ.setdefault("DATABASE_URL", "sqlite:///./synthetic_batch.db")
+    os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
     os.environ.setdefault("RAZORPAY_WEBHOOK_SECRET", "synthetic_batch_secret")
 
     from app.core.database import Base, engine, SessionLocal
@@ -131,7 +131,7 @@ def run(count: int, seed: int):
             print(f"  - {e}")
         sys.exit(1)
     else:
-        print("No stuck cases, no exceptions, no guardrail violations.")
+        print("No cases left in detection/diagnosis, no exceptions, no guardrail violations.")
 
 
 if __name__ == "__main__":

@@ -25,6 +25,8 @@ export type ArmSummary = {
   recovery_rate: number;
   contacts: number;
   escalations: number;
+  action_cost_proxy: number;
+  realized_net_value: number;
   action_distribution: Record<string, number>;
 };
 

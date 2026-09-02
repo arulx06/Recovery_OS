@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
@@ -40,7 +43,10 @@ jobs:
           node-version: "22"
       - name: Install frontend deps
         working-directory: frontend
-        run: npm install
+        run: npm ci
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
       - name: Build
         working-directory: frontend
         run: npm run build

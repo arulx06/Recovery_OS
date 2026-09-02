@@ -17,6 +17,8 @@ ACTION_COST = {
     "WAIT_FOR_NATIVE_RETRY": 0.0,
     "CREATE_PAYMENT_LINK": 5.0,
     "CONTACT_CUSTOMER": 15.0,
+    # PTP collection uses the same outbound-contact path as CONTACT_CUSTOMER.
+    "COLLECT_PROMISE_TO_PAY": 15.0,
     "ESCALATE": 50.0,
     "STOP": 0.0,
 }

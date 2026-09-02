@@ -7,11 +7,10 @@ update current entity state -> trigger recovery orchestration -> return 200
 
 Two things matter more than they look like they should:
 
-1. We always return 200 once the signature is valid, even if something
-   downstream is degraded — Razorpay retries on non-2xx, and repeated
-   retries of an event we've already stored just get deduped anyway. The
-   one case we return non-200 for is a bad signature, which should never
-   happen from a real Razorpay delivery.
+1. Signature, JSON shape, and event-ID validation fail closed with 400.
+   Accepted duplicate event IDs return 200 without reprocessing. Downstream
+   failures currently return 500 so Razorpay can retry; durable background
+   processing is not implemented yet.
 
 2. Idempotency is enforced at the database level (payment_events.
    razorpay_event_id is unique), not just checked-then-inserted in
@@ -45,8 +44,15 @@ async def razorpay_webhook(request: Request, db: Session = Depends(get_db)):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="malformed JSON body")
 
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="webhook JSON body must be an object")
+
     event_type = payload.get("event", "unknown")
+    if not isinstance(event_type, str) or not event_type:
+        raise HTTPException(status_code=400, detail="webhook event must be a non-empty string")
     razorpay_event_id = request.headers.get("x-razorpay-event-id")
+    if not razorpay_event_id:
+        raise HTTPException(status_code=400, detail="missing x-razorpay-event-id")
 
     payment_event = PaymentEvent(
         razorpay_event_id=razorpay_event_id,

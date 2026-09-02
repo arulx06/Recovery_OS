@@ -1,23 +1,14 @@
 """
 Razorpay Payment Links client (Phase 4).
 
-Real Razorpay test-mode credentials (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET)
-aren't something every environment running this code will have wired in
-yet — a fresh clone, CI, or this repo before someone's pasted in their own
-test keys. Rather than hard-failing the whole recovery pipeline whenever
-credentials are absent, this client falls back to a clearly-labeled local
-simulation: it fabricates a payment-link-shaped response with `simulated:
-True` so the rest of the system (Action.result, the audit trail, the
-dashboard) can show real behavior end to end. The moment real credentials
-are set, it calls the actual API — no code change required, and nothing
-about the simulation path can be mistaken for a live link because every
-caller checks the `simulated` flag before treating a URL as real.
+This client uses a clearly-labeled local simulation unless Razorpay API
+access is explicitly enabled. Credentials alone never activate network
+traffic. Live access is limited to Razorpay Test Mode keys.
 
 This is unlike webhook signature verification, which fails closed when no
 secret is configured — that's a security boundary. This isn't; it's a
 missing integration, so degrading gracefully is the right default.
 """
-import time
 import uuid
 from decimal import Decimal
 from typing import Optional
@@ -48,9 +39,9 @@ def _simulated_payment_link(amount_rupees: Decimal, currency: str, description: 
         "reference_id": reference_id,
         "status": "created",
         "simulated": True,
-        "note": "RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET not configured — this is a local "
-                "simulation, not a real Razorpay Payment Link. Set real test-mode "
-                "credentials to switch to live calls.",
+        "note": "Razorpay API access is disabled - this is a local simulation, not a real "
+                "Payment Link. Set Test Mode credentials and RAZORPAY_API_ENABLED=true "
+                "to enable external calls.",
     }
 
 
@@ -71,8 +62,15 @@ def create_payment_link(
     Returns the Razorpay API response dict (or the simulated equivalent).
     Raises RazorpayAPIError on a live call that fails.
     """
-    if not credentials_configured():
+    if not settings.RAZORPAY_API_ENABLED:
         return _simulated_payment_link(amount_rupees, currency, description, reference_id)
+
+    if not credentials_configured():
+        raise RazorpayAPIError(
+            "Razorpay API access is enabled but RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET are incomplete"
+        )
+    if not settings.RAZORPAY_KEY_ID.startswith("rzp_test_"):
+        raise RazorpayAPIError("RecoveryOS only permits Razorpay Test Mode API keys")
 
     payload = {
         "amount": int(amount_rupees * 100),  # paise

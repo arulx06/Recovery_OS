@@ -2,6 +2,10 @@ import hashlib
 import hmac
 import json
 
+from app.core.config import settings
+from app.core.database import SessionLocal
+from app.models import PaymentEvent, RevenueCase
+
 WEBHOOK_SECRET = "test_webhook_secret"
 
 
@@ -37,6 +41,55 @@ def test_rejects_bad_signature(client):
         headers={"x-razorpay-signature": "not-the-real-signature", "x-razorpay-event-id": "evt_bad"},
     )
     assert resp.status_code == 400
+
+    with SessionLocal() as db:
+        assert db.query(PaymentEvent).count() == 0
+        assert db.query(RevenueCase).count() == 0
+
+
+def test_rejects_when_webhook_secret_is_missing(client, monkeypatch):
+    payload = {"event": "payment.failed", "payload": {}}
+    body = json.dumps(payload).encode()
+    monkeypatch.setattr(settings, "RAZORPAY_WEBHOOK_SECRET", "")
+    resp = client.post(
+        "/webhooks/razorpay",
+        content=body,
+        headers={"x-razorpay-signature": sign(body), "x-razorpay-event-id": "evt_no_secret"},
+    )
+    assert resp.status_code == 400
+
+
+def test_rejects_missing_event_id(client):
+    payload = {"event": "payment.failed", "payload": {}}
+    body = json.dumps(payload).encode()
+    resp = client.post(
+        "/webhooks/razorpay",
+        content=body,
+        headers={"x-razorpay-signature": sign(body)},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "missing x-razorpay-event-id"
+
+
+def test_rejects_signed_non_object_json(client):
+    body = json.dumps(["not", "an", "event"]).encode()
+    resp = client.post(
+        "/webhooks/razorpay",
+        content=body,
+        headers={"x-razorpay-signature": sign(body), "x-razorpay-event-id": "evt_array"},
+    )
+    assert resp.status_code == 400
+
+
+def test_rejects_signed_null_event_type(client):
+    body = json.dumps({"event": None, "payload": {}}).encode()
+    resp = client.post(
+        "/webhooks/razorpay",
+        content=body,
+        headers={"x-razorpay-signature": sign(body), "x-razorpay-event-id": "evt_null_type"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "webhook event must be a non-empty string"
 
 
 def test_payment_failed_creates_a_case(client):

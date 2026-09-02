@@ -23,9 +23,6 @@ customer-actionable categories (auth, invalid instrument) need contact;
 permanent/unknown failures rarely recover without a human.
 """
 import random
-import os
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///./ml_ground_truth.db")
 
 from app.services.policy_engine import ALL_ACTIONS
 

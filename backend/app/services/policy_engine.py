@@ -33,6 +33,7 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from app.models import RevenueCase, Decision, Action, AuditEvent
+from app.core.time import utc_now
 
 CONTACT_ACTIONS = {"CONTACT_CUSTOMER", "CREATE_PAYMENT_LINK", "COLLECT_PROMISE_TO_PAY"}
 
@@ -132,10 +133,12 @@ def _check_action_allowed(
 def _record_decision(
     db: Session, case: RevenueCase, chosen_action: str, alternatives: dict,
     explanation: str, config: GuardrailConfig, now: datetime,
+    expected_value: float | None = None,
 ) -> Decision:
     decision = Decision(
         revenue_case_id=case.id,
         chosen_action=chosen_action,
+        expected_value=expected_value,
         alternatives=alternatives,
         guardrails_applied={
             "max_contacts_per_case": config.max_contacts_per_case,
@@ -180,7 +183,7 @@ def decide(db: Session, case: RevenueCase, config: GuardrailConfig = DEFAULT_GUA
     if case.state != "DIAGNOSED":
         return None
 
-    now = now or datetime.utcnow()
+    now = now or utc_now()
     case.state = "DECISION_READY"
 
     if _attempt_count(db, case) > config.max_total_attempts:
@@ -245,7 +248,7 @@ def check_action_allowed(
     config: GuardrailConfig = DEFAULT_GUARDRAILS, now: datetime | None = None,
 ) -> tuple[bool, str | None]:
     """Public entry point for _check_action_allowed. Returns (allowed, reason_if_blocked)."""
-    return _check_action_allowed(db, case, action, config, now or datetime.utcnow())
+    return _check_action_allowed(db, case, action, config, now or utc_now())
 
 
 def attempt_count(db: Session, case: RevenueCase) -> int:
@@ -261,6 +264,10 @@ def contacts_for_case(db: Session, case: RevenueCase) -> list[Action]:
 def record_decision(
     db: Session, case: RevenueCase, chosen_action: str, alternatives: dict,
     explanation: str, config: GuardrailConfig = DEFAULT_GUARDRAILS, now: datetime | None = None,
+    expected_value: float | None = None,
 ) -> Decision:
     """Public entry point for _record_decision."""
-    return _record_decision(db, case, chosen_action, alternatives, explanation, config, now or datetime.utcnow())
+    return _record_decision(
+        db, case, chosen_action, alternatives, explanation, config,
+        now or utc_now(), expected_value=expected_value,
+    )

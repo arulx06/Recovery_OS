@@ -2,6 +2,7 @@ import pytest
 
 from app.ml import ground_truth
 from app.ml.synthetic_history import generate_history
+from app.ml.costs import ACTION_COST
 from app.services.failure_diagnosis import ALL_CATEGORIES
 from app.services.policy_engine import ALL_ACTIONS
 
@@ -16,6 +17,10 @@ def test_true_probability_is_a_valid_probability(category, action):
 def test_stop_always_has_zero_probability():
     for category in ALL_CATEGORIES:
         assert ground_truth.true_probability(category, "STOP", amount=5000) == 0.0
+
+
+def test_every_policy_action_has_an_explicit_cost():
+    assert set(ACTION_COST) == set(ALL_ACTIONS)
 
 
 def test_transient_infra_wait_beats_permanent_hard_failure_wait():

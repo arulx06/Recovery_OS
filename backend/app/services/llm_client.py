@@ -1,12 +1,9 @@
 """
 LLM client (Phase 6).
 
-Same shape as razorpay_client.py: calls a real API when credentials are
-configured (Anthropic's Messages API, since api.anthropic.com is the one
-LLM endpoint actually reachable from this environment), and falls back to
-a clearly-labeled local simulation otherwise — every response carries a
-`simulated` flag so nothing downstream can mistake a heuristic stand-in
-for a real model output.
+Calls Anthropic's Messages API only when external LLM access is explicitly
+enabled. Credentials alone never activate network traffic; otherwise a
+clearly-labeled local simulation is used.
 
 Two jobs, matching ARCHITECTURE.md's layer table:
   - draft_contact_message: action + case context -> outbound message text
@@ -28,6 +25,7 @@ from datetime import datetime, timedelta
 import httpx
 
 from app.core.config import settings
+from app.core.time import utc_now
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODEL = "claude-3-5-haiku-latest"  # fast/cheap is plenty for drafting + extraction
@@ -53,6 +51,13 @@ class LLMAPIError(Exception):
 
 def credentials_configured() -> bool:
     return bool(settings.LLM_API_KEY)
+
+
+def _require_live_config() -> None:
+    if settings.LLM_PROVIDER.lower() != "anthropic":
+        raise LLMAPIError("LLM_API_ENABLED currently supports only LLM_PROVIDER=anthropic")
+    if not credentials_configured():
+        raise LLMAPIError("LLM API access is enabled but LLM_API_KEY is not configured")
 
 
 @dataclass
@@ -89,7 +94,11 @@ def _simulated_draft(action_type: str, context: dict) -> dict:
         amount=f"{context.get('amount', 0):,.2f}",
         reason=(context.get("failure_category") or "a payment issue").replace("_", " ").lower(),
     )
-    return {"body": body, "simulated": True, "note": "LLM_API_KEY not configured — templated message, not model-generated."}
+    return {
+        "body": body,
+        "simulated": True,
+        "note": "LLM API access is disabled - templated message, not model-generated.",
+    }
 
 
 def draft_contact_message(action_type: str, context: dict, timeout_seconds: float = 10.0) -> dict:
@@ -97,8 +106,9 @@ def draft_contact_message(action_type: str, context: dict, timeout_seconds: floa
     context: {"amount": float, "failure_category": str, "case_id": str, ...}
     Returns {"body": str, "simulated": bool, ...}
     """
-    if not credentials_configured():
+    if not settings.LLM_API_ENABLED:
         return _simulated_draft(action_type, context)
+    _require_live_config()
 
     system_prompt = (
         "You draft short, plain, compliant payment-recovery messages to customers whose "
@@ -192,10 +202,11 @@ def _simulated_extract(message: str, now: datetime) -> PTPExtraction:
 
 
 def extract_ptp_intent(message: str, now: datetime | None = None, timeout_seconds: float = 10.0) -> PTPExtraction:
-    now = now or datetime.utcnow()
+    now = now or utc_now()
 
-    if not credentials_configured():
+    if not settings.LLM_API_ENABLED:
         return _simulated_extract(message, now)
+    _require_live_config()
 
     system_prompt = (
         "Extract intent from a customer's reply about an overdue payment. Respond with ONLY "

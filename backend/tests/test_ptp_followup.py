@@ -40,21 +40,12 @@ def make_case_with_due_promise(db, state="AWAITING_OUTCOME", promise_status="PEN
     return case, promise, action
 
 
-# NOTE: process_due_followups() scans the whole table, and this test suite
-# shares one sqlite file across test modules (some of which, like
-# test_customer_reply.py, commit real data via the `client` fixture rather
-# than rolling back). So these tests check the specific case/promise/action
-# they created, never the global summary dict counts — those aren't
-# reliably isolated from whatever else has been committed to the DB by the
-# time this file runs.
-
 def test_broken_promise_escalates_case_and_marks_promise_broken(db_session):
     case, promise, action = make_case_with_due_promise(db_session)
 
     summary = ptp_followup.process_due_followups(db_session, now=NOW)
 
-    assert summary["processed"] >= 1
-    assert summary["broken"] >= 1
+    assert summary == {"processed": 1, "already_recovered": 0, "broken": 1}
     assert case.state == "HUMAN_REVIEW"
     assert promise.status == "BROKEN"
     assert action.status == "EXECUTED"

@@ -10,9 +10,12 @@ from app.services import llm_client
 @pytest.fixture(autouse=True)
 def _clear_credentials():
     original = settings.LLM_API_KEY
+    original_enabled = settings.LLM_API_ENABLED
     settings.LLM_API_KEY = ""
+    settings.LLM_API_ENABLED = False
     yield
     settings.LLM_API_KEY = original
+    settings.LLM_API_ENABLED = original_enabled
 
 
 NOW = datetime(2026, 8, 23, 10, 0, 0)  # a Sunday
@@ -45,6 +48,7 @@ def test_simulated_draft_differs_by_action_type():
 
 def test_live_draft_used_when_credentials_present(monkeypatch):
     settings.LLM_API_KEY = "sk-ant-test"
+    settings.LLM_API_ENABLED = True
 
     def fake_post(url, json, headers, timeout):
         class FakeResponse:
@@ -64,6 +68,7 @@ def test_live_draft_used_when_credentials_present(monkeypatch):
 
 def test_live_draft_failure_raises(monkeypatch):
     settings.LLM_API_KEY = "sk-ant-test"
+    settings.LLM_API_ENABLED = True
 
     def fake_post(*args, **kwargs):
         raise httpx.ConnectTimeout("boom")
@@ -131,6 +136,7 @@ def test_bare_weekday_on_that_weekday_means_next_week():
 
 def test_live_extraction_used_when_credentials_present(monkeypatch):
     settings.LLM_API_KEY = "sk-ant-test"
+    settings.LLM_API_ENABLED = True
 
     def fake_post(url, json, headers, timeout):
         class FakeResponse:
@@ -152,6 +158,7 @@ def test_live_extraction_used_when_credentials_present(monkeypatch):
 
 def test_live_extraction_malformed_json_falls_back_to_unclear(monkeypatch):
     settings.LLM_API_KEY = "sk-ant-test"
+    settings.LLM_API_ENABLED = True
 
     def fake_post(url, json, headers, timeout):
         class FakeResponse:
@@ -171,6 +178,7 @@ def test_live_extraction_malformed_json_falls_back_to_unclear(monkeypatch):
 
 def test_live_extraction_failure_raises(monkeypatch):
     settings.LLM_API_KEY = "sk-ant-test"
+    settings.LLM_API_ENABLED = True
 
     def fake_post(*args, **kwargs):
         raise httpx.ConnectTimeout("boom")
@@ -178,3 +186,12 @@ def test_live_extraction_failure_raises(monkeypatch):
     monkeypatch.setattr(httpx, "post", fake_post)
     with pytest.raises(llm_client.LLMAPIError):
         llm_client.extract_ptp_intent("whatever", now=NOW)
+
+
+def test_nonblank_credentials_do_not_enable_network_implicitly():
+    settings.LLM_API_KEY = "fake_nonblank_llm_key"
+
+    result = llm_client.draft_contact_message(
+        "CONTACT_CUSTOMER", {"amount": 1000, "failure_category": "UNKNOWN"},
+    )
+    assert result["simulated"] is True

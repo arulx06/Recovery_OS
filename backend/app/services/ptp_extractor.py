@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from app.services.llm_client import PTPExtraction
+from app.core.time import utc_now
 
 DEFAULT_HORIZON_DAYS = 14
 MIN_CONFIDENCE = 0.6
@@ -41,7 +42,7 @@ def validate_promise(
     horizon_days: int = DEFAULT_HORIZON_DAYS,
     min_confidence: float = MIN_CONFIDENCE,
 ) -> ValidationResult:
-    now = now or datetime.utcnow()
+    now = now or utc_now()
     today = now.date()
 
     if extraction.intent != "promise_to_pay":

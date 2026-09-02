@@ -26,6 +26,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.models import RevenueCase, Action, AuditEvent, PromiseToPay
+from app.core.time import utc_now
 
 TERMINAL_STATES = {"RECOVERED", "STOPPED", "DISPUTED"}
 
@@ -40,7 +41,7 @@ def process_due_followups(db: Session, now: datetime | None = None) -> dict:
     passed. Returns a summary dict: {"processed": n, "already_recovered": n,
     "broken": n}.
     """
-    now = now or datetime.utcnow()
+    now = now or utc_now()
 
     due_actions = (
         db.query(Action)

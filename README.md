@@ -2,7 +2,7 @@
 
 Built for the **Razorpay AI Buildathon**, Track 03 (AI Revenue Recovery).
 
-> When revenue fails, RecoveryOS decides whether to wait, retry, contact the
+> When revenue fails, RecoveryOS decides whether to wait for a native retry, contact the
 > customer, send a payment link, collect a promise-to-pay, escalate, or
 > stop — and measures which decisions actually recover the most money with
 > the least customer friction.
@@ -14,12 +14,15 @@ including doing nothing?* See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for
 the full pipeline, state machine, and a table of what Razorpay already
 provides versus what this project adds on top.
 
-## Status: Phase 7 — Measurement + explainability dashboard (Day 13)
+## Current implementation status
 
-Phases 0–6 (skeleton, webhook backbone, failure taxonomy, guardrails +
-baseline policy, real Payment Link execution, adaptive ML policy,
-Promise-to-Pay + LLM) are done — see ARCHITECTURE.md for what shipped
-there.
+The modular-monolith prototype includes a signed webhook path, deterministic
+failure diagnosis and baseline policy, simulated actions, opt-in Razorpay Test
+Mode Payment Link creation, an offline adaptive ML policy, Promise-to-Pay
+extraction, persisted synthetic experiments, and a measurement dashboard.
+Adaptive ML is not used by the webhook path. Customer messages are drafted and
+stored but are not delivered through SMS, email, or WhatsApp. Delayed actions
+are records only; no worker or scheduler currently consumes them automatically.
 
 - [X] `app/services/experiment_runner.py` — the persisted, downloadable
   version of Phase 5's `evaluate_policies.py`: runs matched synthetic
@@ -39,20 +42,15 @@ there.
   recovered, recovery rate, contacts, escalations, action
   distribution), an incremental-₹ headline, and a "Download audit
   CSV" link
-- [X] `GET /cases/{id}` (from Phase 3/6) already serves the
-  decision-explanation and audit-timeline half of "explainability" —
-  Phase 7 didn't need to rebuild that, only add the aggregate
-  measurement view on top
-- [X] 12 new tests (reproducibility with a fixed seed, summary shape,
-  CSV row counts, 400/404 edge cases) — 218 backend tests total, all
-  passing
+- [X] `GET /cases/{id}` serves decision details and an audit timeline. The
+  current frontend does not render this case-detail view.
+- [X] Hermetic backend test suite, including explicit fake-credential and
+  network-denial coverage
 
-**Exit criteria for Phase 7:** one click runs a 500+ case experiment with
-metrics reproducible from a fixed seed, plus a downloadable audit. Verified
-live: the same seed against the same trained model produces bit-identical
-results on repeat runs (confirmed by running `POST /experiments` twice in
-a row with `seed: 11` and diffing the response). One caveat worth stating
-plainly: reproducibility is scoped to *a fixed trained model* —
+**Phase 7 measurement scope:** one click runs a 500+ scenario experiment with
+metrics reproducible from a fixed seed and model, plus a downloadable audit.
+Run IDs and creation timestamps differ between runs, so complete API responses
+are not byte-identical. Reproducibility is scoped to *a fixed trained model* —
 `HistGradientBoostingClassifier` can differ by a small fraction of a
 percent between two separate *training* runs even with the same
 `random_state`, a known consequence of its parallel histogram-building
@@ -73,10 +71,10 @@ measures the adaptive policy, it doesn't make it the one that's live.
 | Validation              | Pydantic                                                                    |
 | ORM                     | SQLAlchemy (Alembic migrations from Phase 1)                                |
 | Database                | PostgreSQL                                                                  |
-| Queue / delayed actions | Redis + RQ (from Phase 3)                                                   |
-| ML                      | scikit-learn / XGBoost (from Phase 5)                                       |
-| LLM                     | Provider-agnostic tool-calling model, structured output only (from Phase 6) |
-| Payments                | Razorpay Test Mode REST APIs, Webhooks, Payment Links                       |
+| Delayed actions         | Database records + manual PTP processor; Redis/RQ reserved but not wired    |
+| ML                      | scikit-learn `HistGradientBoostingClassifier` (offline experiments only)    |
+| LLM                     | Optional Anthropic Messages API; templated/regex simulation by default      |
+| Payments                | Signed webhooks; simulated or explicitly enabled Razorpay Test Mode links   |
 
 Deliberately **not** using: microservices, Kafka, Kubernetes, LangGraph,
 RAG, or a vector DB. A modular monolith is far more likely to actually ship
@@ -95,11 +93,15 @@ docker compose up -d
 ```bash
 cd backend
 cp .env.example .env
-python3 -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 alembic upgrade head
 uvicorn app.main:app --reload --port 8000
 ```
+
+Windows PowerShell uses `Copy-Item .env.example .env` and
+`.\.venv\Scripts\Activate.ps1` instead of `cp` and `source`.
 
 Check it: `curl http://localhost:8000/health`
 
@@ -114,7 +116,8 @@ python scripts/send_test_webhook.py payment.captured --payment-id pay_demo_1 --a
 curl http://localhost:8000/cases   # case should show state RECOVERED
 ```
 
-Run tests: `pytest` (uses an isolated sqlite DB, no Postgres needed).
+Run tests: `python -m pytest` (uses a process-unique temporary SQLite DB, blocks
+external sockets, and does not use credentials from `.env`).
 
 **See the guardrail + policy engine reason about 100 cases at once:**
 
@@ -123,7 +126,7 @@ python scripts/run_synthetic_batch.py --count 100
 ```
 
 Prints the failure-category mix, the action distribution the baseline
-policy chose, and confirms every case reached a resolved state — this is
+policy chose, and confirms every case left the detection/diagnosis states — this is
 the Phase 3 exit criteria.
 
 **Inspect why a specific case got the action it did:**
@@ -135,7 +138,7 @@ curl http://localhost:8000/cases/<case-id>
 Returns the decision (chosen action, alternatives considered, which
 guardrails fired), the scheduled action, and the full audit trail.
 
-**See the full Phase 4 loop — a real (or simulated) Payment Link gets
+**See the Payment Link loop — a Razorpay Test Mode (or simulated) link gets
 created automatically, then paid:**
 
 ```bash
@@ -145,10 +148,10 @@ python scripts/send_test_webhook.py payment_link.paid --payment-link-id "$LINK_I
 curl http://localhost:8000/cases   # case should show state RECOVERED
 ```
 
-Without `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` set, the link is a clearly
-labeled local simulation (`GET /cases/<id>` shows `"simulated": true` on
-the action's result) — set real test-mode credentials in `.env` to switch
-to live Razorpay Payment Links with no code change.
+The link is a clearly labeled local simulation by default (`GET /cases/<id>`
+shows `"simulated": true`). To call Razorpay, provide Test Mode credentials
+and explicitly set `RAZORPAY_API_ENABLED=true`. Live-mode keys are rejected.
+Creating a link does not deliver it to a customer.
 
 **Train the recovery-probability model and compare it against the
 baseline policy (Phase 5):**
@@ -160,8 +163,8 @@ python scripts/evaluate_policies.py --count 1000
 
 The first command prints holdout ROC-AUC/log-loss/accuracy. The second
 runs 1,000 matched synthetic scenarios through both the baseline and ML
-policies and prints a side-by-side comparison (revenue recovered, contacts,
-escalations, incremental ₹) — labeled as a synthetic benchmark, not a
+policies and prints a side-by-side comparison (revenue recovered, contact
+interventions, escalations, notional action cost, incremental ₹) — labeled as a synthetic benchmark, not a
 production claim. The model is gitignored and reproducible; re-run
 `train.py` any time (same seed → same model).
 
@@ -184,10 +187,11 @@ curl -X POST http://localhost:8000/cases/$CASE_ID/customer-reply \
 # -> case_state: DISPUTED — recovery stops immediately, even overriding a pending promise
 ```
 
-Without `LLM_API_KEY` set, message drafting is templated and reply
-extraction is a documented regex/keyword heuristic (both clearly marked
-`"simulated": true` / `channel: "simulated"`) — set a real Anthropic API
-key in `.env` to switch to live calls with no code change.
+Message drafting and reply extraction are simulated by default. Drafting is
+templated and extraction uses a documented regex/keyword heuristic (both are
+clearly marked `"simulated": true` / `channel: "simulated"`). To call
+Anthropic, set `LLM_PROVIDER=anthropic`, provide `LLM_API_KEY`, and explicitly
+set `LLM_API_ENABLED=true`. Drafted messages are stored, not delivered.
 
 Promises whose due date has passed and were never fulfilled aren't
 checked automatically yet (no live scheduler) — run
@@ -201,7 +205,8 @@ curl -X POST http://localhost:8000/experiments -H "Content-Type: application/jso
 
 Or open the dashboard (below) and click "Run experiment" — same thing,
 with a UI. Either way you get back ₹ at risk/recovered per policy,
-recovery rate, contacts, escalations, an incremental-₹ headline, and a
+recovery rate, contact interventions, escalations, notional action cost,
+an incremental-₹ headline, and a
 `run_id` you can fetch again (`GET /experiments/{run_id}`) or export as a
 case-level CSV (`GET /experiments/{run_id}/export.csv`).
 
@@ -217,6 +222,35 @@ npm run dev
 Open `http://localhost:5173` — you should see the dashboard shell report
 "backend healthy" and an empty cases table.
 
+On Windows PowerShell, create the frontend environment file with
+`Copy-Item .env.example .env`.
+
+## Objective and evaluation limits
+
+The adaptive scorer currently maximizes
+`P(recovery | context, action) * amount - notional_action_cost`. Its INR 5/15/50
+cost proxies are small relative to many case amounts, so this is primarily a
+recovered-value objective, not a calibrated multi-objective definition of
+"least customer friction." The experiment's contact count means selected
+contact-type actions, including Payment Link creation; it is not a delivery
+count. The experiment reports those selections and
+escalations beside revenue, plus realized notional net value; it does not hide
+a revenue gain that requires more outreach. Selecting a real friction tradeoff
+requires merchant/customer research and explicit policy choices, not tuning
+synthetic weights until a chart looks favorable.
+
+Training labels and benchmark outcomes come from the same hand-authored
+synthetic simulator. These runs validate code and assumptions, not production
+lift or model generalization to real Razorpay traffic.
+
+## Scheduling reality
+
+`WAIT` and `WAIT_FOR_NATIVE_RETRY` create `SCHEDULED` database rows and put the
+case in `WAITING`; no process wakes or re-evaluates them. `FOLLOW_UP_PTP` is
+processed only when `python scripts/process_followups.py` is run manually or by
+an external cron. Redis/RQ are reserved dependencies and available in the local
+Compose file, but no current application module imports them.
+
 ## 14-day phase plan
 
 | Phase                                     | Days   | What ships                                                                                                   | Why this order                                                                   |
@@ -224,7 +258,7 @@ Open `http://localhost:5173` — you should see the dashboard shell report
 | 0. Scope lock + skeleton                  | 1      | Repo, README, architecture, backend, frontend, schema,`.env`                                               | Architecture before AI prevents a rebuild later                                  |
 | 1. Razorpay event backbone                | 2–3   | Test-mode integration, webhook endpoint, signature validation, idempotent event persistence                  | Every later feature depends on trustworthy payment state                         |
 | 2. Failure intelligence + state machine   | 4–5   | Failure taxonomy, canonical case states, deterministic diagnosis, late-capture handling                      | No point building ML before input/state semantics are correct                    |
-| 3. Guardrails + baseline recovery engine  | 6–7   | Allowed-action set, contact limits, cooldowns, stopping rules, simple baseline policy, scheduler             | Need a safe, working product before layering AI on top                           |
+| 3. Guardrails + baseline recovery engine  | 6–7   | Allowed-action set, contact limits, cooldowns, stopping rules, baseline policy, scheduled-action records     | Worker-based scheduling remains unimplemented                                    |
 | 4. Real recovery action                   | 8      | Razorpay Payment Links integration, action executor, outcome webhook handling                                | Guardrails must exist before the system can do something real                    |
 | 5. Adaptive policy / ML                   | 9–10  | Synthetic history generator, recovery-probability model, expected-value scorer, baseline-vs-model comparison | Data/state/action pipeline already works, so ML plugs into a functioning product |
 | 6. Promise-to-Pay + LLM                   | 11–12 | Customer conversation simulator, structured intent extraction, PTP parser, dispute detection                 | LLM comes late — it's a tool, not the architecture                              |
@@ -257,7 +291,7 @@ recoveryos/
 │   │   │   ├── failure_diagnosis.py  # deterministic failure taxonomy
 │   │   │   ├── policy_engine.py      # guardrails + baseline recovery policy
 │   │   │   ├── razorpay_client.py    # Payment Links API (live or simulated)
-│   │   │   ├── action_executor.py    # turns a decision into a real side effect
+│   │   │   ├── action_executor.py    # creates links or stores drafted messages
 │   │   │   ├── ml_policy.py          # expected-value policy (offline eval only, not live)
 │   │   │   ├── llm_client.py         # message drafting + PTP extraction (live or simulated)
 │   │   │   ├── ptp_extractor.py      # validates an LLM's promise extraction before it's recorded

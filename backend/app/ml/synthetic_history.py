@@ -18,9 +18,6 @@ works better than WAIT for this category" instead of only ever confirming
 the baseline's own preferences.
 """
 import random
-import os
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///./ml_generate.db")
 
 import pandas as pd
 

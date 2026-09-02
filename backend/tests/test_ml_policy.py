@@ -5,32 +5,17 @@ import pytest
 from app.core.database import SessionLocal
 from app.models import RevenueCase, Action
 from app.services import ml_policy, policy_engine
-from app.ml import scorer, train as train_module
+from app.ml import scorer
 
 
 @pytest.fixture(scope="module", autouse=True)
-def trained_model(tmp_path_factory):
-    """ml_policy uses the module-level scorer, which reads from the real
-    MODEL_PATH by default — train a real (small) model there for this test
-    module so decide_ml has something to score against, and restore
-    whatever was there afterward."""
-    import shutil
-    backup_dir = tmp_path_factory.mktemp("model_backup")
-    backup_path = backup_dir / "model.joblib"
-    had_existing = train_module.MODEL_PATH.exists()
-    if had_existing:
-        shutil.copy(train_module.MODEL_PATH, backup_path)
-
-    train_module.train(n=6000, seed=42, save=True)
+def trained_model(trained_model_path):
+    original_path = scorer.MODEL_PATH
+    scorer.MODEL_PATH = trained_model_path
     scorer.reset_cache()
-
     yield
-
-    if had_existing:
-        shutil.copy(backup_path, train_module.MODEL_PATH)
-    else:
-        train_module.MODEL_PATH.unlink(missing_ok=True)
     scorer.reset_cache()
+    scorer.MODEL_PATH = original_path
 
 
 @pytest.fixture
@@ -73,6 +58,7 @@ def test_decide_ml_produces_a_decision_with_expected_value_alternatives(db_sessi
     chosen_alt = decision.alternatives[decision.chosen_action]
     assert "expected_value" in chosen_alt
     assert "p_recovery" in chosen_alt
+    assert float(decision.expected_value) == pytest.approx(chosen_alt["expected_value"], abs=0.01)
 
 
 def test_decide_ml_respects_the_same_amount_guardrail_as_baseline(db_session):

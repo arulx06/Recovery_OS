@@ -21,10 +21,7 @@ reproducible from repo": anyone can re-run this and get the same numbers
 (same seed, same synthetic generator, same model).
 """
 import argparse
-import os
 from pathlib import Path
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///./ml_train.db")
 
 import joblib
 import pandas as pd

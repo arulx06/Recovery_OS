@@ -5,27 +5,26 @@ Phase 3 built the guardrail-checked policy engine that decides what to do
 and records it as a SCHEDULED Action. This module is where a decision
 becomes a real-world side effect.
 
-Phase 4 added CREATE_PAYMENT_LINK. Phase 6 adds CONTACT_CUSTOMER and
-COLLECT_PROMISE_TO_PAY — both draft an outbound message via the LLM
-client (real or simulated) and store it as a CustomerMessage, rather than
-leaving the case sitting at ACTION_SCHEDULED indefinitely. WAIT /
+Phase 4 added CREATE_PAYMENT_LINK. CONTACT_CUSTOMER and
+COLLECT_PROMISE_TO_PAY both draft text via the LLM client (real or simulated)
+and store it as a CustomerMessage. No messaging transport delivers that draft.
+WAIT /
 WAIT_FOR_NATIVE_RETRY / ESCALATE / STOP still have no external side effect
 to execute; the state they leave the case in already reflects the action.
 
-State machine step this owns:
+Case/action state step this owns:
 
-    ACTION_SCHEDULED -> ACTION_EXECUTED -> AWAITING_OUTCOME   (success)
-    ACTION_SCHEDULED -> HUMAN_REVIEW                          (execution failed)
+    case ACTION_SCHEDULED -> action EXECUTED -> case AWAITING_OUTCOME
+    case ACTION_SCHEDULED -> action FAILED -> case HUMAN_REVIEW
 
 A failed API call does not silently retry and does not leave the case
 stuck in ACTION_SCHEDULED forever — it falls back to human review, the
 same conservative default the policy engine uses whenever it can't decide
 confidently on its own.
 """
-from datetime import datetime
-
 from sqlalchemy.orm import Session
 
+from app.core.time import utc_now
 from app.models import RevenueCase, Action, AuditEvent, CustomerMessage
 from app.services import razorpay_client, llm_client
 
@@ -55,7 +54,7 @@ def execute(db: Session, case: RevenueCase, action: Action) -> Action:
 
 
 def _execute_create_payment_link(db: Session, case: RevenueCase, action: Action) -> Action:
-    now = datetime.utcnow()
+    now = utc_now()
 
     try:
         result = razorpay_client.create_payment_link(
@@ -99,7 +98,7 @@ def _execute_create_payment_link(db: Session, case: RevenueCase, action: Action)
 
 
 def _execute_contact(db: Session, case: RevenueCase, action: Action) -> Action:
-    now = datetime.utcnow()
+    now = utc_now()
 
     try:
         draft = llm_client.draft_contact_message(

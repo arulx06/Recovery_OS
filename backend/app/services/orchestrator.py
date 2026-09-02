@@ -19,8 +19,9 @@ right after diagnosis, the Guardrail + baseline Policy Engine
 (app/services/policy_engine.py) runs synchronously, choosing an action and
 landing the case in WAITING, ACTION_SCHEDULED, or HUMAN_REVIEW.
 
-Nothing is actually executed yet (no message sent, no Payment Link
-created) — that's Phase 4. This module and policy_engine.py only decide.
+The baseline policy runs inline. Payment Links may be created through the
+explicitly enabled Razorpay Test Mode integration; contact text is drafted
+and stored but no messaging transport delivers it.
 """
 from datetime import datetime
 from decimal import Decimal
@@ -28,6 +29,7 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from app.models import RevenueCase, AuditEvent, PaymentEvent, Action, PromiseToPay, CustomerMessage
+from app.core.time import utc_now
 from app.services.failure_diagnosis import classify_failure
 from app.services import policy_engine, action_executor, llm_client, ptp_extractor
 
@@ -90,7 +92,7 @@ def _diagnose(db: Session, case: RevenueCase, entity: dict):
     case.error_reason = entity.get("error_reason") or case.error_reason
     case.failure_category = category
     case.state = "DIAGNOSED"
-    case.updated_at = datetime.utcnow()
+    case.updated_at = utc_now()
 
     if category != previous_category:
         _log_audit(
@@ -177,7 +179,7 @@ def _recover_case(db: Session, case: RevenueCase, reason: str, extra_detail: dic
         action.status = "CANCELLED"
 
     case.state = "RECOVERED"
-    case.updated_at = datetime.utcnow()
+    case.updated_at = utc_now()
     detail = {"reason": reason, "cancelled_actions": len(cancelled)}
     if extra_detail:
         detail.update(extra_detail)
@@ -260,7 +262,7 @@ def _dispute_case(db: Session, case: RevenueCase, reason: str, extra_detail: dic
 
     previous_state = case.state
     case.state = "DISPUTED"
-    case.updated_at = datetime.utcnow()
+    case.updated_at = utc_now()
     detail = {"reason": reason, "previous_state": previous_state, "cancelled_actions": len(cancelled)}
     if extra_detail:
         detail.update(extra_detail)
@@ -308,7 +310,7 @@ def handle_customer_reply(db: Session, case: RevenueCase, message_body: str, now
         high, date out of range, low confidence) -> falls back to
         HUMAN_REVIEW rather than guessing.
     """
-    now = now or datetime.utcnow()
+    now = now or utc_now()
 
     extraction = llm_client.extract_ptp_intent(message_body, now=now)
 

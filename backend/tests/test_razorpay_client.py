@@ -13,10 +13,13 @@ def _clear_credentials():
     it sets them itself — keeps the simulation-vs-live behavior explicit
     per test rather than depending on .env contents."""
     original_id, original_secret = settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET
+    original_enabled = settings.RAZORPAY_API_ENABLED
     settings.RAZORPAY_KEY_ID = ""
     settings.RAZORPAY_KEY_SECRET = ""
+    settings.RAZORPAY_API_ENABLED = False
     yield
     settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET = original_id, original_secret
+    settings.RAZORPAY_API_ENABLED = original_enabled
 
 
 def test_credentials_configured_false_when_empty():
@@ -50,6 +53,7 @@ def test_simulated_link_id_is_unique_per_call():
 def test_live_call_used_when_credentials_present(monkeypatch):
     settings.RAZORPAY_KEY_ID = "rzp_test_x"
     settings.RAZORPAY_KEY_SECRET = "secret_x"
+    settings.RAZORPAY_API_ENABLED = True
 
     captured = {}
 
@@ -84,6 +88,7 @@ def test_live_call_used_when_credentials_present(monkeypatch):
 def test_live_call_failure_raises_razorpay_api_error(monkeypatch):
     settings.RAZORPAY_KEY_ID = "rzp_test_x"
     settings.RAZORPAY_KEY_SECRET = "secret_x"
+    settings.RAZORPAY_API_ENABLED = True
 
     def fake_post(*args, **kwargs):
         raise httpx.ConnectTimeout("boom")
@@ -91,4 +96,21 @@ def test_live_call_failure_raises_razorpay_api_error(monkeypatch):
     monkeypatch.setattr(httpx, "post", fake_post)
 
     with pytest.raises(razorpay_client.RazorpayAPIError):
+        razorpay_client.create_payment_link(Decimal("100"), "INR", "d", "ref")
+
+
+def test_nonblank_credentials_do_not_enable_network_implicitly():
+    settings.RAZORPAY_KEY_ID = "rzp_test_fake_nonblank"
+    settings.RAZORPAY_KEY_SECRET = "fake_nonblank_secret"
+
+    result = razorpay_client.create_payment_link(Decimal("100"), "INR", "d", "ref")
+    assert result["simulated"] is True
+
+
+def test_live_mode_rejects_non_test_key():
+    settings.RAZORPAY_KEY_ID = "rzp_live_fake_nonblank"
+    settings.RAZORPAY_KEY_SECRET = "fake_nonblank_secret"
+    settings.RAZORPAY_API_ENABLED = True
+
+    with pytest.raises(razorpay_client.RazorpayAPIError, match="Test Mode"):
         razorpay_client.create_payment_link(Decimal("100"), "INR", "d", "ref")

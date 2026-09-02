@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models import ExperimentCase
 from app.services import experiment_runner
+from app.ml.scorer import ModelNotTrainedError
 
 router = APIRouter(prefix="/experiments", tags=["experiments"])
 
@@ -30,7 +31,10 @@ def run_experiment(body: RunExperimentRequest, db: Session = Depends(get_db)):
     if body.count < 1 or body.count > 5000:
         raise HTTPException(status_code=400, detail="count must be between 1 and 5000")
 
-    run_id = experiment_runner.run_experiment(db, count=body.count, seed=body.seed)
+    try:
+        run_id = experiment_runner.run_experiment(db, count=body.count, seed=body.seed)
+    except ModelNotTrainedError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return experiment_runner.summarize_run(db, run_id)
 
 

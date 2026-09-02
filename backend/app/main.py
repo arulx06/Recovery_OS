@@ -12,7 +12,7 @@ from app.routers import health, cases, webhooks, experiments
 app = FastAPI(
     title=settings.APP_NAME,
     description="Adaptive revenue recovery controller — decides whether a failed "
-                 "payment should be retried, delayed, contacted, or left alone.",
+                 "payment should await native retry, be contacted, or be left alone.",
     version="0.1.0",
 )
 
