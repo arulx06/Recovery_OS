@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.db
+
+# ML artifacts (reproducible via `python -m app.ml.train`)
+backend/app/ml/artifacts/
+
+# Node
+node_modules/
+dist/
+
+# Env
+.env
+
+# OS
+.DS_Store

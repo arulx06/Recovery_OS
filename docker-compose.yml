@@ -1,0 +1,27 @@
+version: "3.9"
+
+# Day 1: just the two stateful services the backend needs locally.
+# The backend and frontend run with `uvicorn` / `npm run dev` directly
+# during development — no need to containerize them yet.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: recoveryos
+      POSTGRES_PASSWORD: recoveryos
+      POSTGRES_DB: recoveryos
+    ports:
+      - "5432:5432"
+    volumes:
+      - recoveryos_pg_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+volumes:
+  recoveryos_pg_data:
