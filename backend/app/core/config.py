@@ -15,8 +15,18 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "postgresql+psycopg2://recoveryos:recoveryos@localhost:5432/recoveryos"
 
-    # Reserved for a future delayed-action worker; currently unused.
+    # Durable action transport. PostgreSQL remains authoritative; Redis/RQ
+    # only carries action IDs and can be rebuilt by reconciliation.
     REDIS_URL: str = "redis://localhost:6379/0"
+    RQ_QUEUE_NAME: str = "recoveryos"
+    TASK_QUEUE_ENABLED: bool = True
+    WAIT_DELAY_SECONDS: int = 3600
+    NATIVE_RETRY_DELAY_SECONDS: int = 86400
+    ACTION_MAX_ATTEMPTS: int = 3
+    ACTION_RETRY_DELAY_SECONDS: int = 60
+    ACTION_CLAIM_TIMEOUT_SECONDS: int = 300
+    ACTION_JOB_TIMEOUT_SECONDS: int = 30
+    MERCHANT_TIMEZONE: str = "Asia/Kolkata"
 
     # Razorpay (test mode) — filled in during Phase 1
     RAZORPAY_KEY_ID: str = ""

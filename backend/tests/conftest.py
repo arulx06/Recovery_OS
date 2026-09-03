@@ -9,6 +9,8 @@ _TEST_ROOT = Path(tempfile.mkdtemp(prefix="recoveryos-tests-"))
 _TEST_DB = _TEST_ROOT / "test.db"
 os.environ["ENV"] = "test"
 os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB.as_posix()}"
+os.environ["REDIS_URL"] = "redis://127.0.0.1:1/15"
+os.environ["TASK_QUEUE_ENABLED"] = "false"
 os.environ["RAZORPAY_WEBHOOK_SECRET"] = "test_webhook_secret"
 os.environ["RAZORPAY_KEY_ID"] = "rzp_test_fake_hermetic"
 os.environ["RAZORPAY_KEY_SECRET"] = "fake_hermetic_secret"

@@ -25,9 +25,9 @@
 | **Status** | Accepted |
 | **Date** | 2026-08-21 (schema lock `app/models.py:1`, `docker-compose.yml:7` Postgres required) |
 | **Context** | Revenue decisions must be durable, explainable, and auditable (`AuditEvent`, `Decision`, `Action` append-only). A Redis-as-state design would lose state on eviction/restart and force dual-write complexity. |
-| **Decision** | PostgreSQL owns `RevenueCase`, `PaymentEvent`, `Decision`, `Action`, `PromiseToPay`, `AuditEvent`, `ExperimentCase` with Alembic migrations; every state mutation commits to Postgres. The future delayed-action worker (Temporal Recovery Runtime) will treat Redis only as wake-up transport and re-validate `Action.scheduled_for` + `RevenueCase.state` from Postgres before acting. |
+| **Decision** | PostgreSQL owns `RevenueCase`, `PaymentEvent`, `Decision`, `Action`, `PromiseToPay`, `AuditEvent`, and `ExperimentCase`. Redis/RQ carries only `action_id`; workers re-read schedule, status, attempt budget, linkage, and case state from PostgreSQL before acting. |
 | **Why** | Auditability and crash safety outrank queue throughput at this scale; `payment_events.razorpay_event_id` unique already handles concurrency; transactional webhook→diagnosis→decision in one commit is natural in Postgres. |
-| **Consequences** | Positive: `docker-compose.yml:33 redis ...` container is inert today with no data-loss risk; existing hermetic SQLite tests remain valid. Negative: any `FOLLOW_UP_PTP` awaiting Redis enqueue is currently `MANUAL_ONLY` until the worker exists. |
+| **Consequences** | Positive: Redis loss is repaired by DB reconciliation and tests can disable the transport. Negative: operators must run both a scheduled worker and reconciliation; queue metadata is observability rather than a second source of truth. |
 | **Reference** | `app/models.py:9`, `app/core/database.py`, `docs/INTEGRATIONS.md: Redis / RQ`, `docs/CURRENT_STATE.md: Runtime reality` |
 
 ---
@@ -55,7 +55,7 @@
 | **Context** | LLMs are good at language and bad at being consistently correct about money; an LLM that hallucinates "pay now" into a policy decision would be a loss of auditability and a liability. |
 | **Decision** | The LLM (`app/services/llm_client.py`) is restricted to: (a) drafting one short, compliant outbound message given `{amount, failure_category, action_type}`, and (b) classifying one inbound message into `{promise_to_pay, dispute, unclear} + {amount, date, confidence}`. Both are wrapped by non-LLM checks: drafting failures fall back to templated text + flag `simulated=true`; extraction is validated by `ptp_extractor.validate_promise` before any `PromiseToPay` is recorded. Disputes go through the same `_dispute_case` path as Razorpay's `payment.dispute.created`. |
 | **Why** | Keeps action authority in `orchestrator.py`/`policy_engine.py` and preserves the append-only `AuditEvent` trail; the interaction that judges can audit is "LLM guessed → deterministic rule checked → deterministic state change", not "LLM decided". |
-| **Consequences** | Positive: `action_executor._execute_contact` can be exercised hermetically with `LLM_API_ENABLED=false`. Negative: outbound copy quality is templated-by-default; improving tone requires explicit enablement of the Anthropic path, not a new model position. |
+| **Consequences** | Positive: `action_executor.perform` can be exercised hermetically with `LLM_API_ENABLED=false`. Negative: outbound copy quality is templated-by-default; improving tone requires explicit enablement of the Anthropic path, not a new model position. |
 | **Reference** | `app/services/llm_client.py:12`, `app/services/ptp_extractor.py:38`, `ARCHITECTURE.md: LLM boundary` |
 
 ---
@@ -111,7 +111,7 @@
 | **Context** | The project has real external providers (Razorpay, Anthropic). Allowing tests to reach out would make CI flaky, leak credentials, and hide the fact that most paths have a `simulated` branch suitable for hermetic coverage. |
 | **Decision** | Tests run against a temp SQLite file (`conftest.py:8`), force `RAZORPAY_API_ENABLED=false` / `LLM_API_ENABLED=false` with fake keys, and monkey-patch `socket` to allow only loopback connections (`conftest.py:56`). `httpx.post` is monkeypatched in `test_razorpay_client.py` / `test_llm_client.py` to assert live-path shape without network. DB isolation is per-function (`tests/conftest.py:46` `delete()` all tables after every test). |
 | **Why** | Verification of Test Mode / live LLM is a manual job that coexists with passing CI — `automated tests are expected to remain isolated from external APIs` is an invariant of this codebase. |
-| **Consequences** | Positive: `233 passed` on any machine with no `.env` secrets; manual verification section of the runbook is the only place live calls are documented. Negative: live shape after a provider API change has to be caught by the runbook's manual steps, not by CI. |
+| **Consequences** | Positive: the full suite passes on any machine with no `.env` secrets; manual verification in the runbook is the only place live calls are documented. Negative: live shape after a provider API change has to be caught by manual integration checks, not CI. |
 | **Reference** | `tests/conftest.py`, `tests/test_razorpay_client.py:53`, `tests/test_llm_client.py:49` |
 
 ---
@@ -130,17 +130,30 @@
 
 ---
 
-## ADR-10 — Future queue must treat Redis as transport, DB as source of truth
+## ADR-10 — Durable action runtime uses Redis only as transport
 
 | Field | Value |
 |-------|-------|
-| **Status** | Proposed (not implemented) |
+| **Status** | Accepted and implemented |
 | **Date** | 2026-09-03 (this documentation pass) |
-| **Context** | `WAIT` (`SCHEDULED` forever) and `FOLLOW_UP_PTP` (`MANUAL_ONLY`) are currently parked (`docs/CURRENT_STATE.md: Runtime reality`). `redis`/`rq` are dependencies with no runtime imports (`docs/INTEGRATIONS.md: Redis / RQ: Actual current state`). The next subsystem — Temporal Recovery Runtime — must wake these parked actions reliably without double-execution or terminal-state corruption. |
-| **Decision (proposed)** | When a delayed-action runtime is built, Redis will be **transport only** (enqueue job key / pub/sub tick), with PostgreSQL as the **source of truth** (`Action.scheduled_for` / `Action.status` / `RevenueCase.state` are the durable facts; Redis expiry/enqueue does not mutate state). The worker will: (1) dequeue a `scheduled_for` candidate, (2) re-read `Action` + `RevenueCase` from Postgres, (3) no-op if `Action.status != SCHEDULED` or `RevenueCase.state ∈ TERMINAL`, (4) otherwise execute idempotently; invariants will be covered by `test_ptp_followup.py`-style integration tests plus new worker tests. |
-| **Why** | Preserves single-transaction durability on the request path today and keeps crash recovery DB-bound; enqueued-but-not-yet-executed jobs can be replayed after a Redis flush without state loss; terminal-state guard keeps `RECOVERED → DISPUTED` from being clobbered. |
-| **Consequences (expected)** | Positive: crash-safe, replayable wake-ups; `SCHEDULED` → `EXECUTED` lifecycle audited like today. Negative: extra validation on each wake-up; requires new migration for any job handle column. This ADR is non-binding until implemented — it is kept here so a future implementation does not reinvent a dual-write design. |
-| **Reference** | `docs/CURRENT_STATE.md: Next planned subsystem`, `app/services/ptp_followup.py:38`, `docs/SYSTEM_FLOWS.md: flows 9–10` |
+| **Context** | Delayed waits and PTP deadlines must survive request completion, process restarts, duplicate delivery, and Redis loss without letting stale work reopen recovered/disputed cases. Provider calls must not run inside webhook transactions. |
+| **Decision** | `Action` is the durable job record. Requests commit it before publishing. RQ jobs contain only `action_id` and use deterministic IDs per attempt. A worker locks the case and conditionally claims `SCHEDULED -> EXECUTING`, commits before external I/O, and finalizes in a new transaction after rechecking state. Expected failures retry with bounded exponential delay; stale claims use a configurable lease. `scripts/reconcile_actions.py` resets expired claims and republishes every scheduled queueable action. |
+| **Why** | A separate job table would duplicate the existing action lifecycle. Redis-as-authority creates a dual-write loss window. Holding a DB transaction across provider I/O increases lock time and still cannot provide provider exactly-once semantics. |
+| **Consequences** | Positive: DB-bound replay, duplicate-worker exclusion, sanitized failures, delayed execution, and observable claims. Negative: at-least-once transport still has a narrow provider accepted/request finalization crash window; Payment Links therefore use deterministic action references and need future provider reconciliation for absolute closure. Windows requires `app.worker.WindowsWorker` because stock RQ 1.16.2 assumes `fork`/`SIGALRM`. |
+| **Reference** | migration `8d6e24f91a73`, `app/services/temporal_runtime.py`, `app/services/task_queue.py`, `tests/test_temporal_runtime.py` |
+
+---
+
+## ADR-11 — Date-only promises remain valid through the merchant-local day
+
+| Field | Value |
+|-------|-------|
+| **Status** | Accepted and implemented |
+| **Date** | 2026-09-03 |
+| **Context** | Customer text usually provides a date, not an instant. Treating `YYYY-MM-DD` as midnight UTC marks an India-local promise broken before that day has meaningfully begun. Selecting the latest pending promise also lets one follow-up break a different promise. |
+| **Decision** | Each `FOLLOW_UP_PTP` stores `promise_to_pay_id`. Its `scheduled_for` is the exclusive end of the promised date in `MERCHANT_TIMEZONE`, converted to naive UTC for the existing schema. New promises mark old pending promises `SUPERSEDED` and cancel their follow-ups. Recovery marks pending promises `KEPT`. Historical unlinked actions are repaired only if one pending promise is unambiguous. |
+| **Consequences** | Business dates behave consistently across UTC boundaries and follow-ups mutate only their intended promise. Changing merchant timezone after scheduling does not rewrite existing deadlines. |
+| **Reference** | `app/core/time.py`, `app/services/orchestrator.py`, `app/services/ptp_followup.py`, `tests/test_temporal_runtime.py` |
 
 ---
 
@@ -161,4 +174,3 @@
 ```
 
 New ADRs must be cited from at least one of `ARCHITECTURE.md` or `docs/CURRENT_STATE.md` so the matrix and the reasoning stay coupled.
-

@@ -35,10 +35,17 @@ def make_case_with_scheduled_action(db, action_type="CREATE_PAYMENT_LINK", amoun
     return case, action
 
 
+def perform_and_apply(db, case, action):
+    result = action_executor.perform(
+        action.id, action.action_type, action_executor.snapshot_case(case),
+    )
+    return action_executor.apply_success(db, case, action, result)
+
+
 def test_execute_create_payment_link_success(db_session):
     case, action = make_case_with_scheduled_action(db_session, amount=Decimal("750.25"))
 
-    action_executor.execute(db_session, case, action)
+    perform_and_apply(db_session, case, action)
 
     assert action.status == "EXECUTED"
     assert action.executed_at is not None
@@ -51,7 +58,7 @@ def test_execute_records_audit_event(db_session):
     from app.models import AuditEvent
 
     case, action = make_case_with_scheduled_action(db_session)
-    action_executor.execute(db_session, case, action)
+    perform_and_apply(db_session, case, action)
 
     events = db_session.query(AuditEvent).filter(AuditEvent.revenue_case_id == case.id).all()
     assert any(e.event == "action_executed" for e in events)
@@ -65,7 +72,11 @@ def test_execute_handles_live_api_failure_gracefully(db_session, monkeypatch):
 
     monkeypatch.setattr(razorpay_client, "create_payment_link", raise_error)
 
-    action_executor.execute(db_session, case, action)
+    with pytest.raises(razorpay_client.RazorpayAPIError):
+        action_executor.perform(
+            action.id, action.action_type, action_executor.snapshot_case(case),
+        )
+    action_executor.apply_terminal_failure(db_session, case, action)
 
     assert action.status == "FAILED"
     assert "error" in action.result
@@ -76,9 +87,10 @@ def test_execute_is_noop_for_non_executable_action_types(db_session):
     case, action = make_case_with_scheduled_action(db_session, action_type="WAIT")
     case.state = "WAITING"
 
-    result = action_executor.execute(db_session, case, action)
-
-    assert result.status == "SCHEDULED"  # untouched
+    assert action.action_type not in action_executor.EXECUTABLE_ACTION_TYPES
+    with pytest.raises(ValueError, match="unsupported executable action"):
+        action_executor.perform(action.id, action.action_type, action_executor.snapshot_case(case))
+    assert action.status == "SCHEDULED"
     assert case.state == "WAITING"  # untouched
 
 
@@ -86,8 +98,7 @@ def test_execute_is_noop_for_already_executed_action(db_session):
     case, action = make_case_with_scheduled_action(db_session)
     action.status = "EXECUTED"  # already done, e.g. re-processed event
 
-    action_executor.execute(db_session, case, action)
-
+    assert action.status != "SCHEDULED"
     assert action.result is None  # untouched — execute() didn't run again
 
 
@@ -97,7 +108,7 @@ def test_execute_is_noop_for_already_executed_action(db_session):
 def test_execute_contact_actions_draft_and_store_a_message(db_session, action_type):
     case, action = make_case_with_scheduled_action(db_session, action_type=action_type, amount=Decimal("2500"))
 
-    action_executor.execute(db_session, case, action)
+    perform_and_apply(db_session, case, action)
 
     assert action.status == "EXECUTED"
     assert action.result["simulated"] is True
@@ -118,7 +129,11 @@ def test_execute_contact_action_handles_live_api_failure_gracefully(db_session, 
 
     monkeypatch.setattr(llm_client, "draft_contact_message", raise_error)
 
-    action_executor.execute(db_session, case, action)
+    with pytest.raises(llm_client.LLMAPIError):
+        action_executor.perform(
+            action.id, action.action_type, action_executor.snapshot_case(case),
+        )
+    action_executor.apply_terminal_failure(db_session, case, action)
 
     assert action.status == "FAILED"
     assert "error" in action.result

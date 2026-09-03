@@ -6,7 +6,7 @@ pydantic==2.9.2
 pydantic-settings==2.5.2
 python-dotenv==1.0.1
 alembic==1.13.2
-# Reserved for a future worker. No current application path imports these.
+# Delayed action transport. PostgreSQL remains the authoritative store.
 redis==5.0.8
 rq==1.16.2
 httpx==0.27.2

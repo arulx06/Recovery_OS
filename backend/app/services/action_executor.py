@@ -1,27 +1,7 @@
-"""
-Action Executor.
+"""External action execution, split from transaction-owned state changes."""
+from dataclasses import dataclass
+from decimal import Decimal
 
-Phase 3 built the guardrail-checked policy engine that decides what to do
-and records it as a SCHEDULED Action. This module is where a decision
-becomes a real-world side effect.
-
-Phase 4 added CREATE_PAYMENT_LINK. CONTACT_CUSTOMER and
-COLLECT_PROMISE_TO_PAY both draft text via the LLM client (real or simulated)
-and store it as a CustomerMessage. No messaging transport delivers that draft.
-WAIT /
-WAIT_FOR_NATIVE_RETRY / ESCALATE / STOP still have no external side effect
-to execute; the state they leave the case in already reflects the action.
-
-Case/action state step this owns:
-
-    case ACTION_SCHEDULED -> action EXECUTED -> case AWAITING_OUTCOME
-    case ACTION_SCHEDULED -> action FAILED -> case HUMAN_REVIEW
-
-A failed API call does not silently retry and does not leave the case
-stuck in ACTION_SCHEDULED forever — it falls back to human review, the
-same conservative default the policy engine uses whenever it can't decide
-confidently on its own.
-"""
 from sqlalchemy.orm import Session
 
 from app.core.time import utc_now
@@ -29,120 +9,96 @@ from app.models import RevenueCase, Action, AuditEvent, CustomerMessage
 from app.services import razorpay_client, llm_client
 
 EXECUTABLE_ACTION_TYPES = {"CREATE_PAYMENT_LINK", "CONTACT_CUSTOMER", "COLLECT_PROMISE_TO_PAY"}
+EXPECTED_EXECUTION_ERRORS = (razorpay_client.RazorpayAPIError, llm_client.LLMAPIError)
+
+
+@dataclass(frozen=True)
+class CaseSnapshot:
+    id: str
+    amount: Decimal
+    currency: str
+    failure_category: str | None
 
 
 def _log_audit(db: Session, case: RevenueCase, event: str, detail: dict | None = None):
     db.add(AuditEvent(revenue_case_id=case.id, event=event, detail=detail or {}))
 
 
-def execute(db: Session, case: RevenueCase, action: Action) -> Action:
-    """
-    Execute a just-created SCHEDULED action for `case`, if this executor
-    knows how to. No-ops (returns the action unchanged) for action types
-    outside EXECUTABLE_ACTION_TYPES, or if the action isn't SCHEDULED.
-    """
-    if action.status != "SCHEDULED" or action.action_type not in EXECUTABLE_ACTION_TYPES:
-        return action
-
-    if action.action_type == "CREATE_PAYMENT_LINK":
-        return _execute_create_payment_link(db, case, action)
-
-    if action.action_type in ("CONTACT_CUSTOMER", "COLLECT_PROMISE_TO_PAY"):
-        return _execute_contact(db, case, action)
-
-    return action  # pragma: no cover — unreachable while EXECUTABLE_ACTION_TYPES is exhaustive above
-
-
-def _execute_create_payment_link(db: Session, case: RevenueCase, action: Action) -> Action:
-    now = utc_now()
-
-    try:
-        result = razorpay_client.create_payment_link(
-            amount_rupees=case.amount,
-            currency=case.currency or "INR",
-            description=f"Recovery for case {case.id} ({case.failure_category or 'unclassified'})",
-            reference_id=case.id,
-        )
-    except razorpay_client.RazorpayAPIError as exc:
-        action.status = "FAILED"
-        action.executed_at = now
-        action.result = {"error": str(exc)}
-        case.state = "HUMAN_REVIEW"
-        case.updated_at = now
-        _log_audit(
-            db, case, "action_execution_failed",
-            {"action_type": action.action_type, "error": str(exc)},
-        )
-        db.flush()
-        return action
-
-    action.status = "EXECUTED"
-    action.executed_at = now
-    action.result = result
-
-    case.razorpay_payment_link_id = result.get("id")
-    case.state = "AWAITING_OUTCOME"
-    case.updated_at = now
-
-    _log_audit(
-        db, case, "action_executed",
-        {
-            "action_type": action.action_type,
-            "razorpay_payment_link_id": result.get("id"),
-            "short_url": result.get("short_url"),
-            "simulated": result.get("simulated", False),
-        },
+def snapshot_case(case: RevenueCase) -> CaseSnapshot:
+    return CaseSnapshot(
+        id=case.id,
+        amount=case.amount or Decimal("0"),
+        currency=case.currency or "INR",
+        failure_category=case.failure_category,
     )
-    db.flush()
-    return action
 
 
-def _execute_contact(db: Session, case: RevenueCase, action: Action) -> Action:
-    now = utc_now()
-
-    try:
-        draft = llm_client.draft_contact_message(
-            action.action_type,
+def perform(action_id: str, action_type: str, case: CaseSnapshot) -> dict:
+    """Perform the external operation without an open database transaction."""
+    if action_type == "CREATE_PAYMENT_LINK":
+        return razorpay_client.create_payment_link(
+            amount_rupees=case.amount,
+            currency=case.currency,
+            description=f"Recovery for case {case.id} ({case.failure_category or 'unclassified'})",
+            reference_id=action_id,
+            notes={"recoveryos_case_id": case.id, "recoveryos_action_id": action_id},
+        )
+    if action_type in ("CONTACT_CUSTOMER", "COLLECT_PROMISE_TO_PAY"):
+        return llm_client.draft_contact_message(
+            action_type,
             {
-                "amount": float(case.amount) if case.amount is not None else 0.0,
+                "amount": float(case.amount),
                 "failure_category": case.failure_category,
                 "case_id": case.id,
             },
         )
-    except llm_client.LLMAPIError as exc:
-        action.status = "FAILED"
-        action.executed_at = now
-        action.result = {"error": str(exc)}
-        case.state = "HUMAN_REVIEW"
-        case.updated_at = now
-        _log_audit(
-            db, case, "action_execution_failed",
-            {"action_type": action.action_type, "error": str(exc)},
-        )
-        db.flush()
-        return action
+    raise ValueError(f"unsupported executable action type: {action_type}")
 
-    db.add(CustomerMessage(
-        revenue_case_id=case.id,
-        direction="outbound",
-        channel="simulated" if draft.get("simulated") else "llm",
-        body=draft["body"],
-    ))
+
+def apply_success(db: Session, case: RevenueCase, action: Action, result: dict) -> Action:
+    """Persist a completed external operation in one short transaction."""
+    now = utc_now()
+    if action.action_type == "CREATE_PAYMENT_LINK":
+        case.razorpay_payment_link_id = result.get("id")
+        audit_detail = {
+            "action_type": action.action_type,
+            "razorpay_payment_link_id": result.get("id"),
+            "short_url": result.get("short_url"),
+            "simulated": result.get("simulated", False),
+        }
+    else:
+        db.add(CustomerMessage(
+            revenue_case_id=case.id,
+            direction="outbound",
+            channel="simulated" if result.get("simulated") else "llm",
+            body=result["body"],
+        ))
+        audit_detail = {
+            "action_type": action.action_type,
+            "message_preview": result["body"][:120],
+            "simulated": result.get("simulated", False),
+        }
 
     action.status = "EXECUTED"
     action.executed_at = now
-    action.result = draft
-
+    action.result = result
+    action.last_error = None
     case.state = "AWAITING_OUTCOME"
     case.updated_at = now
+    _log_audit(db, case, "action_executed", audit_detail)
+    db.flush()
+    return action
 
-    _log_audit(
-        db, case, "action_executed",
-        {
-            "action_type": action.action_type,
-            "message_preview": draft["body"][:120],
-            "simulated": draft.get("simulated", False),
-        },
-    )
+
+def apply_terminal_failure(db: Session, case: RevenueCase, action: Action) -> Action:
+    """Persist a sanitized final failure after the retry budget is exhausted."""
+    now = utc_now()
+    action.status = "FAILED"
+    action.executed_at = now
+    action.result = {"error": "external service request failed"}
+    action.last_error = "external service request failed"
+    case.state = "HUMAN_REVIEW"
+    case.updated_at = now
+    _log_audit(db, case, "action_execution_failed", {"action_type": action.action_type})
     db.flush()
     return action

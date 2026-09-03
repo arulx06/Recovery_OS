@@ -13,7 +13,7 @@ from Phase 1 onward. This file is the source of truth for model shape.
 import uuid
 
 from sqlalchemy import (
-    Column, String, Integer, Numeric, DateTime, ForeignKey, JSON, Boolean, Text
+    Column, String, Integer, Numeric, DateTime, ForeignKey, JSON, Boolean, Text, Index, text
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -41,6 +41,15 @@ class Customer(Base):
 class RevenueCase(Base):
     """One failed payment / overdue receivable being tracked for recovery."""
     __tablename__ = "revenue_cases"
+    __table_args__ = (
+        Index(
+            "uq_revenue_cases_razorpay_payment_id",
+            "razorpay_payment_id",
+            unique=True,
+            postgresql_where=text("source = 'razorpay' AND razorpay_payment_id IS NOT NULL"),
+            sqlite_where=text("source = 'razorpay' AND razorpay_payment_id IS NOT NULL"),
+        ),
+    )
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
     customer_id = Column(UUID(as_uuid=False), ForeignKey("customers.id"), nullable=True)
@@ -87,6 +96,9 @@ class PaymentEvent(Base):
 
     razorpay_event_id = Column(String, unique=True, nullable=True)  # x-razorpay-event-id, for idempotency
     event_type = Column(String, nullable=False)  # payment.failed, payment.captured, etc.
+    razorpay_payment_id = Column(String, nullable=True, index=True)
+    razorpay_subscription_id = Column(String, nullable=True, index=True)
+    razorpay_payment_link_id = Column(String, nullable=True, index=True)
     raw_payload = Column(JSON, nullable=True)
 
     received_at = Column(DateTime, default=utc_now)
@@ -115,16 +127,24 @@ class Decision(Base):
 class Action(Base):
     """What was actually scheduled / executed as a result of a decision."""
     __tablename__ = "actions"
+    __table_args__ = (Index("ix_actions_status_scheduled_for", "status", "scheduled_for"),)
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
     revenue_case_id = Column(UUID(as_uuid=False), ForeignKey("revenue_cases.id"), nullable=False)
     decision_id = Column(UUID(as_uuid=False), ForeignKey("decisions.id"), nullable=True)
+    promise_to_pay_id = Column(UUID(as_uuid=False), ForeignKey("promises_to_pay.id"), nullable=True)
 
     action_type = Column(String, nullable=False)  # WAIT, CREATE_PAYMENT_LINK, CONTACT_CUSTOMER, ...
-    status = Column(String, default="SCHEDULED")  # SCHEDULED | EXECUTED | CANCELLED | FAILED
+    status = Column(String, default="SCHEDULED")  # SCHEDULED | EXECUTING | EXECUTED | CANCELLED | FAILED
     scheduled_for = Column(DateTime, nullable=True)
     executed_at = Column(DateTime, nullable=True)
     result = Column(JSON, nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=3)
+    claimed_at = Column(DateTime, nullable=True)
+    enqueued_at = Column(DateTime, nullable=True)
+    queue_job_id = Column(String, nullable=True)
+    last_error = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=utc_now)
 
@@ -140,7 +160,7 @@ class PromiseToPay(Base):
     promised_amount = Column(Numeric(12, 2), nullable=False)
     promised_date = Column(DateTime, nullable=False)
     confidence = Column(Numeric(3, 2), nullable=True)
-    status = Column(String, default="PENDING")  # PENDING | KEPT | BROKEN
+    status = Column(String, default="PENDING")  # PENDING | KEPT | BROKEN | SUPERSEDED
 
     created_at = Column(DateTime, default=utc_now)
 

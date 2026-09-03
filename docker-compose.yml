@@ -1,5 +1,5 @@
-# Local development services. PostgreSQL is required; Redis is reserved for
-# future scheduling work and is not used by the current application runtime.
+# Local development services. PostgreSQL is authoritative; Redis is the
+# reconstructable RQ transport used by action workers.
 # The backend and frontend run with `uvicorn` / `npm run dev` directly
 # during development — no need to containerize them yet.
 

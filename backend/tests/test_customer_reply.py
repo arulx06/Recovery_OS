@@ -2,6 +2,10 @@ import hashlib
 import hmac
 import json
 
+from app.core.database import SessionLocal
+from app.models import Action
+from app.services import temporal_runtime
+
 WEBHOOK_SECRET = "test_webhook_secret"
 
 
@@ -37,8 +41,16 @@ def fail_with_contact_action(client, payment_id: str, amount: int, event_id: str
         {"id": payment_id, "amount": amount, "error_reason": "otp_incorrect"},
         event_id=event_id,
     )
-    assert resp.json()["case_state"] == "AWAITING_OUTCOME"
-    return resp.json()["case_id"]
+    assert resp.json()["case_state"] == "ACTION_SCHEDULED"
+    case_id = resp.json()["case_id"]
+    with SessionLocal() as db:
+        action_id = (
+            db.query(Action.id)
+            .filter(Action.revenue_case_id == case_id, Action.action_type == "CONTACT_CUSTOMER")
+            .scalar()
+        )
+    assert temporal_runtime.process_action(action_id) == "executed"
+    return case_id
 
 
 # ---- the exit-criteria scenarios ----

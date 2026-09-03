@@ -12,8 +12,8 @@ This is intentionally **not** `failure → LLM → WhatsApp message → payment 
 
 - **Problem:** Payment failures beyond gateway routing — every failed payment needs a recovery decision, but most stacks treat all failures the same.
 - **What RecoveryOS adds** (vs. Razorpay today): deterministic failure taxonomy → guardrailed policy → measured baseline-vs-adaptive experiments with downloadable audits. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full boundary table.
-- **Current scope:** Signed webhook ingestion, deterministic diagnosis, guardrails + baseline policy, simulated and Test-Mode Payment Links, stored (not delivered) customer messages, promise-to-pay extraction, offline adaptive ML, and a measurement dashboard — all on a modular-monolith with PostgreSQL as the source of truth.
-- **What is not there yet:** No automatic scheduler/worker for parked states, no delivered SMS/email/WhatsApp, no production live-money integration, no LLM controlling money moves.
+- **Current scope:** Signed webhook ingestion, deterministic diagnosis, guardrails + baseline policy, PostgreSQL-authoritative Redis/RQ temporal execution, simulated and Test-Mode Payment Links, linked promise-to-pay deadlines, offline adaptive ML, and a measurement dashboard.
+- **What is not there yet:** No delivered SMS/email/WhatsApp, no production live-money integration, no provider-side closure of the rare accepted-request/worker-crash window, and no LLM controlling money moves.
 
 **Two disclaimers (read before evaluating numbers):**
 
@@ -33,12 +33,14 @@ This is intentionally **not** `failure → LLM → WhatsApp message → payment 
 | Payment Links — Razorpay **Test Mode** live call | ✅ Verified (manual) |
 | `payment.captured` / `payment_link.paid` → `RECOVERED` | ✅ Verified |
 | Promise-to-Pay extraction (regex heuristic / optional Anthropic) | ✅ Simulated default |
+| Durable `WAIT` / native-retry / linked PTP scheduling via Redis/RQ | ✅ Verified on PostgreSQL + Redis |
+| Atomic action claims, bounded retries, stale-job no-ops, DB reconciliation | ✅ Verified |
 | Adaptive ML scorer (`HistGradientBoostingClassifier`, expected-value ranking) | ✅ Offline only — not live |
 | Persisted experiments (baseline vs adaptive, `run_id` + CSV audit) | ✅ Verified |
 | React dashboard + health + case list | ✅ Verified |
-| Hermetic test suite (233 tests; no external network) | ✅ Verified |
+| Hermetic test suite (257 tests; no external network or Redis required) | ✅ Verified |
 
-**Important limits:** Delayed actions are persisted rows only — `WAIT`/`FOLLOW_UP_PTP` have **no automatic wake-up** (`docs/CURRENT_STATE.md` → Runtime reality). Drafted customer messages are **stored, not delivered**. The adaptive policy is **offline/synthetic** and does not serve the live webhook path. Redis/RQ are reserved dependencies with no worker. See the full matrix at [`docs/CURRENT_STATE.md`](./docs/CURRENT_STATE.md).
+**Important limits:** The worker and periodic reconciliation are required operational processes. Drafted customer messages are **stored, not delivered**. The adaptive policy remains **offline/synthetic** and does not serve the live webhook path. See the full matrix at [`docs/CURRENT_STATE.md`](./docs/CURRENT_STATE.md).
 
 ---
 
@@ -50,14 +52,15 @@ Razorpay Test Mode  ──webhooks──►  FastAPI  ──►  Failure diagnos
                                     │                     ▼                  ▼                    ▼
                                     │              PostgreSQL (source of truth: cases, events, decisions, actions, audit)
                                     │                     ▲
+                                    └────  Redis/RQ worker (ID-only jobs; atomic DB claims; delayed WAIT/PTP)
                                     └────  Action executor (Payment Links — simulated or Test Mode; contact drafts — stored only)
-                                    └────  Customer reply / PTP follow-up (manual-only scheduling)
+                                    └────  Customer reply / linked PTP follow-up
                                     └────  Offline adaptive ML + experiment runner (synthetic)
                                     └────  React dashboard
 ```
 
 - Deterministic code decides when money moves; LLM never does — it drafts text or parses a reply.
-- PostgreSQL is authoritative; Redis/RQ are future transport (planned, not wired).
+- PostgreSQL is authoritative; Redis/RQ is reconstructable execution transport.
 - See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for component boundaries, state machine, and Mermaid diagrams.
 
 ---
@@ -84,6 +87,12 @@ pip install -r requirements.txt
 alembic upgrade head
 uvicorn app.main:app --reload --port 8000
 # macOS/Linux variant is in RUNBOOK.md
+```
+
+In a second activated Windows terminal from `backend/`:
+
+```bash
+rq worker --worker-class app.worker.WindowsWorker --with-scheduler --url redis://localhost:6379/0 recoveryos
 ```
 
 Health check: `curl http://localhost:8000/health`
@@ -119,7 +128,7 @@ See [`docs/RUNBOOK.md`](./docs/RUNBOOK.md) for Payment Link → `payment_link.pa
 | Frontend | React + Vite + TypeScript, Tailwind CSS |
 | Backend | Python + FastAPI, Pydantic, SQLAlchemy + Alembic |
 | Database | PostgreSQL (SQLite for tests) |
-| Delayed actions | DB records + manual processor; Redis/RQ reserved |
+| Delayed actions | PostgreSQL-authoritative `Action` rows + Redis/RQ worker/scheduler |
 | ML | scikit-learn `HistGradientBoostingClassifier` (offline/synthetic) |
 | LLM | Optional Anthropic Messages API; templated/regex simulation otherwise |
 | Payments | Signed webhooks; simulated or opt-in Test-Mode Payment Links |

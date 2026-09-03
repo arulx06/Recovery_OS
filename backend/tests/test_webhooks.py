@@ -4,7 +4,8 @@ import json
 
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.models import PaymentEvent, RevenueCase
+from app.models import Action, PaymentEvent, RevenueCase
+from app.services import temporal_runtime
 
 WEBHOOK_SECRET = "test_webhook_secret"
 
@@ -30,6 +31,17 @@ def send_webhook(client, event_type: str, entity: dict, event_id: str):
             "content-type": "application/json",
         },
     )
+
+
+def execute_action(case_id: str, action_type: str) -> str:
+    with SessionLocal() as db:
+        action_id = (
+            db.query(Action.id)
+            .filter(Action.revenue_case_id == case_id, Action.action_type == action_type)
+            .order_by(Action.created_at.desc())
+            .scalar()
+        )
+    return temporal_runtime.process_action(action_id)
 
 
 def test_rejects_bad_signature(client):
@@ -159,6 +171,28 @@ def test_recovery_event_with_no_matching_case_is_a_noop(client):
     assert resp.json()["case_id"] is None
 
 
+def test_out_of_order_capture_prevents_later_failure_automation(client):
+    captured = send_webhook(
+        client,
+        "payment.captured",
+        {"id": "pay_capture_first", "amount": 10000},
+        event_id="evt_capture_first_a",
+    )
+    assert captured.json()["case_id"] is None
+
+    failed = send_webhook(
+        client,
+        "payment.failed",
+        {"id": "pay_capture_first", "amount": 10000, "error_reason": "card_expired"},
+        event_id="evt_capture_first_b",
+    )
+    assert failed.json()["case_state"] == "RECOVERED"
+    case_id = failed.json()["case_id"]
+    with SessionLocal() as db:
+        assert db.query(Action).filter(Action.revenue_case_id == case_id).count() == 0
+        assert db.query(PaymentEvent).filter(PaymentEvent.revenue_case_id == case_id).count() == 2
+
+
 def test_payment_failed_is_diagnosed_with_a_failure_category(client):
     resp = send_webhook(
         client, "payment.failed",
@@ -171,7 +205,8 @@ def test_payment_failed_is_diagnosed_with_a_failure_category(client):
     # and, as of Phase 4, actually gets executed (simulated, since no
     # Razorpay test-mode credentials are configured here) — landing the
     # case in AWAITING_OUTCOME rather than just ACTION_SCHEDULED.
-    assert resp.json()["case_state"] == "AWAITING_OUTCOME"
+    assert resp.json()["case_state"] == "ACTION_SCHEDULED"
+    assert execute_action(resp.json()["case_id"], "CREATE_PAYMENT_LINK") == "executed"
 
     cases = client.get("/cases").json()
     case = next(c for c in cases if c["amount"] == 3000.0)
@@ -206,9 +241,10 @@ def test_create_payment_link_action_actually_executes_and_case_awaits_outcome(cl
         {"id": "pay_test_007", "amount": 90000, "error_reason": "card_expired"},
         event_id="evt_007",
     )
-    assert resp.json()["case_state"] == "AWAITING_OUTCOME"
+    assert resp.json()["case_state"] == "ACTION_SCHEDULED"
 
     case_id = resp.json()["case_id"]
+    assert execute_action(case_id, "CREATE_PAYMENT_LINK") == "executed"
     detail = client.get(f"/cases/{case_id}").json()
     executed_actions = [a for a in detail["actions"] if a["action_type"] == "CREATE_PAYMENT_LINK"]
     assert len(executed_actions) == 1
@@ -223,7 +259,8 @@ def test_payment_link_paid_recovers_the_case(client):
         event_id="evt_008a",
     )
     case_id = failed.json()["case_id"]
-    assert failed.json()["case_state"] == "AWAITING_OUTCOME"
+    assert failed.json()["case_state"] == "ACTION_SCHEDULED"
+    assert execute_action(case_id, "CREATE_PAYMENT_LINK") == "executed"
 
     link_id = client.get(f"/cases/{case_id}").json()["razorpay_payment_link_id"]
     assert link_id is not None

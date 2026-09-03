@@ -112,6 +112,8 @@ pip install -r requirements.txt
 
 Migrations are owned by Alembic. Run them before starting the app, and after every `git pull` that changes `backend/alembic/versions/*`.
 
+Revision `8d6e24f91a73` adds a live-Razorpay payment-ID unique index. It checks for legacy duplicate `source=razorpay` payment IDs before any schema change and aborts with a clear error if operator resolution is required. Subscription IDs are intentionally not unique because billing cycles reuse them.
+
 ```bash
 alembic upgrade head
 ```
@@ -129,6 +131,32 @@ If this fails, confirm `DATABASE_URL` in `backend/.env` points to `postgresql+ps
 ```bash
 uvicorn app.main:app --reload --port 8000
 ```
+
+### 2e. Start the RQ worker and scheduler
+
+Run from `backend/` in a second activated terminal. On Windows, stock RQ 1.16.2 uses unavailable `fork`/`SIGALRM` primitives, so the custom worker class is required.
+
+**PowerShell / CMD:**
+
+```bash
+rq worker --worker-class app.worker.WindowsWorker --with-scheduler --url redis://localhost:6379/0 recoveryos
+```
+
+**macOS / Linux:**
+
+```bash
+rq worker --with-scheduler --url redis://localhost:6379/0 recoveryos
+```
+
+The worker must run from `backend/` so `app.jobs.process_action` imports and `backend/.env` loads. `--with-scheduler` is required for future `WAIT` and PTP jobs.
+
+Run reconciliation after startup and periodically (for example, once per minute via Task Scheduler/cron):
+
+```bash
+python scripts/reconcile_actions.py
+```
+
+This repairs expired `EXECUTING` claims and republishes all PostgreSQL `SCHEDULED` actions. It is safe to repeat. Review the count before starting a worker against an existing database because historical scheduled actions may become executable.
 
 Expected: `Uvicorn running on http://127.0.0.1:8000`.
 
@@ -208,13 +236,14 @@ Working directory: **`backend/`** with the venv activated.
 
 ```bash
 python -m pytest -q
-# 233 passed
+# 257 passed
 ```
 
 What "hermetic" means here (`tests/conftest.py`):
 
 - `ENV=test`, `DATABASE_URL=sqlite:///<tempfile>/test.db` (process-unique, removed after session).
 - `RAZORPAY_API_ENABLED=false`, `LLM_API_ENABLED=false` regardless of `backend/.env`.
+- `TASK_QUEUE_ENABLED=false` and an inert loopback `REDIS_URL`; Redis is not required.
 - Fake `RAZORPAY_KEY_ID`/`LLM_API_KEY` values so missing-credential branches are exercised but never make network calls.
 - `socket.connect` / `socket.connect_ex` / `socket.sendto` guarded to loopback only; any external-network attempt raises.
 
@@ -386,15 +415,15 @@ curl -X POST http://localhost:8000/cases/$CASE_ID/customer-reply -H "Content-Typ
 
 Message drafting / intent extraction are **simulated** by default (`channel=simulated`); to use Anthropic, set `LLM_PROVIDER=anthropic`, `LLM_API_KEY`, `LLM_API_ENABLED=true` in `backend/.env`.
 
-**Broken promises** are processed manually only:
+The RQ scheduler processes the linked promise after the full merchant-local promised day. To repair missed queue publication or abandoned claims:
 
 ```bash
 # working directory: backend/
-python scripts/process_followups.py
-# Prints: Processed N due follow-up(s): already recovered … / broken promise -> escalated …
+python scripts/reconcile_actions.py
+# process_followups.py remains a compatibility alias for the same reconciliation
 ```
 
-Run this periodically or via external cron — no automatic scheduler exists.
+For a short local wait test, stop/restart the backend and worker with `WAIT_DELAY_SECONDS=5`, send a transient failure, and watch the worker move the case out of `WAITING`. Do not use shortened delays in shared environments.
 
 ---
 
@@ -465,6 +494,8 @@ See `docs/SYSTEM_FLOWS.md` flow 8 and `app/routers/experiments.py`:
 | `python scripts/send_test_webhook.py …` | `backend/` (or absolute `backend/scripts/send_test_webhook.py`) |
 | `python scripts/evaluate_policies.py …` | `backend/` |
 | `python scripts/process_followups.py` | `backend/` |
+| `python scripts/reconcile_actions.py` | `backend/` |
+| `rq worker ... recoveryos` | `backend/` |
 | `python scripts/run_synthetic_batch.py …` | `backend/` (it sets `DATABASE_URL=sqlite:///:memory:` itself) |
 | `python -m pytest` | `backend/` |
 | `alembic upgrade head` | `backend/` |
@@ -485,7 +516,7 @@ docker compose down      # services stopped, data kept
 docker compose down -v   # also wipes Postgres volume — use after a known-bad migration attempt
 ```
 
-After a restart: `docker compose up -d` → `cd backend && alembic upgrade head` → `uvicorn …` → `cd frontend && npm run dev`.
+After a restart: start Compose, run `alembic upgrade head`, run `python scripts/reconcile_actions.py`, then start uvicorn, the RQ worker with scheduler, and the frontend.
 
 ---
 
@@ -497,8 +528,11 @@ After a restart: `docker compose up -d` → `cd backend && alembic upgrade head`
 | `POST /webhooks/razorpay` returns `400 invalid webhook signature` | The raw-body HMAC must match `backend/.env:RAZORPAY_WEBHOOK_SECRET` and `send_test_webhook.py --secret` / `$env:RAZORPAY_WEBHOOK_SECRET`. Mismatch is intentional (fails closed). For tests, `conftest.py` uses `test_webhook_secret`. |
 | `POST /webhooks/razorpay` returns `400 missing x-razorpay-event-id` | `send_test_webhook.py` generates one; a raw `curl` needs `-H "x-razorpay-event-id: evt_local_1"`. |
 | `python -m app.ml.train` warns `No trained model at …` on experiments | `POST /experiments` without a model returns `503 ModelNotTrainedError` — run `python -m app.ml.train` first. Artifact is gitignored. |
-| `FOLLOW_UP_PTP` rows stuck `SCHEDULED` | Expected — run `python scripts/process_followups.py` from `backend/` manually. |
+| `/health` reports Redis `unreachable` | Confirm the Redis container is up and `REDIS_URL` is correct. Use `TASK_QUEUE_ENABLED=false` only for intentionally queue-free test processes. |
+| Actions remain `SCHEDULED` | Start the worker with `--with-scheduler`, then run `python scripts/reconcile_actions.py`. Check `rq info --url redis://localhost:6379/0 recoveryos`. |
+| RQ fails with `os.fork` or `signal.SIGALRM` on Windows | Use `--worker-class app.worker.WindowsWorker`; `SimpleWorker` alone still uses the Unix timeout class. |
+| Actions remain `EXECUTING` after a worker crash | After `ACTION_CLAIM_TIMEOUT_SECONDS`, run reconciliation. It resets attempts still within budget and fails exhausted work to human review. |
 | `npm run lint` fails | `oxlint` (not eslint) — run `npm install` first; check Node 22+. |
-| `alembic upgrade head` says `already at head` | Fine — there are 3 revisions (`709600d2e2b1`, `d3e3dbb702c4`, `197e63dfda6f`). CI verifies against SQLite explicitly (`DATABASE_URL=sqlite:///./ci_migration.db python -m alembic upgrade head`). |
+| `alembic upgrade head` says `already at head` | Fine - current head is `8d6e24f91a73`. CI verifies migrations against SQLite and local verification uses PostgreSQL. |
 
 No real credentials are included above. For full boundaries see `docs/INTEGRATIONS.md`.

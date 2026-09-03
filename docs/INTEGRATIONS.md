@@ -115,7 +115,7 @@ _require_live_config()              # provider == anthropic, key non-empty
 
 - **Allowed:** produce a draft sentence collection; classify a free-text reply. Both produce text/guess only.
 - **Prohibited:** deciding whether money moves. `extract_ptp_intent` output is **always** validated by `ptp_extractor.validate_promise` (`app/services/ptp_extractor.py:38`) — checks confidence ≥ 0.6, amount positive and ≤ `case.amount`, date ∈ [today, today+14d], `intent==promise_to_pay`; anything that fails validation goes to `HUMAN_REVIEW` rather than becoming a `PromiseToPay`. Dispute classifications route through the **same** `_dispute_case` path (`orchestrator.py:248`) as a Razorpay dispute webhook — identical terminal logic.
-- **Failure mode:** `LLMAPIError` / `httpx.HTTPError` in the draft path is caught by `action_executor._execute_contact` → `Action(status=FAILED, result={error})` + `HUMAN_REVIEW` (`action_executor.py:112`), flushed — webhook itself still returns `200` so Razorpay stops retrying this event and a human can investigate. Extraction failures fall back to `unclear` rather than retrying in place.
+- **Failure mode:** worker draft failures are sanitized and retried within the action's bounded attempt budget; exhaustion produces `Action(status=FAILED)` + `HUMAN_REVIEW`. The originating webhook has already committed and returned. Extraction failures fall back to `unclear` rather than retrying in place.
 
 ### Current limitations
 
@@ -135,24 +135,33 @@ _require_live_config()              # provider == anthropic, key non-empty
 
 ## Redis / RQ
 
-### Actual current state — not planned fiction
+### Actual current state
 
 | Aspect | Code fact | File |
 |--------|-----------|------|
 | Dependency installed | `redis==5.0.8`, `rq==1.16.2` | `backend/requirements.txt:10` |
-| Config key present | `REDIS_URL=redis://localhost:6379/0` | `app/core/config.py:19` — comment "Reserved for a future delayed-action worker; currently unused." |
-| Compose service | `services.redis: image: redis:7-alpine` | `docker-compose.yml:19` — comment "Redis is reserved for future scheduling work" |
-| Runtime imports | **None** in `backend/app/**` or `backend/scripts/**` besides a comment documenting the absence | Verified: `grep -r "import redis\|from rq\|import rq" backend/app backend/scripts` → no hit besides `config.py` definition and `ptp_followup.py:6` comment |
-| Queue / worker / scheduler process | **Does not exist** | No `rq.Worker`, no `Queue`, no `redis.from_url`, no `app/worker.py` |
-| Use in request path | None — `WAIT`/`FOLLOW_UP_PTP` rows are `Action(status=SCHEDULED)` that stay scheduled until healed by `scripts/process_followups.py` or a future inbound webhook | `docs/SYSTEM_FLOWS.md` flows 9–10 |
+| Configuration | `REDIS_URL`, `RQ_QUEUE_NAME`, `TASK_QUEUE_ENABLED`, delay/retry/lease settings | `app/core/config.py`, `.env.example` |
+| Compose service | `services.redis: image: redis:7-alpine` | `docker-compose.yml` |
+| Publisher | `task_queue.enqueue_action` / `enqueue_case_actions` | Publishes only after DB commit; payload is only `action_id` |
+| Worker entry | `app.jobs.process_action` -> `temporal_runtime.process_action` | Re-reads all authoritative facts from PostgreSQL |
+| Scheduler | RQ worker `--with-scheduler` | Moves future `enqueue_at` jobs when due |
+| Reconciliation | `python scripts/reconcile_actions.py` | Recovers expired claims and republishes every `SCHEDULED` queueable action |
+| Windows worker | `app.worker.WindowsWorker` | Avoids unsupported `os.fork` and `SIGALRM` in RQ 1.16.2 |
 
-In other words: **dependency + configuration present, execution runtime not implemented.** Compose brings up a Redis container because local development provisions it for the future runtime, not because the current application connects to it.
+PostgreSQL owns the lifecycle: `Action.status`, `scheduled_for`, `attempt_count`, `max_attempts`, `claimed_at`, `enqueued_at`, `queue_job_id`, and `last_error`. Redis can be flushed and rebuilt from those rows. `enqueued_at` is observability, not proof that work is durable.
 
-Do not describe automatic wake-up behavior as current (`WAIT` is a persisted `SCHEDULED` row that is never woken; see `docs/CURRENT_STATE.md` Runtime reality).
+Only actions whose case has `source=razorpay` are published or reconciled. Offline `experiment` and synthetic policy rows share the `actions` table for evaluation but are never live work.
 
-### Future intent (brief)
+Job IDs are deterministic per action attempt: `action-{action_id}-{attempt_count}`. Duplicate deliveries are safe because the worker's conditional update is the claim authority. If an RQ job record exists but is absent from both the queue and scheduled registry, the publisher removes the orphan record and republishes it.
 
-The intended runtime is: Redis as **transport** (enqueue wake-up jobs / pub/sub heartbeat) with PostgreSQL as the **source of truth** (`Action.scheduled_for` ≤ now drives durability), so crash recovery and invariant checks remain DB-bound. Any worker will need idempotency guarding against double-execution of the same `Action` and terminal-state re-validation before mutating `RevenueCase.state`. This is reserved for the Temporal Recovery Runtime phase and is explicitly **not wired** here.
+### Transaction and failure contract
+
+- Request handlers commit before Redis publish. Redis failure does not roll back webhook ingestion.
+- Workers lock the case, atomically claim due work, and commit before provider I/O.
+- Success/failure finalization uses a new short transaction and rechecks status, case state, and supersession.
+- Expected provider failures use bounded application retries. Persisted error text is sanitized.
+- Unexpected worker death leaves an expiring `EXECUTING` lease. Reconciliation resets it or marks it exhausted.
+- Payment Link requests use `Action.id` as `reference_id` and include case/action IDs in notes. Provider-side reconciliation is still required for the narrow crash-after-accept/before-finalize window.
 
 ---
 
@@ -160,10 +169,9 @@ The intended runtime is: Redis as **transport** (enqueue wake-up jobs / pub/sub 
 
 | Capability | External call today | When it fires | Fallback |
 |------------|---------------------|---------------|----------|
-| Payment Link create | `POST /v1/payment_links` **only when** `RAZORPAY_API_ENABLED=true` + `rzp_test_*` | `action_executor._execute_create_payment_link`, synchronously in the webhook request | `_simulated_payment_link` |
-| LLM draft | `POST https://api.anthropic.com/v1/messages` **only when** `LLM_API_ENABLED=true` + provider=anthropic + key | `action_executor._execute_contact`, synchronously in the webhook request | `_simulated_draft` (`_TEMPLATES`) |
-| LLM PTP extract | Same endpoint, same gate | `orchestrator.handle_customer_reply`, synchronously in the `customer-reply` request | `_simulated_extract` (keywords + regex) |
-| Redis/RQ enqueue | *(none)* | — | `SCHEDULED` DB rows (see Redis section) |
+| Payment Link create | `POST /v1/payment_links` **only when** `RAZORPAY_API_ENABLED=true` + `rzp_test_*` | Claimed worker action, outside DB transaction | `_simulated_payment_link` |
+| LLM draft | `POST https://api.anthropic.com/v1/messages` **only when** `LLM_API_ENABLED=true` + provider=anthropic + key | Claimed worker action, outside DB transaction | `_simulated_draft` (`_TEMPLATES`) |
+| LLM PTP extract | Same endpoint, same gate | Before the customer-reply row-lock transaction | `_simulated_extract` (keywords + regex) |
+| Redis/RQ enqueue | Redis at `REDIS_URL` when `TASK_QUEUE_ENABLED=true` | After request commit, after retry commit, or reconciliation | Durable `SCHEDULED` DB row remains recoverable |
 
 Every external call path can be **fully exercised under tests without network** via the `simulated` branch and the fake `httpx.post` monkeypatches (`tests/test_razorpay_client.py:53`, `tests/test_llm_client.py:49`).
-

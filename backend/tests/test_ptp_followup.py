@@ -57,7 +57,7 @@ def test_already_recovered_case_is_left_alone(db_session):
     ptp_followup.process_due_followups(db_session, now=NOW)
 
     assert case.state == "RECOVERED"  # untouched
-    assert promise.status == "PENDING"  # untouched — no need to mark it broken, the case already recovered
+    assert promise.status == "KEPT"
     assert action.status == "EXECUTED"  # still marked done, so it's not reprocessed
 
 
@@ -102,4 +102,4 @@ def test_multiple_due_followups_in_one_batch_are_all_processed(db_session):
 
     assert action_a.status == "EXECUTED" and promise_a.status == "BROKEN"
     assert action_b.status == "EXECUTED" and promise_b.status == "BROKEN"
-    assert action_c.status == "EXECUTED" and promise_c.status == "PENDING"  # recovered case, promise left alone
+    assert action_c.status == "EXECUTED" and promise_c.status == "KEPT"

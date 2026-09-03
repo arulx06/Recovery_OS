@@ -8,14 +8,15 @@ update current entity state -> trigger recovery orchestration -> return 200
 Two things matter more than they look like they should:
 
 1. Signature, JSON shape, and event-ID validation fail closed with 400.
-   Accepted duplicate event IDs return 200 without reprocessing. Downstream
-   failures currently return 500 so Razorpay can retry; durable background
-   processing is not implemented yet.
+   Accepted duplicate event IDs return 200 without reprocessing. Orchestration
+   failures return 500; queue publication happens only after a successful DB
+   commit and is repaired from PostgreSQL if Redis is unavailable.
 
 2. Idempotency is enforced at the database level (payment_events.
    razorpay_event_id is unique), not just checked-then-inserted in
    application code, so a race between two near-simultaneous deliveries
-   of the same event can't create two rows.
+   of the same event can't create two rows. Durable actions are committed
+   before an ID-only RQ job is published; reconciliation repairs publish loss.
 """
 from fastapi import APIRouter, Depends, Request, HTTPException
 from sqlalchemy.exc import IntegrityError
@@ -26,7 +27,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import verify_signature
 from app.models import PaymentEvent
-from app.services import orchestrator
+from app.services import orchestrator, task_queue
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
@@ -68,11 +69,16 @@ async def razorpay_webhook(request: Request, db: Session = Depends(get_db)):
         return {"status": "ignored", "reason": "duplicate_event", "event_id": razorpay_event_id}
 
     case = orchestrator.handle_event(db, payment_event, event_type, payload)
+    case_id = case.id if case else None
+    case_state = case.state if case else None
     db.commit()
+
+    if case_id:
+        task_queue.enqueue_case_actions(case_id)
 
     return {
         "status": "processed",
         "event_type": event_type,
-        "case_id": case.id if case else None,
-        "case_state": case.state if case else None,
+        "case_id": case_id,
+        "case_state": case_state,
     }

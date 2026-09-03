@@ -22,9 +22,8 @@ Order of operations, every time a case is diagnosed:
               v
     case.state updated to match the chosen action
 
-No LLM, no side effects (no message is actually sent, no Payment Link is
-actually created yet — that's Phase 4/6). This module only decides and
-records; execution is deliberately out of scope here.
+No LLM and no side effects. This module only decides and records; the
+temporal worker claims executable actions after the transaction commits.
 """
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -33,9 +32,11 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from app.models import RevenueCase, Decision, Action, AuditEvent
+from app.core.config import settings
 from app.core.time import utc_now
 
 CONTACT_ACTIONS = {"CONTACT_CUSTOMER", "CREATE_PAYMENT_LINK", "COLLECT_PROMISE_TO_PAY"}
+WAIT_ACTIONS = {"WAIT", "WAIT_FOR_NATIVE_RETRY"}
 
 # Every state this engine can leave a case in, keyed by the action chosen.
 ACTION_TO_STATE = {
@@ -108,6 +109,19 @@ def _check_action_allowed(
     db: Session, case: RevenueCase, action: str, config: GuardrailConfig, now: datetime
 ) -> tuple[bool, str | None]:
     """Returns (allowed, reason_if_blocked)."""
+    if action in WAIT_ACTIONS:
+        completed_wait = (
+            db.query(Action.id)
+            .filter(
+                Action.revenue_case_id == case.id,
+                Action.action_type == action,
+                Action.status == "EXECUTED",
+            )
+            .first()
+        )
+        if completed_wait:
+            return False, f"{action} already completed for this case"
+
     if action in CONTACT_ACTIONS and case.amount is not None and case.amount > config.max_automated_amount:
         return False, f"amount {case.amount} exceeds max_automated_amount {config.max_automated_amount} — requires human approval"
 
@@ -152,12 +166,21 @@ def _record_decision(
     db.add(decision)
     db.flush()
 
+    scheduled_for = now
+    if chosen_action == "WAIT":
+        scheduled_for = now + timedelta(seconds=settings.WAIT_DELAY_SECONDS)
+    elif chosen_action == "WAIT_FOR_NATIVE_RETRY":
+        scheduled_for = now + timedelta(seconds=settings.NATIVE_RETRY_DELAY_SECONDS)
+
+    is_terminal_instruction = chosen_action in {"ESCALATE", "STOP"}
     db.add(Action(
         revenue_case_id=case.id,
         decision_id=decision.id,
         action_type=chosen_action,
-        status="SCHEDULED",
-        scheduled_for=now,
+        status="EXECUTED" if is_terminal_instruction else "SCHEDULED",
+        scheduled_for=scheduled_for,
+        executed_at=now if is_terminal_instruction else None,
+        max_attempts=settings.ACTION_MAX_ATTEMPTS,
     ))
     db.flush()
 

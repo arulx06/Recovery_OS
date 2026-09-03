@@ -3,8 +3,10 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.config import settings
+from app.core.time import utc_now, utc_to_local
 from app.models import RevenueCase, Decision, Action, AuditEvent, PromiseToPay, CustomerMessage
-from app.services import orchestrator
+from app.services import llm_client, orchestrator, task_queue
 
 router = APIRouter(prefix="/cases", tags=["cases"])
 
@@ -122,6 +124,13 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
                 "scheduled_for": a.scheduled_for.isoformat() if a.scheduled_for else None,
                 "executed_at": a.executed_at.isoformat() if a.executed_at else None,
                 "result": a.result,
+                "promise_to_pay_id": a.promise_to_pay_id,
+                "attempt_count": a.attempt_count,
+                "max_attempts": a.max_attempts,
+                "claimed_at": a.claimed_at.isoformat() if a.claimed_at else None,
+                "enqueued_at": a.enqueued_at.isoformat() if a.enqueued_at else None,
+                "queue_job_id": a.queue_job_id,
+                "last_error": a.last_error,
             }
             for a in actions
         ],
@@ -166,11 +175,28 @@ def customer_reply(case_id: str, body: CustomerReplyRequest, db: Session = Depen
     transport). Runs PTP/dispute extraction and returns the resulting case
     state.
     """
-    case = db.query(RevenueCase).filter(RevenueCase.id == case_id).first()
-    if not case:
+    exists = db.query(RevenueCase.id).filter(RevenueCase.id == case_id).scalar()
+    db.rollback()
+    if not exists:
         raise HTTPException(status_code=404, detail="case not found")
 
-    updated = orchestrator.handle_customer_reply(db, case, body.body)
+    now = utc_now()
+    business_now = utc_to_local(now, settings.MERCHANT_TIMEZONE)
+    extraction = llm_client.extract_ptp_intent(body.body, now=business_now)
+    case = (
+        db.query(RevenueCase)
+        .filter(RevenueCase.id == case_id)
+        .with_for_update()
+        .first()
+    )
+    if not case:
+        raise HTTPException(status_code=404, detail="case not found")
+    updated = orchestrator.handle_customer_reply(
+        db, case, body.body, now=now, business_now=business_now, extraction=extraction,
+    )
+    updated_id = updated.id
+    updated_state = updated.state
     db.commit()
+    task_queue.enqueue_case_actions(updated_id)
 
-    return {"case_id": updated.id, "case_state": updated.state}
+    return {"case_id": updated_id, "case_state": updated_state}

@@ -18,11 +18,13 @@ recoveryos/
 │   ├── INTEGRATIONS.md       # Razorpay / LLM / Redis-RQ — real vs simulated
 │   ├── DEVELOPMENT.md        # this file
 │   └── DECISIONS.md          # ADRs with status
-├── docker-compose.yml        # local Postgres (required) + Redis (reserved)
+├── docker-compose.yml        # local Postgres (authoritative) + Redis (RQ transport)
 ├── backend/
 │   ├── app/
 │   │   ├── main.py           # FastAPI app + router registration
-│   │   ├── models.py         # 9 tables — schema shape source of truth
+│   │   ├── models.py         # schema shape source of truth
+│   │   ├── jobs.py           # ID-only RQ entry point
+│   │   ├── worker.py         # Windows-compatible RQ worker class
 │   │   ├── core/
 │   │   │   ├── config.py     # env-driven Settings (never touch os.environ elsewhere)
 │   │   │   ├── database.py   # engine / SessionLocal / get_db
@@ -37,7 +39,9 @@ recoveryos/
 │   │   │   ├── ml_policy.py           # adaptive scorer — offline only, guarded
 │   │   │   ├── llm_client.py          # draft + extract — simulated or Anthropic
 │   │   │   ├── ptp_extractor.py       # validates extraction before PromiseToPay
-│   │   │   ├── ptp_followup.py        # due-row processor — manual / cron
+│   │   │   ├── ptp_followup.py        # exact linked-promise completion
+│   │   │   ├── task_queue.py          # after-commit RQ publishing
+│   │   │   ├── temporal_runtime.py    # claims, execution, retry, reconciliation
 │   │   │   └── experiment_runner.py   # persisted matched-scenario experiments
 │   │   ├── ml/
 │   │   │   ├── ground_truth.py        # hand-set P(recovery) simulator + modifiers
@@ -51,13 +55,14 @@ recoveryos/
 │   │       ├── cases.py               # GET /cases, GET /cases/{id}, POST /cases/{id}/customer-reply
 │   │       ├── webhooks.py            # POST /webhooks/razorpay
 │   │       └── experiments.py         # POST/GET /experiments, GET /{id}/export.csv
-│   ├── alembic/versions/     # 3 revisions — only way schema changes
+│   ├── alembic/versions/     # 4 revisions — only way schema changes
 │   ├── scripts/
 │   │   ├── send_test_webhook.py       # signed webhook sender (local testing)
 │   │   ├── run_synthetic_batch.py     # 100-case policy health check
 │   │   ├── evaluate_policies.py       # baseline vs ML script (non-persisted)
-│   │   └── process_followups.py       # manual BROKEN-promise processor
-│   ├── tests/                # 233 hermetic tests
+│   │   ├── reconcile_actions.py       # repair claims and republish DB work
+│   │   └── process_followups.py       # compatibility reconciliation entry
+│   ├── tests/                # hermetic suite; canonical count in CURRENT_STATE.md
 │   ├── requirements.txt
 │   └── .env.example
 └── frontend/
@@ -96,7 +101,16 @@ recoveryos/
 | `APP_NAME` | No | `RecoveryOS` | No |
 | `ENV` | No | `dev` | No (tests set `test`) |
 | `DATABASE_URL` | Yes for real run | `postgresql+psycopg2://recoveryos:recoveryos@localhost:5432/recoveryos` | No |
-| `REDIS_URL` | No | `redis://localhost:6379/0` | No — reserved, no current import |
+| `REDIS_URL` | When queue enabled | `redis://localhost:6379/0` | Redis transport only |
+| `RQ_QUEUE_NAME` | No | `recoveryos` | Selects worker queue |
+| `TASK_QUEUE_ENABLED` | No | `true` | Gate for Redis publishing/health checks |
+| `WAIT_DELAY_SECONDS` | No | `3600` | Generic wait deadline |
+| `NATIVE_RETRY_DELAY_SECONDS` | No | `86400` | Native retry deadline |
+| `ACTION_MAX_ATTEMPTS` | No | `3` | Bounded provider attempts for new actions |
+| `ACTION_RETRY_DELAY_SECONDS` | No | `60` | Exponential retry base |
+| `ACTION_CLAIM_TIMEOUT_SECONDS` | No | `300` | Abandoned `EXECUTING` lease threshold |
+| `ACTION_JOB_TIMEOUT_SECONDS` | No | `30` | RQ execution timeout |
+| `MERCHANT_TIMEZONE` | No | `Asia/Kolkata` | PTP date validation/deadline zone |
 | `RAZORPAY_API_ENABLED` | No | `false` | **Gate** — live Payment Links only when `true` + valid key |
 | `RAZORPAY_KEY_ID` | When enabled | `""` | Only with gate; `rzp_test_*` enforced |
 | `RAZORPAY_KEY_SECRET` | When enabled | `""` | Only with gate |
@@ -135,6 +149,7 @@ python -m pytest -q
 Non-negotiable — see `tests/conftest.py`:
 
 - `ENV=test`, `DATABASE_URL=sqlite:///<tempfile>/test.db` (per-session tmpdir, removed after).
+- `TASK_QUEUE_ENABLED=false` and an inert loopback `REDIS_URL`; normal tests never require Redis.
 - `RAZORPAY_API_ENABLED=false`, `LLM_API_ENABLED=false`; fake keys so "credentials present" branches are exercised as `simulated` without network.
 - `socket` guard: only `127.0.0.1` / `::1` permitted; anything else raises `AssertionError: automated tests must not access external networks`.
 - Uses `Base.metadata.create_all` / `delete()` instead of `alembic upgrade` for speed; schema is still verified by the explicit CI migration step.
@@ -149,18 +164,18 @@ Before adding a test that needs the trained model, accept a `trained_model_path`
 1. Add to `policy_engine.ALL_ACTIONS` (`policy_engine.py:240`) **and** `ml/costs.py:ACTION_COST` (cost == missing raises in `scorer.rank_actions`).
 2. Add `ACTION_TO_STATE[action] = …` mapping (`policy_engine.py:41`) — every state must exist or the orchestrator invariant breaks.
 3. Decide if the baseline prefers it: add to `CATEGORY_ACTION_PREFERENCE[category]` in preference order. If it is always guardrail-filtered, add its check to `_check_action_allowed`.
-4. Decide if it needs execution: add to `action_executor.EXECUTABLE_ACTION_TYPES` and add an `_execute_<action>` branch in `execute` (follow `_execute_create_payment_link` / `_execute_contact` for audit(shape) — `AuditEvent(action_executed, {simulated, …})` and failure → `FAILED + HUMAN_REVIEW`).
+4. Decide if it needs execution: add delayed/internal types to `task_queue.QUEUEABLE_ACTION_TYPES` and a branch in `temporal_runtime.process_action`; add provider-call types to `action_executor.EXECUTABLE_ACTION_TYPES` and `perform`. Provider calls must occur after the claim commit, never in a request transaction.
 5. Update ML ground truth if appropriate: `BASE_PROBABILITY[(category, action)]` in `app/ml/ground_truth.py:33`; out-of-table pairs fall back to `FALLBACK_PROBABILITY`, which may not be what you want.
 6. Update `CONTACT_ACTIONS` if the action counts as contact/friction (`policy_engine.py:38` also drives `ptp_followup` and experiment counting).
-7. Add tests: `test_policy_engine.py` param for `CATEGORY_TOP_CHOICE` (or guardrail block), `test_action_executor.py` for execute + failure, `test_experiments.py` or `test_ml_*` if scoring changes.
+7. Add tests: policy choice/guardrails plus duplicate delivery, terminal-state stale work, retry exhaustion, expired-claim reconciliation, and ID-only queue payloads in `test_temporal_runtime.py`.
 
 ---
 
 ## How to add a new webhook event
 
 1. In `app/services/orchestrator.py`, add to the appropriate set (`FAILURE_EVENTS`, `RECOVERY_EVENTS`, `DISPUTE_EVENTS`, or a new `PAYMENT_LINK_PAID_EVENT` analogue) and handle it in `handle_event` before the fallback `return None`.
-2. Add the `raw_payload` extraction (use `_entity_from_payload` or a specific `_payment_link_entity_from_payload` analogue; keep `util: payload.payload.values()` iteration convention).
-3. Decide state eligibility (`DIAGNOSABLE_STATES` / `REPLYABLE_STATES` analogues) — add a `TERMINAL_STATES` guard if appropriate. Current rules: recovery ignored from `RECOVERED/STOPPED/DISPUTED` (`orchestrator.py:206`); dispute always overrides (`orchestrator.py:248` — no terminal guard).
+2. Add explicit event-to-wrapper extraction. Never iterate payload wrapper order when an event can contain payment, subscription, link, and dispute entities together.
+3. Decide state eligibility. Current rules: `STOPPED` can still recover; `RECOVERED`/`DISPUTED` ignore recovery; dispute always overrides recovery.
 4. Add audit events; treat `PaymentEvent` as append-only.
 5. Add `send_test_webhook.py` helper if manual testing is useful (see `payment_link.paid` payload in `tests/test_webhooks.py:181`).
 6. Add `tests/test_webhooks.py` coverage including `400` on malformed body / `duplicate_event` idempotency.
@@ -170,11 +185,22 @@ Before adding a test that needs the trained model, accept a `trained_model_path`
 
 ## How to update state transitions
 
-1. Change **only** `orchestrator.py` (case `state = …` mutations) or `policy_engine.ACTION_TO_STATE` + `action_executor.execute` for policy-owned/executor-owned steps. Do not scatter `case.state =` across routers or ML code.
+1. Change only the owning service: `orchestrator.py` for event/reply transitions, `policy_engine.py` for decisions, and `temporal_runtime.py`/`action_executor.py`/`ptp_followup.py` for worker transitions. Routers and ML code must not mutate case state.
 2. Update `REPLYABLE_STATES` / `DIAGNOSABLE_STATES` / `TERMINAL_STATES` sets where transition eligibility changes.
 3. Add/correct `AuditEvent(event, detail)` for every new mutation — these are the only way the dashboard/detail endpoint and inspectors explain "why".
 4. Update `ARCHITECTURE.md` state machine diagram and table (`State inventory`, `Known deviation`), and `docs/SYSTEM_FLOWS.md` row for every affected flow.
 5. Add migration if the transition needs a persisted column (e.g., a new `scheduled_for` semantic on `Action`).
+
+### Temporal runtime invariants
+
+- PostgreSQL is authoritative; Redis payloads contain only `action_id`.
+- Queue publishing/reconciliation must join the case and require `source=razorpay`; experiment actions are never executable work.
+- Publish only after the action transaction commits. Queue failure must leave recoverable `SCHEDULED` state.
+- Lock the case before conditionally claiming an action to preserve lock ordering.
+- Commit `EXECUTING` before any Redis/provider/LLM network call; finalize in a new transaction.
+- Recheck terminal state and supersession during finalization.
+- Persist sanitized failure categories, not raw provider exceptions.
+- Any schema or status change must update `scripts/reconcile_actions.py`, `GET /cases/{id}`, runtime tests, and canonical docs.
 
 ---
 

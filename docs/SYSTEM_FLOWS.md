@@ -1,6 +1,6 @@
 # RecoveryOS — System Flows
 
-> Exact current behavior. For each flow: trigger, persisted entities, state transitions, side effects, external services, failure behavior, and **current limitations**. If a transition requires `[PLANNED]` infrastructure, it is labeled as such — not documented as present.
+> Exact current behavior. For each flow: trigger, persisted entities, state transitions, side effects, external services, failure behavior, and current limitations.
 
 ---
 
@@ -10,13 +10,13 @@
 |--------|--------|
 | **Trigger** | `POST /webhooks/razorpay` with `event=payment.failed` or `subscription.halted`; body contains `payload.payment.entity: {id, amount (paise), error_source, error_step, error_reason, subscription_id?}` |
 | **Preconditions** | Valid `x-razorpay-signature` on raw body (`app/core/security.py:11`); non-empty `event` string; `x-razorpay-event-id` present |
-| **Persisted** | `PaymentEvent(razorpay_event_id, event_type, raw_payload)` — immutable, unique on `razorpay_event_id`; `AuditEvent(case_detected)` on new case |
-| **Steps** | `handle_event` (`orchestrator.py:114`) → `_entity_from_payload` → `_handle_failure`:<br/>1. Lookup `RevenueCase` by `razorpay_payment_id` — if found, attach event + `_log_audit(failure_event_received)` + `_diagnose`; if not, create `RevenueCase(state=DETECTED)` + `AuditEvent(case_detected)`.<br/>2. `_diagnose` (`orchestrator.py:82`): if `state ∈ {DETECTED, DIAGNOSED}`, `classify_failure(entity)` (`failure_diagnosis.py:97`) → set `failure_category/error_source/step/reason`, `state=DIAGNOSED` → call `policy_engine.decide`.<br/>3. `policy_engine.decide` (`policy_engine.py:176`): guardrail check → `Decision` + `Action(SCHEDULED)` + `AuditEvent(decision_made)` + `state → ACTION_TO_STATE[action]`.<br/>4. If `Action` was created, `action_executor.execute` fires synchronously for executable types. |
-| **State transition** | `∅ → DETECTED → DIAGNOSED → DECISION_READY →` one of `WAITING | ACTION_SCHEDULED | HUMAN_REVIEW | STOPPED`; then if executable, `ACTION_SCHEDULED → AWAITING_OUTCOME` (or `HUMAN_REVIEW` on failure). |
-| **Side effects** | None for `WAIT` variants beyond state + DB rows; `CREATE_PAYMENT_LINK`/`CONTACT_CUSTOMER` execute inline (see flows 2–3). |
-| **External services** | None unless executor chooses a Payment Link / LLM path (see flows 2, 6). |
-| **Failure behavior** | Malformed JSON / non-object / empty event → `400` without DB write; duplicate `event_id` → `200 {ignored: duplicate_event}`; downstream exception currently bubbles to `500` for Razorpay to retry (no dead-letter queue). |
-| **Current limitation** | Same `razorpay_payment_id` re-failed with a more specific `error_reason` re-diagnoses only if `state` still `DETECTED/DIAGNOSED`; parked states (`WAITING`, `AWAITING_OUTCOME`) do not get re-diagnosed. |
+| **Persisted** | `PaymentEvent(razorpay_event_id, event_type, normalized payment/subscription/link IDs, raw_payload)` - immutable and unique on event ID; `AuditEvent(case_detected)` on new case |
+| **Steps** | `handle_event` extracts an event-specific entity (`payment`, `subscription`, or `dispute`). Payment failures correlate by unique payment ID; subscription-only events use the latest open subscription case, so a recovered billing cycle is not reused for a new payment. New failures create and diagnose a case. Repeated active failures cancel stale scheduled work, reclassify, and create a fresh decision, except while a valid PTP is pending: diagnosis metadata is refreshed but the promise and deadline remain authoritative. `HUMAN_REVIEW` does not resume automation. The webhook commits first, then publishes ID-only jobs. |
+| **State transition** | `∅ -> DETECTED -> DIAGNOSED -> DECISION_READY ->` one of `WAITING | ACTION_SCHEDULED | HUMAN_REVIEW | STOPPED`; a worker later moves executable actions to `AWAITING_OUTCOME` or retries/fails them. |
+| **Side effects** | None occur inside the webhook transaction. Provider calls happen in workers after an atomic claim commit. |
+| **External services** | Redis is contacted only after PostgreSQL commit. Razorpay/Anthropic are contacted only by claimed worker actions. |
+| **Failure behavior** | Invalid input -> `400`; duplicate event ID -> `200 ignored`. Redis publish failure leaves the committed action `SCHEDULED`, records a sanitized enqueue failure, and is repaired by reconciliation. |
+| **Current limitation** | Correlation uses exact provider IDs; malformed/nonstandard provider identifiers can still open separate cases. |
 
 ---
 
@@ -27,10 +27,10 @@
 | **Trigger** | `payment.failed` with `error_reason` containing `expired`/`invalid_card`/`card_blocked`/`invalid_vpa`/… (`failure_diagnosis.py:59`) → `INVALID_INSTRUMENT` |
 | **Baseline policy choice** | `CATEGORY_ACTION_PREFERENCE[INVALID_INSTRUMENT] = [CREATE_PAYMENT_LINK, CONTACT_CUSTOMER, ESCALATE]` (`policy_engine.py:60`). If guardrails allow (amount ≤ 25k, contacts not throttled), `CREATE_PAYMENT_LINK` is chosen. |
 | **Persisted (failure side)** | Same as flow 1, plus `Decision(chosen_action=CREATE_PAYMENT_LINK, alternatives, guardrails_applied)` + `Action(action_type=CREATE_PAYMENT_LINK, status=SCHEDULED, scheduled_for=now)` |
-| **Execution** | `action_executor._execute_create_payment_link` (`action_executor.py:56`):<br/>- If `RAZORPAY_API_ENABLED=false` (default) → `_simulated_payment_link` → `id=plink_sim_*`, `short_url=https://rzp.io/simulated/*`, `simulated=true`.<br/>- If enabled + credentials + `rzp_test_*` → `httpx.post(BASE_URL/payment_links)` (`razorpay_client.py:85`) and return `response.json()`.<br/>On success: `Action(status=EXECUTED, executed_at=now, result=response)`, `case.razorpay_payment_link_id = result.id`, `state=AWAITING_OUTCOME`, `AuditEvent(action_executed, {razorpay_payment_link_id, short_url, simulated})`.<br/>On failure: `Action(status=FAILED, result={error})`, `state=HUMAN_REVIEW` (`action_execution_failed`). |
-| **Recovery: `payment_link.paid`** | `POST /webhooks/razorpay` `event=payment_link.paid` (`orchestrator.py:119`). `_handle_payment_link_paid` reads `payload.payment_link.entity.id` (not `payload.payment.id` — the fulfilling payment has a *different* id). Lookup `RevenueCase` by `razorpay_payment_link_id`. If terminal (`RECOVERED/STOPPED/DISPUTED`) → `recovery_event_ignored_terminal_state`, unchanged. Otherwise ` _recover_case(reason=payment_link_paid)` → cancel all `SCHEDULED` actions (`CANCELLED`), `state=RECOVERED`, `AuditEvent(case_recovered_silently, {reason, cancelled_actions, razorpay_payment_link_id})`. If `link_id` unknown → `200` with `case_id=null` (noop). |
+| **Execution** | RQ calls `app.jobs.process_action(action_id)`. `temporal_runtime` locks the case and atomically claims `SCHEDULED -> EXECUTING`, commits, snapshots required fields, and closes the transaction before `action_executor.perform`. Payment Link `reference_id` is deterministic `Action.id`. Success is finalized in a new short transaction. Expected provider failures use exponential delay and the row's bounded `max_attempts`; final failure stores only sanitized text and moves the case to `HUMAN_REVIEW`. |
+| **Recovery: `payment_link.paid`** | Reads `payload.payment_link.entity.id`, locks the case by `razorpay_payment_link_id`, cancels scheduled work, marks pending promises `KEPT`, and sets `RECOVERED`. `STOPPED` can legitimately recover; `RECOVERED` and `DISPUTED` are ignored. Unknown links are no-ops. |
 | **External services** | Razorpay Payment Links API (Test Mode only, gated). Webhook for `payment_link.paid` is matched on the *link* id, not the payment id. |
-| **Failure behavior** | Razorpay `HTTPErr` / non-`rzp_test_*` key → `RazorpayAPIError` → `FAILED` + `HUMAN_REVIEW` (does not leave case stuck in `ACTION_SCHEDULED`). |
+| **Failure behavior** | `RazorpayAPIError` schedules bounded retries; exhausted attempts -> `FAILED + HUMAN_REVIEW`. Unexpected worker death leaves an `EXECUTING` lease that reconciliation resets or fails. |
 | **Current limitation** | Payment Link creation **does not deliver** the link to the customer — no SMS/email/WhatsApp. The customer pays by visiting `short_url` and Razorpay emits `payment_link.paid`. The short URL is genuine only when Test Mode is enabled and verified; otherwise it is obviously simulated. |
 
 Verification: `tests/test_webhooks.py:163` (`card_expired` → `AWAITING_OUTCOME`, `razorpay_payment_link_id` set), `tests/test_webhooks.py:219` (`payment_link.paid` → `RECOVERED`).
@@ -43,8 +43,8 @@ Verification: `tests/test_webhooks.py:163` (`card_expired` → `AWAITING_OUTCOME
 |--------|--------|
 | **Trigger** | `payment.failed` where `error_reason ∈ {otp, authentication, 3ds, incorrect_pin, …}` or `error_step == payment_authentication` → `CUSTOMER_AUTHENTICATION` (`failure_diagnosis.py:52`) |
 | **Baseline choice** | `CUSTOMER_AUTHENTICATION → [CONTACT_CUSTOMER, ESCALATE]` — `CONTACT_CUSTOMER` wins if guardrails allow |
-| **Persisted** | `Decision(chosen_action=CONTACT_CUSTOMER)` + `Action(SCHEDULED)` → then execution creates `CustomerMessage(direction=outbound, channel=simulated|llm, body=…)` (`action_executor.py:125`) and an `AuditEvent(action_executed, {message_preview, simulated})`. |
-| **Execution** | `action_executor._execute_contact` (`action_executor.py:100`): `llm_client.draft_contact_message(action_type, {amount, failure_category, case_id})`. Simulated default returns templated text (`llm_client.py:77` — `CONTACT_CUSTOMER` / `COLLECT_PROMISE_TO_PAY` have distinct templates); live (Anthropic) returns `response.content[*].text` from `POST https://api.anthropic.com/v1/messages`. |
+| **Persisted** | `Decision(chosen_action=CONTACT_CUSTOMER)` + `Action(SCHEDULED)`. The worker later creates `CustomerMessage(direction=outbound, channel=simulated|llm, body=...)` and `AuditEvent(action_executed)`. |
+| **Execution** | Same claim/commit/perform/finalize path as Payment Links. LLM drafting occurs with no open DB transaction. Simulated default returns templated text; live Anthropic returns message content. |
 | **State** | `ACTION_SCHEDULED → AWAITING_OUTCOME` on success, `→ HUMAN_REVIEW` on `LLMAPIError`. |
 | **Current limitation** | Draft is **stored, not delivered** — no messaging transport exists. The message is visible at `GET /cases/{id}.messages`. The PTP collection path (`COLLECT_PROMISE_TO_PAY`) uses a distinct second template. |
 
@@ -56,9 +56,9 @@ Verification: `tests/test_customer_reply.py:31` (`otp_incorrect` → `CONTACT_CU
 
 | Aspect | Detail |
 |--------|--------|
-| **Trigger** | `POST /webhooks/razorpay` `event ∈ {payment.captured, subscription.charged}` with `payload.payment.entity.id == RevenueCase.razorpay_payment_id` |
+| **Trigger** | `payment.captured` correlated by payment ID, or `subscription.charged` correlated by payment or subscription ID |
 | **Persisted** | `PaymentEvent(revenue_case_id=case.id, …)` always; then either `AuditEvent(case_recovered_silently)` or `AuditEvent(recovery_event_ignored_terminal_state)` |
-| **State** | `_handle_recovery` (`orchestrator.py:190`): if no matching `RevenueCase` → `null` (noop — e.g., first-attempt success never opened a case); if `case.state ∈ {RECOVERED, STOPPED, DISPUTED}` → ignored. Otherwise `_recover_case`: cancel all `SCHEDULED` actions (`→ CANCELLED`), `state=RECOVERED`. |
+| **State** | No matching case is persisted as an unlinked normalized recovery signal keyed by `razorpay_payment_id`. If a later `payment.failed` arrives for the **same** `payment_id`, case creation links that prior recovery and goes directly to `RECOVERED` without scheduling automation (subscription id alone does not suppress — a subsequent cycle's `subscription.halted` is not considered the same receivable). For existing cases, `RECOVERED`/`DISPUTED` remain unchanged; any other state, including `STOPPED`, can recover. |
 | **Current limitation** | Amount-inconsistency between the original failure and the capture is not validated; any capture for the same `razorpay_payment_id` recovers, even if `amount` differs. |
 
 Verification: `tests/test_webhooks.py:132` (`payment.captured` with same `pay_test_003` → `RECOVERED`).
@@ -84,10 +84,10 @@ Verification: `tests/test_webhooks.py:237` unknown `link_id` is a noop.
 |--------|--------|
 | **Trigger** | `POST /cases/{id}/customer-reply` `{body: string}` (`routers/cases.py:160`). This is transport-agnostic — the caller has already received the SMS/WhatsApp/email reply. |
 | **Persisted (always)** | `CustomerMessage(direction=inbound, channel=simulated|llm, body, extracted={intent, amount, date, confidence})` — even when the case is terminal or extraction fails (audit completeness). |
-| **Steps** | `orchestrator.handle_customer_reply` (`orchestrator.py:297`):<br/>1. `extracted = llm_client.extract_ptp_intent(body, now)` — simulated (keyword + regex) or Anthropic JSON.<br/>2. Store inbound `CustomerMessage`.<br/>3. If `case.state ∉ REPLYABLE_STATES` (`orchestrator.py:294` = `DECISION_READY, WAITING, ACTION_SCHEDULED, AWAITING_OUTCOME, HUMAN_REVIEW`) → `AuditEvent(customer_reply_ignored_terminal_state)`, return unchanged.<br/>4. If `extracted.intent == dispute` → `_dispute_case(reason=customer_reported_dispute, {message: body[:200]})`: cancel `SCHEDULED`, `state=DISPUTED`, `AuditEvent(case_disputed)`. **Overrides even a prior `AWAITING_OUTCOME` with pending `PromiseToPay`.**<br/>5. Else `validate_promise(extraction, outstanding_amount=case.amount, now)` (`ptp_extractor.py:38`) requires: `intent==promise_to_pay`, confidence ≥ 0.6, `amount ≤ outstanding`, `date ∈ [today, today+14d]`.<br/>  - Invalid → `state=HUMAN_REVIEW`, `AuditEvent(ptp_validation_failed, {reason, extraction})`.<br/>  - Valid → `PromiseToPay(promised_amount, promised_date, confidence, status=PENDING)`, `Action(FOLLOW_UP_PTP, SCHEDULED, scheduled_for=promised_date)`, `state=AWAITING_OUTCOME`, `AuditEvent(promise_to_pay_recorded)`. |
+| **Steps** | The router first confirms the case exists and closes that read transaction. PTP extraction then runs outside a DB transaction using merchant-local time. The case is re-read with a row lock. Valid promises supersede previous pending promises and cancel their linked follow-ups. A new `FOLLOW_UP_PTP` links by `promise_to_pay_id` and is scheduled at the exclusive end of the promise date in `MERCHANT_TIMEZONE`; commit precedes enqueue. |
 | **State transitions** | `WAITING | AWAITING_OUTCOME | HUMAN_REVIEW → AWAITING_OUTCOME` (promise) or `→ DISPUTED` or `→ HUMAN_REVIEW`. Terminal `RECOVERED/STOPPED/DISPUTED` stay put but inbound message + ignored-state audit are still stored. |
 | **Failure behavior** | Malformed Anthropic JSON → `PTPExtraction(intent=unclear, simulated=false, raw={parse_error})` → treated as `unclear` → `HUMAN_REVIEW` (no crash). `LLMAPIError` during extraction is rare (simulated path does not raise); if live path raises, the `POST` bubbles to `500` for the caller to retry (no `CustomerMessage` would have been created yet for that branch in the current ordering — the `extract_ptp_intent` call precedes persistence). |
-| **Current limitations** | Message delivery that would *trigger* this webhook does not exist (see flow 3). Day-of-week parsing (`llm_client.py:161`) resolves a bare weekday name to the **next** occurrence (Friday on a Friday → next Friday). Amount parsing supports `₹/Rs./INR` prefixes but not spelled-out amounts. Only the most recent `PENDING` promise is considered by the follow-up processor. |
+| **Current limitations** | Message delivery does not exist. Bare weekdays resolve to the next occurrence; amount parsing does not support spelled-out amounts. Historical unlinked follow-ups are repaired only when exactly one pending promise makes linkage unambiguous. |
 
 Verification: `tests/test_customer_reply.py:46` (clear promise → pending + scheduled follow-up), `...:68` (dispute immediate), `...:85` (dispute overrides pending promise), `...:98` (over-amount → `HUMAN_REVIEW`), `...:116` (reply on `RECOVERED` is recorded but ignored).
 
@@ -126,10 +126,9 @@ Verification: `tests/test_experiments.py:30` (2 rows per scenario), `...:37` (re
 | Aspect | Detail |
 |--------|--------|
 | **Trigger** | Guardrail-filtered baseline choice `WAIT` (for `TRANSIENT_INFRASTRUCTURE`, `INSUFFICIENT_BALANCE`) or `WAIT_FOR_NATIVE_RETRY` (for `SUBSCRIPTION_PENDING_NATIVE_RETRY`). See `policy_engine.py:55`. |
-| **Persisted** | `Action(action_type ∈ {WAIT, WAIT_FOR_NATIVE_RETRY}, status=SCHEDULED, scheduled_for=now)` + `Decision` + `case.state=WAITING`. |
-| **Executed?** | No. `action_executor.EXECUTABLE_ACTION_TYPES = {CREATE_PAYMENT_LINK, CONTACT_CUSTOMER, COLLECT_PROMISE_TO_PAY}` — `WAIT` variants are no-ops for `execute` (`action_executor.py:44` returns unchanged). |
-| **Woken?** | **No.** There is no queue, worker, or scheduler import in `backend/app/**`. The row stays `SCHEDULED` forever. The case leaves `WAITING` only on a later `POST /webhooks/razorpay` (`payment.captured` / `payment_link.paid` / dispute) or manual operator intervention. |
-| **Planned replacement** | Temporal Recovery Runtime: when `WAITING`'s `scheduled_for` is considered elapsed, re-evaluate the case (potentially with updated context/ML). **Gated behind Redis-as-transport / DB-as-source-of-truth guarantees. Not implemented.** |
+| **Persisted** | `WAIT` is due after `WAIT_DELAY_SECONDS`; native retry wait uses `NATIVE_RETRY_DELAY_SECONDS`. Both set case `WAITING`. |
+| **Execution** | The scheduled worker claim marks the wait `EXECUTED`, returns the case to `DIAGNOSED`, and re-runs the deterministic baseline policy. A completed wait is guardrail-blocked from repeating, so the policy advances to the next candidate or `ESCALATE`. Live adaptive ML remains uninvolved. |
+| **Stale behavior** | Duplicate jobs, early jobs, terminal cases, or superseded waits are no-ops/cancelled. A new failure in an active state cancels the old scheduled wait and re-diagnoses from the new payload. |
 
 ---
 
@@ -137,11 +136,10 @@ Verification: `tests/test_experiments.py:30` (2 rows per scenario), `...:37` (re
 
 | Aspect | Detail |
 |--------|--------|
-| **Scheduled** | Only via `handle_customer_reply` after a valid `PromiseToPay` (`orchestrator.py:363`): `Action(FOLLOW_UP_PTP, SCHEDULED, scheduled_for=promised_date)` with `promised_date` midnight UTC from the extraction's ISO date. |
-| **Processing** | `ptp_followup.process_due_followups(db, now)` (`ptp_followup.py:38`): queries `Action(FOLLOW_UP_PTP, SCHEDULED, scheduled_for <= now)`; for each: mark `EXECUTED`; if `case.state ∈ {RECOVERED, STOPPED, DISPUTED}` → `already_recovered` (no state change); otherwise find the most recent `PromiseToPay(status=PENDING)` → `status=BROKEN`, `state=HUMAN_REVIEW`, `AuditEvent(promise_broken_escalated)`; counts as `broken`. |
-| **Invocation** | Only by `scripts/process_followups.py` run manually or scheduled via external cron. No import in `app/main.py` or any router. |
-| **Terminal handling** | If the case already reached `RECOVERED` via a later webhook / manual recovery before the follow-up runs, the promise is **not** marked `BROKEN` — it remains `PENDING` and the action is simply marked `EXECUTED` + counted as `already_recovered`. |
-| **Current limitation** | `WAITING` / `AWAITING_OUTCOME` cases without a PTP have no follow-up action at all. A `FOLLOW_UP_PTP` whose `promised_date` is past due but `process_due_followups` has not yet run is indistinguishable from a pending promise that is still viable — the DB row is `SCHEDULED`, not a clock. |
+| **Scheduled** | A valid promise creates a linked action due at midnight immediately after the promised merchant-local day, converted to naive UTC for the existing schema. |
+| **Processing** | The common worker claim invokes `ptp_followup.complete_followup`. Only the linked `PENDING` promise becomes `BROKEN`; case becomes `HUMAN_REVIEW`. Superseded, already resolved, or terminal work is a stale no-op. |
+| **Recovery handling** | Recovery before the deadline marks every pending promise `KEPT` and cancels scheduled follow-ups. A fresh promise marks older pending promises `SUPERSEDED`. |
+| **Reconciliation** | `scripts/reconcile_actions.py` republishes all durable scheduled action types, not just PTP rows. `scripts/process_followups.py` remains a compatibility alias for the same operation. |
 
 Verification: `tests/test_ptp_followup.py` (module-level coverage); `tests/test_customer_reply.py:46` records scheduling.
 
@@ -149,8 +147,8 @@ Verification: `tests/test_ptp_followup.py` (module-level coverage); `tests/test_
 
 ## Cross-cutting guarantees
 
-- **Idempotency:** `PaymentEvent.razorpay_event_id` unique (`alembic/versions/709600d2e2b1`). Application-level duplicate return (`webhooks.py:66`) **and** DB constraint prevent double-creation on concurrent deliveries.
+- **Idempotency:** Webhook event IDs are unique. Action jobs contain only `action_id`; atomic `SCHEDULED -> EXECUTING` updates ensure only one worker claims a generation. Deterministic job IDs use `(action_id, attempt_count)`.
 - **Audit trail:** Every mutation is recorded as an `AuditEvent` (`case_detected`, `case_diagnosed`, `decision_made`, `action_executed`, `action_execution_failed`, `case_recovered_silently`, `case_disputed`, `promise_to_pay_recorded`, `promise_broken_escalated`, `ptp_validation_failed`, …). Payloads live in `detail` JSON.
-- **No external network from tests:** `tests/conftest.py:56` guards `socket.connect` to loopback only; `RAZORPAY_API_ENABLED` / `LLM_API_ENABLED` forced `false` with fake keys.
-- **Failure isolation:** `action_executor` failures (Razorpay / Anthropic `HTTPError`) set `Action(status=FAILED)` + `state=HUMAN_REVIEW` and flush — the original webhook still commits and returns `200` with `case_state=HUMAN_REVIEW`. The retry burden stays on Razorpay's webhook retry schedule plus human review.
-
+- **No external network from tests:** tests force provider and queue gates off, use a temp SQLite DB, point `REDIS_URL` at an inert local port, and deny external sockets.
+- **Failure isolation:** expected provider failures retry with bounded exponential delay and sanitized persisted errors. Lease expiry is repaired by reconciliation; exhausted attempts become `FAILED + HUMAN_REVIEW`.
+- **Transaction boundary:** no Redis, Razorpay, or Anthropic call is made while a production request/worker DB transaction remains open.

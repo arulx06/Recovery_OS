@@ -1,9 +1,9 @@
 """
 Recovery Case Orchestrator.
 
-Owns every mutation of RevenueCase.state. Nothing else is allowed to touch
-it directly — that invariant is what keeps the state machine honest as
-more layers (guardrails, ML policy, LLM) get added on top of it.
+Owns inbound event and customer-reply mutations of RevenueCase.state.
+Policy and claimed-worker services own their narrow transitions; routers,
+queue transport, and ML scoring never mutate state directly.
 
 State machine (see ARCHITECTURE.md for the full diagram):
 
@@ -23,15 +23,18 @@ The baseline policy runs inline. Payment Links may be created through the
 explicitly enabled Razorpay Test Mode integration; contact text is drafted
 and stored but no messaging transport delivers it.
 """
-from datetime import datetime
+from datetime import datetime, time
 from decimal import Decimal
 
+from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import RevenueCase, AuditEvent, PaymentEvent, Action, PromiseToPay, CustomerMessage
-from app.core.time import utc_now
+from app.core.config import settings
+from app.core.time import end_of_local_day_utc, utc_now, utc_to_local
 from app.services.failure_diagnosis import classify_failure
-from app.services import policy_engine, action_executor, llm_client, ptp_extractor
+from app.services import policy_engine, llm_client, ptp_extractor
 
 FAILURE_EVENTS = {"payment.failed", "subscription.halted"}
 # payment.captured / subscription.charged carry the original failed
@@ -46,16 +49,15 @@ DISPUTE_EVENTS = {"payment.dispute.created"}
 # States a case can be (re-)diagnosed from. A case that's already recovered,
 # stopped, or disputed should not be re-diagnosed — diagnosis only matters
 # while we're still deciding what to do.
-DIAGNOSABLE_STATES = {"DETECTED", "DIAGNOSED"}
+DIAGNOSABLE_STATES = {
+    "DETECTED", "DIAGNOSED", "DECISION_READY", "WAITING",
+    "ACTION_SCHEDULED", "AWAITING_OUTCOME",
+}
 
 
-def _entity_from_payload(payload: dict) -> dict:
-    """Razorpay nests the actual object under payload.<type>.entity."""
-    for _, wrapper in (payload or {}).get("payload", {}).items():
-        entity = wrapper.get("entity") if isinstance(wrapper, dict) else None
-        if entity:
-            return entity
-    return {}
+def _entity_from_payload(payload: dict, entity_name: str) -> dict:
+    """Extract the event-specific Razorpay entity instead of relying on payload order."""
+    return (payload or {}).get("payload", {}).get(entity_name, {}).get("entity", {}) or {}
 
 
 def _payment_link_entity_from_payload(payload: dict) -> dict:
@@ -79,6 +81,92 @@ def _log_audit(db: Session, case: RevenueCase, event: str, detail: dict | None =
     db.add(AuditEvent(revenue_case_id=case.id, event=event, detail=detail or {}))
 
 
+def _matching_case(db: Session, identifiers: list) -> RevenueCase | None:
+    if not identifiers:
+        return None
+    matches = (
+        db.query(RevenueCase)
+        .filter(RevenueCase.source == "razorpay", or_(*identifiers))
+        .with_for_update()
+        .all()
+    )
+    if len(matches) > 1:
+        raise RuntimeError("conflicting Razorpay payment and subscription case identifiers")
+    return matches[0] if matches else None
+
+
+def _cancel_scheduled_actions(db: Session, case: RevenueCase) -> int:
+    pending = (
+        db.query(Action)
+        .filter(Action.revenue_case_id == case.id, Action.status == "SCHEDULED")
+        .all()
+    )
+    for action in pending:
+        action.status = "CANCELLED"
+    return len(pending)
+
+
+def _prior_unlinked_recovery(
+    db: Session,
+    razorpay_payment_id: str | None,
+    razorpay_subscription_id: str | None,
+) -> PaymentEvent | None:
+    # A recovery signal must belong to the same receivable/payment attempt
+    # before it can suppress automation. Subscription id alone identifies
+    # the billing relationship, not a specific cycle, so out-of-order
+    # suppression requires an exact payment-id match.
+    if not razorpay_payment_id:
+        return None
+    return (
+        db.query(PaymentEvent)
+        .filter(
+            PaymentEvent.revenue_case_id.is_(None),
+            PaymentEvent.event_type.in_(RECOVERY_EVENTS),
+            PaymentEvent.razorpay_payment_id == razorpay_payment_id,
+        )
+        .order_by(PaymentEvent.received_at.desc())
+        .with_for_update()
+        .first()
+    )
+
+
+def _handle_existing_failure(
+    db: Session,
+    case: RevenueCase,
+    payment_event: PaymentEvent,
+    entity: dict,
+) -> RevenueCase:
+    payment_event.revenue_case_id = case.id
+    _log_audit(db, case, "failure_event_received", {"event_id": payment_event.razorpay_event_id})
+    if case.state not in DIAGNOSABLE_STATES:
+        _log_audit(db, case, "failure_event_ignored_terminal_state", {"state": case.state})
+        return case
+
+    pending_promises = (
+        db.query(PromiseToPay)
+        .filter(PromiseToPay.revenue_case_id == case.id, PromiseToPay.status == "PENDING")
+        .all()
+    )
+    if pending_promises:
+        case.error_source = entity.get("error_source") or case.error_source
+        case.error_step = entity.get("error_step") or case.error_step
+        case.error_reason = entity.get("error_reason") or case.error_reason
+        case.failure_category = classify_failure(entity)
+        case.updated_at = utc_now()
+        _log_audit(
+            db,
+            case,
+            "failure_diagnosed_pending_promise",
+            {"pending_promise_ids": [promise.id for promise in pending_promises]},
+        )
+        return case
+
+    _cancel_scheduled_actions(db, case)
+    case.state = "DETECTED"
+    _diagnose(db, case, entity)
+    return case
+
+
 def _diagnose(db: Session, case: RevenueCase, entity: dict):
     """Deterministically classify the failure and move DETECTED -> DIAGNOSED."""
     if case.state not in DIAGNOSABLE_STATES:
@@ -100,15 +188,7 @@ def _diagnose(db: Session, case: RevenueCase, entity: dict):
             {"failure_category": category, "previous_category": previous_category},
         )
 
-    decision = policy_engine.decide(db, case)
-    if decision:
-        action = (
-            db.query(Action)
-            .filter(Action.decision_id == decision.id)
-            .first()
-        )
-        if action:
-            action_executor.execute(db, case, action)
+    policy_engine.decide(db, case)
 
 
 def handle_event(db: Session, payment_event: PaymentEvent, event_type: str, payload: dict) -> RevenueCase | None:
@@ -119,14 +199,28 @@ def handle_event(db: Session, payment_event: PaymentEvent, event_type: str, payl
     if event_type == PAYMENT_LINK_PAID_EVENT:
         return _handle_payment_link_paid(db, payment_event, payload)
 
-    entity = _entity_from_payload(payload)
+    entity_name = {
+        "payment.failed": "payment",
+        "payment.captured": "payment",
+        "subscription.halted": "subscription",
+        "subscription.charged": "payment",
+        "payment.dispute.created": "dispute",
+    }.get(event_type)
+    entity = _entity_from_payload(payload, entity_name) if entity_name else {}
+    if event_type in DISPUTE_EVENTS and not entity:
+        entity = _entity_from_payload(payload, "payment")
     razorpay_payment_id = entity.get("id") if entity.get("entity") == "payment" else entity.get("payment_id")
+    razorpay_subscription_id = (
+        entity.get("id") if entity.get("entity") == "subscription" else entity.get("subscription_id")
+    )
+    payment_event.razorpay_payment_id = razorpay_payment_id
+    payment_event.razorpay_subscription_id = razorpay_subscription_id
 
     if event_type in FAILURE_EVENTS:
-        return _handle_failure(db, payment_event, entity, razorpay_payment_id)
+        return _handle_failure(db, payment_event, entity, razorpay_payment_id, razorpay_subscription_id)
 
     if event_type in RECOVERY_EVENTS:
-        return _handle_recovery(db, payment_event, entity, razorpay_payment_id)
+        return _handle_recovery(db, payment_event, entity, razorpay_payment_id, razorpay_subscription_id)
 
     if event_type in DISPUTE_EVENTS:
         return _handle_dispute(db, payment_event, entity, razorpay_payment_id)
@@ -134,68 +228,141 @@ def handle_event(db: Session, payment_event: PaymentEvent, event_type: str, payl
     return None
 
 
-def _handle_failure(db: Session, payment_event: PaymentEvent, entity: dict, razorpay_payment_id: str | None) -> RevenueCase:
+def _handle_failure(
+    db: Session,
+    payment_event: PaymentEvent,
+    entity: dict,
+    razorpay_payment_id: str | None,
+    razorpay_subscription_id: str | None,
+) -> RevenueCase:
     existing = None
+    identifiers = []
     if razorpay_payment_id:
+        identifiers.append(RevenueCase.razorpay_payment_id == razorpay_payment_id)
+        existing = _matching_case(db, identifiers)
+    if not existing and razorpay_subscription_id:
         existing = (
             db.query(RevenueCase)
-            .filter(RevenueCase.razorpay_payment_id == razorpay_payment_id)
+            .filter(
+                RevenueCase.source == "razorpay",
+                RevenueCase.razorpay_subscription_id == razorpay_subscription_id,
+                RevenueCase.state.notin_(("RECOVERED", "STOPPED", "DISPUTED", "HUMAN_REVIEW")),
+            )
+            .order_by(RevenueCase.created_at.desc())
+            .with_for_update()
             .first()
         )
 
     if existing:
-        # Same payment failing again (e.g. Razorpay's own native retry also
-        # failed) — attach the event, don't spawn a duplicate case, but do
-        # re-diagnose: the new failure may carry a more specific reason.
-        payment_event.revenue_case_id = existing.id
-        _log_audit(db, existing, "failure_event_received", {"event_id": payment_event.razorpay_event_id})
-        _diagnose(db, existing, entity)
-        return existing
+        if razorpay_payment_id and existing.razorpay_payment_id != razorpay_payment_id:
+            existing.razorpay_payment_id = razorpay_payment_id
+            amount = _amount_in_rupees(entity)
+            if amount is not None:
+                existing.amount = amount
+            existing.currency = entity.get("currency") or existing.currency
+        return _handle_existing_failure(db, existing, payment_event, entity)
 
     case = RevenueCase(
         source="razorpay",
         razorpay_payment_id=razorpay_payment_id,
+        razorpay_subscription_id=razorpay_subscription_id,
         amount=_amount_in_rupees(entity) or Decimal("0"),
         currency=entity.get("currency", "INR"),
         state="DETECTED",
     )
-    db.add(case)
-    db.flush()  # get case.id before linking the event / audit row
+    try:
+        with db.begin_nested():
+            db.add(case)
+            db.flush()
+    except IntegrityError:
+        existing = _matching_case(db, identifiers)
+        if not existing:
+            raise
+        return _handle_existing_failure(db, existing, payment_event, entity)
 
     payment_event.revenue_case_id = case.id
     _log_audit(db, case, "case_detected", {"razorpay_payment_id": razorpay_payment_id})
+    prior_recovery = _prior_unlinked_recovery(db, razorpay_payment_id, razorpay_subscription_id)
+    if prior_recovery:
+        prior_recovery.revenue_case_id = case.id
+        return _recover_case(
+            db,
+            case,
+            reason="out_of_order_recovery_event",
+            extra_detail={"recovery_event_id": prior_recovery.razorpay_event_id},
+        )
     _diagnose(db, case, entity)
     return case
 
 
 def _recover_case(db: Session, case: RevenueCase, reason: str, extra_detail: dict | None = None) -> RevenueCase:
     """Shared terminal-recovery logic: cancel anything pending, mark RECOVERED."""
-    cancelled = (
-        db.query(Action)
-        .filter(Action.revenue_case_id == case.id, Action.status == "SCHEDULED")
+    cancelled_count = _cancel_scheduled_actions(db, case)
+
+    kept_promises = (
+        db.query(PromiseToPay)
+        .filter(PromiseToPay.revenue_case_id == case.id, PromiseToPay.status == "PENDING")
         .all()
     )
-    for action in cancelled:
-        action.status = "CANCELLED"
+    for promise in kept_promises:
+        promise.status = "KEPT"
 
     case.state = "RECOVERED"
     case.updated_at = utc_now()
-    detail = {"reason": reason, "cancelled_actions": len(cancelled)}
+    detail = {
+        "reason": reason,
+        "cancelled_actions": cancelled_count,
+        "kept_promises": len(kept_promises),
+    }
     if extra_detail:
         detail.update(extra_detail)
     _log_audit(db, case, "case_recovered_silently", detail)
     return case
 
 
-def _handle_recovery(db: Session, payment_event: PaymentEvent, entity: dict, razorpay_payment_id: str | None) -> RevenueCase | None:
-    if not razorpay_payment_id:
+def _handle_recovery(
+    db: Session,
+    payment_event: PaymentEvent,
+    entity: dict,
+    razorpay_payment_id: str | None,
+    razorpay_subscription_id: str | None,
+) -> RevenueCase | None:
+    if not razorpay_payment_id and not razorpay_subscription_id:
         return None
 
-    case = (
-        db.query(RevenueCase)
-        .filter(RevenueCase.razorpay_payment_id == razorpay_payment_id)
-        .first()
-    )
+    case = None
+    if razorpay_payment_id:
+        case = _matching_case(db, [RevenueCase.razorpay_payment_id == razorpay_payment_id])
+        if not case:
+            linked_case_row = (
+                db.query(PaymentEvent.revenue_case_id)
+                .filter(
+                    PaymentEvent.razorpay_payment_id == razorpay_payment_id,
+                    PaymentEvent.revenue_case_id.is_not(None),
+                )
+                .order_by(PaymentEvent.received_at.desc())
+                .first()
+            )
+            linked_case_id = linked_case_row[0] if linked_case_row else None
+            if linked_case_id:
+                case = (
+                    db.query(RevenueCase)
+                    .filter(RevenueCase.id == linked_case_id, RevenueCase.source == "razorpay")
+                    .with_for_update()
+                    .first()
+                )
+    if not case and razorpay_subscription_id:
+        case = (
+            db.query(RevenueCase)
+            .filter(
+                RevenueCase.source == "razorpay",
+                RevenueCase.razorpay_subscription_id == razorpay_subscription_id,
+                RevenueCase.state.notin_(("RECOVERED", "DISPUTED")),
+            )
+            .order_by(RevenueCase.created_at.desc())
+            .with_for_update()
+            .first()
+        )
     if not case:
         # Recovery event with no matching failed case — nothing to do yet
         # (e.g. a payment that succeeded on the first try never opened a case).
@@ -203,7 +370,7 @@ def _handle_recovery(db: Session, payment_event: PaymentEvent, entity: dict, raz
 
     payment_event.revenue_case_id = case.id
 
-    if case.state in ("RECOVERED", "STOPPED", "DISPUTED"):
+    if case.state in ("RECOVERED", "DISPUTED"):
         _log_audit(db, case, "recovery_event_ignored_terminal_state", {"state": case.state})
         return case
 
@@ -221,12 +388,19 @@ def _handle_payment_link_paid(db: Session, payment_event: PaymentEvent, payload:
     """
     link_entity = _payment_link_entity_from_payload(payload)
     link_id = link_entity.get("id")
+    payment_event.razorpay_payment_link_id = link_id
+    payment_entity = _entity_from_payload(payload, "payment")
+    payment_event.razorpay_payment_id = payment_entity.get("id")
     if not link_id:
         return None
 
     case = (
         db.query(RevenueCase)
-        .filter(RevenueCase.razorpay_payment_link_id == link_id)
+        .filter(
+            RevenueCase.source == "razorpay",
+            RevenueCase.razorpay_payment_link_id == link_id,
+        )
+        .with_for_update()
         .first()
     )
     if not case:
@@ -235,7 +409,7 @@ def _handle_payment_link_paid(db: Session, payment_event: PaymentEvent, payload:
 
     payment_event.revenue_case_id = case.id
 
-    if case.state in ("RECOVERED", "STOPPED", "DISPUTED"):
+    if case.state in ("RECOVERED", "DISPUTED"):
         _log_audit(db, case, "recovery_event_ignored_terminal_state", {"state": case.state})
         return case
 
@@ -277,7 +451,11 @@ def _handle_dispute(db: Session, payment_event: PaymentEvent, entity: dict, razo
 
     case = (
         db.query(RevenueCase)
-        .filter(RevenueCase.razorpay_payment_id == razorpay_payment_id)
+        .filter(
+            RevenueCase.source == "razorpay",
+            RevenueCase.razorpay_payment_id == razorpay_payment_id,
+        )
+        .with_for_update()
         .first()
     )
     if not case:
@@ -294,7 +472,14 @@ def _handle_dispute(db: Session, payment_event: PaymentEvent, entity: dict, razo
 REPLYABLE_STATES = {"DECISION_READY", "WAITING", "ACTION_SCHEDULED", "AWAITING_OUTCOME", "HUMAN_REVIEW"}
 
 
-def handle_customer_reply(db: Session, case: RevenueCase, message_body: str, now: datetime | None = None) -> RevenueCase:
+def handle_customer_reply(
+    db: Session,
+    case: RevenueCase,
+    message_body: str,
+    now: datetime | None = None,
+    business_now: datetime | None = None,
+    extraction: llm_client.PTPExtraction | None = None,
+) -> RevenueCase:
     """
     Phase 6 entry point for an inbound customer message — the reply to a
     CONTACT_CUSTOMER / COLLECT_PROMISE_TO_PAY outreach. Always stores the
@@ -311,8 +496,9 @@ def handle_customer_reply(db: Session, case: RevenueCase, message_body: str, now
         HUMAN_REVIEW rather than guessing.
     """
     now = now or utc_now()
+    business_now = business_now or utc_to_local(now, settings.MERCHANT_TIMEZONE)
 
-    extraction = llm_client.extract_ptp_intent(message_body, now=now)
+    extraction = extraction or llm_client.extract_ptp_intent(message_body, now=business_now)
 
     db.add(CustomerMessage(
         revenue_case_id=case.id,
@@ -338,9 +524,12 @@ def handle_customer_reply(db: Session, case: RevenueCase, message_body: str, now
         return case
 
     outstanding = float(case.amount) if case.amount is not None else 0.0
-    validation = ptp_extractor.validate_promise(extraction, outstanding_amount=outstanding, now=now)
+    validation = ptp_extractor.validate_promise(
+        extraction, outstanding_amount=outstanding, now=business_now,
+    )
 
     if not validation.valid:
+        _cancel_scheduled_actions(db, case)
         case.state = "HUMAN_REVIEW"
         case.updated_at = now
         _log_audit(
@@ -350,28 +539,59 @@ def handle_customer_reply(db: Session, case: RevenueCase, message_body: str, now
         db.flush()
         return case
 
+    _cancel_scheduled_actions(db, case)
+    previous_promises = (
+        db.query(PromiseToPay)
+        .filter(PromiseToPay.revenue_case_id == case.id, PromiseToPay.status == "PENDING")
+        .all()
+    )
+    previous_ids = [promise.id for promise in previous_promises]
+    for previous in previous_promises:
+        previous.status = "SUPERSEDED"
+    if previous_ids:
+        previous_followups = (
+            db.query(Action)
+            .filter(
+                Action.promise_to_pay_id.in_(previous_ids),
+                Action.status == "SCHEDULED",
+            )
+            .all()
+        )
+        for action in previous_followups:
+            action.status = "CANCELLED"
+
     promise = PromiseToPay(
         revenue_case_id=case.id,
         promised_amount=validation.amount,
-        promised_date=datetime.combine(validation.promised_date, datetime.min.time()),
+        promised_date=datetime.combine(validation.promised_date, time.min),
         confidence=extraction.confidence,
         status="PENDING",
     )
     db.add(promise)
     db.flush()
 
+    followup_at = end_of_local_day_utc(validation.promised_date, settings.MERCHANT_TIMEZONE)
     db.add(Action(
         revenue_case_id=case.id,
+        promise_to_pay_id=promise.id,
         action_type="FOLLOW_UP_PTP",
         status="SCHEDULED",
-        scheduled_for=promise.promised_date,
+        scheduled_for=followup_at,
+        max_attempts=settings.ACTION_MAX_ATTEMPTS,
     ))
 
     case.state = "AWAITING_OUTCOME"
     case.updated_at = now
     _log_audit(
         db, case, "promise_to_pay_recorded",
-        {"promise_id": promise.id, "amount": float(promise.promised_amount), "promised_date": validation.promised_date.isoformat()},
+        {
+            "promise_id": promise.id,
+            "amount": float(promise.promised_amount),
+            "promised_date": validation.promised_date.isoformat(),
+            "followup_at_utc": followup_at.isoformat(),
+            "merchant_timezone": settings.MERCHANT_TIMEZONE,
+            "superseded_promises": len(previous_promises),
+        },
     )
     db.flush()
     return case

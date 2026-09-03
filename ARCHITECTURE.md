@@ -32,10 +32,13 @@ flowchart LR
     GW --> ORCH[Recovery Case<br/>Orchestrator]
     ORCH --> DIAG[Failure Intelligence<br/>Engine]
     ORCH --> POL[Guardrails +<br/>Policy Engine]
-    POL --> EXEC[Action Executor]
+    POL --> DB
+    DB --> RQ[Redis/RQ<br/>ID-only transport]
+    RQ --> WORKER[Temporal Runtime<br/>claim / retry / reconcile]
+    WORKER --> EXEC[Action Executor]
     EXEC -- simulated / Test Mode --> RZPAPI[Razorpay Payment Links API<br/>optional]
     EXEC -- stored only --> MSG[CustomerMessage<br/>no delivery transport]
-    ORCH --> PTP[PTP Follow-up<br/>manual-only]
+    WORKER --> PTP[Linked PTP Follow-up]
     POL -. offline/synthetic .-> ML[Adaptive ML Policy<br/>not on live path]
     ML --> EXP[Experiment Runner<br/>baseline vs adaptive]
     ORCH --> DB[(PostgreSQL<br/>source of truth)]
@@ -55,12 +58,14 @@ flowchart LR
 | Guardrail Engine `app/services/policy_engine.py` | [IMPLEMENTED] | Enforce `max_contacts_per_case`, `max_contacts_per_7_days`, `min_contact_interval_hours`, `max_automated_amount`, `max_total_attempts` | No |
 | Baseline Policy `app/services/policy_engine.py:decide` | [IMPLEMENTED] | Pick highest-ranked allowed action for the category (deterministic) | No |
 | Adaptive ML Policy `app/services/ml_policy.py:decide_ml` | [IMPLEMENTED · OFFLINE ONLY] | Score allowed actions by `P(recovery)*amount - cost`; never bypasses guardrails | No — model inference locally |
-| Action Executor `app/services/action_executor.py` | [IMPLEMENTED · PARTIAL] | Execute `CREATE_PAYMENT_LINK` / `CONTACT_CUSTOMER` / `COLLECT_PROMISE_TO_PAY`; leave `WAIT`/`ESCALATE`/`STOP` as state only | Yes — Razorpay (Payment Links) and LLM (draft) when enabled |
+| Temporal Runtime `app/services/temporal_runtime.py` | [IMPLEMENTED · VERIFIED] | Atomic action claims, wait wake-up, bounded retry, stale-job checks, lease recovery, reconciliation | Delegates provider calls after claim commit |
+| RQ Transport `app/services/task_queue.py`, `app/jobs.py` | [IMPLEMENTED · VERIFIED] | Publish ID-only immediate/delayed jobs after DB commit; Redis is reconstructable | Redis only |
+| Action Executor `app/services/action_executor.py` | [IMPLEMENTED · VERIFIED] | Perform provider calls outside DB transactions and persist final results | Razorpay (Payment Links) and LLM (draft) when enabled |
 | Razorpay Client `app/services/razorpay_client.py` | [IMPLEMENTED · SIMULATED / TEST_MODE_ONLY] | `POST /v1/payment_links`; simulation fallback; `rzp_test_*` gate | Yes — Razorpay Test Mode when `RAZORPAY_API_ENABLED=true` |
 | LLM Client `app/services/llm_client.py` | [IMPLEMENTED · SIMULATED / PARTIAL] | Draft outbound text; extract PTP intent `{intent, amount, date, confidence}` | Yes — Anthropic Messages API when `LLM_API_ENABLED=true`; **anthropic-only**, other providers raise |
 | PTP Extractor `app/services/ptp_extractor.py` | [IMPLEMENTED] | Validate LLM extraction before recording `PromiseToPay` | No |
-| PTP Follow-up `app/services/ptp_followup.py` | [PARTIAL · MANUAL_ONLY] | Process due `FOLLOW_UP_PTP` rows → `BROKEN` + `HUMAN_REVIEW` | No |
-| Redis / RQ | [PLANNED] | Reserved for future wake-up runtime; currently no queue, worker, or scheduler | No — no imports in `backend/app/**` |
+| PTP Follow-up `app/services/ptp_followup.py` | [IMPLEMENTED · VERIFIED] | Resolve the exact linked promise after its merchant-local due day | No |
+| Windows Worker `app/worker.py` | [IMPLEMENTED · VERIFIED] | RQ `SimpleWorker` with timer timeout, avoiding unsupported fork/SIGALRM | Redis/PostgreSQL |
 | Experiment Runner `app/services/experiment_runner.py` | [IMPLEMENTED] | Matched-scenario baseline vs adaptive with `run_id` + CSV audit | No |
 | Dashboard `frontend/src/**` | [IMPLEMENTED · PARTIAL] | Health, case list, experiment panel; `GET /cases/:id` exists without a rendered view | No |
 
@@ -78,6 +83,8 @@ sequenceDiagram
     participant ORCH as Orchestrator
     participant DIAG as Failure Diagnosis
     participant POL as Policy + Guardrails
+    participant RQ as Redis/RQ
+    participant WORKER as Temporal Worker
     participant EXEC as Action Executor
 
     RZP->>GW: POST /webhooks/razorpay<br/>(event, payload, x-razorpay-signature, x-razorpay-event-id)
@@ -92,24 +99,25 @@ sequenceDiagram
     DIAG-->>ORCH: failure_category
     ORCH->>POL: decide(case) — baseline, inline
     POL->>DB: INSERT Decision + Action (SCHEDULED), set case.state
-    ORCH->>EXEC: execute(case, action)
-    alt CREATE_PAYMENT_LINK / CONTACT_CUSTOMER / COLLECT_PROMISE_TO_PAY
-        EXEC->>DB: EXECUTED + result (+ CustomerMessage when contact)
-        EXEC-->>ORCH: case.state → AWAITING_OUTCOME
-    else WAIT / WAIT_FOR_NATIVE_RETRY
-        Note over EXEC: no side effect; case.state → WAITING<br/>SCHEDULED forever (no worker)
-    else ESCALATE / STOP
-        Note over EXEC: no side effect; case.state → HUMAN_REVIEW / STOPPED
-    end
     ORCH->>DB: COMMIT
+    GW->>RQ: enqueue(action_id) after commit
     GW-->>RZP: 200 {case_id, case_state}
+    RQ->>WORKER: app.jobs.process_action(action_id)
+    WORKER->>DB: lock case; conditional SCHEDULED → EXECUTING; COMMIT
+    alt provider action
+        WORKER->>EXEC: perform(snapshot), no DB transaction
+        EXEC-->>WORKER: result / expected failure
+    else WAIT / PTP
+        WORKER->>WORKER: deterministic temporal transition
+    end
+    WORKER->>DB: re-lock; finalize / retry / stale no-op; COMMIT
 ```
 
 ---
 
 ## State ownership
 
-- **Only `app/services/orchestrator.py` mutates `RevenueCase.state`.** Policy, executor, and follow-up modules mutate state through the orchestrator or via the executor's narrowly owned transitions (`ACTION_SCHEDULED → AWAITING_OUTCOME / HUMAN_REVIEW`). This invariant is enforced by code review rather than by a type-level guard.
+- State mutation is limited to owning services: orchestrator for inbound events/replies, policy engine for decision outcomes, and temporal runtime/action executor/PTP follow-up for claimed worker transitions. Routers, queue transport, and ML code do not mutate case state.
 
 ---
 
@@ -137,10 +145,12 @@ stateDiagram-v2
     HUMAN_REVIEW --> DISPUTED : dispute
     RECOVERED --> DISPUTED : dispute overrides recovery (chargeback after capture)
     AWAITING_OUTCOME --> AWAITING_OUTCOME : customer promise_to_pay\n(recorded + FOLLOW_UP_PTP scheduled)
-    AWAITING_OUTCOME --> HUMAN_REVIEW : manual FOLLOW_UP_PTP processor — BROKEN promise
+    WAITING --> DIAGNOSED : due WAIT worker re-evaluates
+    AWAITING_OUTCOME --> HUMAN_REVIEW : due linked FOLLOW_UP_PTP — BROKEN promise
+    STOPPED --> RECOVERED : legitimate late recovery event
 
-    note right of WAITING : SCHEDULED forever —\nno automatic re-evaluation\n[PLANNED runtime]
-    note right of AWAITING_OUTCOME : parked until webhook / reply / manual follow-up
+    note right of WAITING : RQ delayed wake-up;\nPostgreSQL action is authoritative
+    note right of AWAITING_OUTCOME : webhook / reply / linked PTP deadline
     RECOVERED --> [*]
     STOPPED --> [*]
     DISPUTED --> [*]
@@ -153,10 +163,10 @@ stateDiagram-v2
 | `DETECTED` | No | `_handle_failure` creates `RevenueCase` | No | Immediately diagnosed within same request |
 | `DIAGNOSED` | No | `_diagnose` sets `failure_category` + `state=DIAGNOSED` | Yes — but only ephemeral | Immediately passed to `policy_engine.decide` |
 | `DECISION_READY` | No | `policy_engine.decide` sets before choosing | Yes | Never persisted long — transitions inline to a final state |
-| `WAITING` | Automation-terminal | `WAIT` / `WAIT_FOR_NATIVE_RETRY` | Yes | **No wake-up**; terminal for automation but `payment.captured` can still recover |
-| `ACTION_SCHEDULED` | No | `CREATE_PAYMENT_LINK` / `CONTACT_CUSTOMER` before execution | Yes | Immediately executed → `AWAITING_OUTCOME` or `HUMAN_REVIEW` |
-| `AWAITING_OUTCOME` | Automation-terminal | Action executed or PTP recorded | Yes | Parked until webhook/reply/manual follow-up |
-| `HUMAN_REVIEW` | Automation-terminal | `ESCALATE`, execution failure, PTP validation failure, broken promise | Yes | Requires human; `payment.captured` can still recover but `FOLLOW_UP_PTP` does not auto-fire |
+| `WAITING` | No | `WAIT` / `WAIT_FOR_NATIVE_RETRY` | Yes | Worker wakes at `scheduled_for`; recovery/dispute may arrive first |
+| `ACTION_SCHEDULED` | No | `CREATE_PAYMENT_LINK` / contact action before execution | Yes | Worker claim leads to outcome, retry, or human review |
+| `AWAITING_OUTCOME` | No when linked PTP exists | Action executed or PTP recorded | Yes | Webhook/reply/PTP deadline can transition it |
+| `HUMAN_REVIEW` | Automation-terminal | `ESCALATE`, exhausted execution, invalid/broken PTP | Yes | Legitimate recovery remains possible |
 | `RECOVERED` | **Yes** | `_recover_case` (late capture or `payment_link.paid`) | No | Dispute still overrides to `DISPUTED` |
 | `STOPPED` | **Yes** | `STOP` (stopping rule) | No | `RECOVERED` still possible via inbound recovery event; dispute can override |
 | `DISPUTED` | **Yes** | `_dispute_case` | No | Always wins, even over `RECOVERED` |
@@ -164,7 +174,7 @@ stateDiagram-v2
 ### Known deviation between intended and actual transitions
 
 - `REPLYABLE_STATES` (`orchestrator.py:294`) includes `DECISION_READY`. Since `DECISION_READY` is never persisted beyond the current transaction, this branch is effectively dead. Harmless but documented in `docs/CURRENT_STATE.md` debt.
-- `WAITING` is entered by two distinct actions (`WAIT` vs `WAIT_FOR_NATIVE_RETRY`) with different intent (generic transient vs subscription-native-retry) but identical current runtime behavior — both are `SCHEDULED` forever.
+- `WAIT` and `WAIT_FOR_NATIVE_RETRY` share execution logic but use independently configurable delays. A completed wait is blocked from repeating so re-evaluation progresses conservatively.
 
 ---
 
@@ -200,6 +210,9 @@ erDiagram
         string revenue_case_id FK
         string razorpay_event_id UK
         string event_type
+        string razorpay_payment_id
+        string razorpay_subscription_id
+        string razorpay_payment_link_id
         json raw_payload
     }
     decisions {
@@ -214,10 +227,17 @@ erDiagram
         string id PK
         string revenue_case_id FK
         string decision_id FK
+        string promise_to_pay_id FK
         string action_type
         string status
         datetime scheduled_for
         datetime executed_at
+        int attempt_count
+        int max_attempts
+        datetime claimed_at
+        datetime enqueued_at
+        string queue_job_id
+        text last_error
         json result
     }
     promises_to_pay {
@@ -256,6 +276,19 @@ erDiagram
 - `payment_events`, `decisions`, `audit_events` are **append-only** — never overwritten. The history is itself the product.
 - Migrations own schema (`backend/alembic/versions/*`); `app/models.py` is the source of truth for model shape.
 - For the full column list, read `app/models.py:29`.
+
+### Durable action protocol
+
+1. Request transaction persists the event, case, decision, and action.
+2. After commit, `task_queue` publishes `action_id`; a publish failure leaves recoverable DB state.
+3. Worker locks the case and conditionally updates a due action from `SCHEDULED` to `EXECUTING`, increments attempts, and commits.
+4. Provider I/O runs against a detached snapshot with no DB transaction open.
+5. Finalization re-locks state. Stale/terminal/superseded work is cancelled or ignored; expected failures retry with bounded exponential delay.
+6. Reconciliation resets expired leases and republishes every scheduled action, including future jobs after Redis loss.
+
+RQ delivery is at least once. The DB claim prevents concurrent duplicate execution. Payment Links use deterministic `Action.id` references, but absolute provider exactly-once still requires future reconciliation for a crash after provider acceptance and before finalization.
+
+The live publisher and reconciler require `RevenueCase.source=razorpay`. Experiment/synthetic actions remain offline records even though they use the same policy and table.
 
 ---
 
@@ -324,7 +357,8 @@ ground_truth.py: BASE_PROBABILITY[(category, action)]  ──┐
 
 - Webhooks: `POST /webhooks/razorpay` verifies `x-razorpay-signature` on raw bytes (`app/core/security.py:11`); requires `x-razorpay-event-id`; deduped via unique DB constraint. Supported inbound events: `payment.failed`, `subscription.halted`, `payment.captured`, `subscription.charged`, `payment_link.paid`, `payment.dispute.created` (`app/services/orchestrator.py:36`).
 - Payment Links: `create_payment_link` (`app/services/razorpay_client.py:48`) — **simulated** by default (`plink_sim_*`); live only when `RAZORPAY_API_ENABLED=true` with a `rzp_test_*` key. `rzp_live_*` rejected. Fulfillment is via a *different* `razorpay_payment_id` than the failed payment; matched on `RevenueCase.razorpay_payment_link_id`.
-- **What is not implemented:** Subscriptions/Orders API, automatic HMAC key rotation, production live-money flow.
+- Subscription vs receivable: `razorpay_payment_id` is the unique live receivable (partial unique index); `razorpay_subscription_id` names the billing relationship, not a specific cycle — correlation uses payment-id first and only falls back to the latest open subscription case; out-of-order recovery suppression requires an exact `payment_id` match, so a prior cycle's success does not suppress a later cycle's failure.
+- **What is not implemented:** invoice/Order-level billing-cycle model, Subscriptions/Orders API, automatic HMAC key rotation, production live-money flow.
 
 ---
 
@@ -340,18 +374,18 @@ ground_truth.py: BASE_PROBABILITY[(category, action)]  ──┐
 
 | Action type | Side effect | Transport | Delivery guarantee |
 |-------------|------------|-----------|--------------------|
-| `WAIT`, `WAIT_FOR_NATIVE_RETRY` | None | — | `SCHEDULED` row only |
-| `CREATE_PAYMENT_LINK` | Payment Link creation | Razorpay REST API (or simulation) | Executed inline; failure → `HUMAN_REVIEW` |
-| `CONTACT_CUSTOMER`, `COLLECT_PROMISE_TO_PAY` | Customer message drafted + stored | None (no SMS/email/WhatsApp) | `EXECUTED` after store; `CustomerMessage.body` persisted |
-| `FOLLOW_UP_PTP` | Scheduled follow-up row | None (manual processor) | `SCHEDULED` until `process_due_followups` runs |
-| `ESCALATE` | None | — | `SCHEDULED` + `HUMAN_REVIEW` |
-| `STOP` | None | — | `SCHEDULED` + `STOPPED` |
+| `WAIT`, `WAIT_FOR_NATIVE_RETRY` | Re-evaluate baseline policy | RQ delayed job | DB claim + stale no-op; no provider call |
+| `CREATE_PAYMENT_LINK` | Payment Link creation | RQ worker -> Razorpay REST API (or simulation) | Bounded retry; deterministic action reference |
+| `CONTACT_CUSTOMER`, `COLLECT_PROMISE_TO_PAY` | Customer message drafted + stored | RQ worker; no delivery transport | Bounded draft retry; one DB finalization |
+| `FOLLOW_UP_PTP` | Break exact unpaid promise after local day | RQ delayed job | DB claim + exact FK linkage |
+| `ESCALATE` | None | None | Immediately `EXECUTED` + `HUMAN_REVIEW` |
+| `STOP` | None | None | Immediately `EXECUTED` + `STOPPED` |
 
 ---
 
 ## Future components
 
-- **Temporal Recovery Runtime (wake-up scheduler) [PLANNED]:** Real delayed-action worker that re-evaluates `WAITING`/`AWAITING_OUTCOME` when their `scheduled_for` arrives, treating PostgreSQL as source of truth and Redis only as transport. Not drawn as implemented.
+- **Provider-side Payment Link reconciliation [PLANNED]:** Close the narrow crash-after-accept/before-DB-finalize uncertainty window by querying deterministic action references.
 - **Production Razorpay live-money path [PLANNED]:** Separate credentials, environment gate, and hardened HMAC/secret management.
 - **Message delivery transport [PLANNED]:** Actual SMS/email/WhatsApp dispatch for drafted `CONTACT_CUSTOMER` messages.
 - **Live adaptive policy [PLANNED]:** Replace the baseline `policy_engine.decide` call in `orchestrator._diagnose` with guarded `ml_policy.decide_ml` behind a feature flag, after real outcome logging validates the model.

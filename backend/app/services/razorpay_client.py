@@ -55,9 +55,9 @@ def create_payment_link(
 ) -> dict:
     """
     Creates a Razorpay Payment Link (test mode, once real credentials are
-    configured) for the given amount. reference_id should be the
-    RevenueCase id, so a paid webhook can be traced back even before we
-    match on the returned payment_link id.
+    configured) for the given amount. The runtime uses the durable Action id
+    as reference_id and includes both action/case ids in notes so retries and
+    provider-side reconciliation have a deterministic key.
 
     Returns the Razorpay API response dict (or the simulated equivalent).
     Raises RazorpayAPIError on a live call that fails.
