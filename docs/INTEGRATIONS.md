@@ -35,25 +35,42 @@ payment_link.paid { payload.payment_link.entity.id == <that plink_*> }
 
 No other production Razorpay API surface is used. No subscriptions/orders mutation.
 
-### Payment Links — gates and behavior
+### Payment Links — gates, identity, and verified provider semantics
+
+Official Razorpay docs (Sep 2026) were verified before implementation. Relevant primitives:
+
+| Question | Verified answer (official docs) | Source |
+|----------|----------------------------------|--------|
+| Direct `GET` by `reference_id`? | **No.** `GET /v1/payment_links/{id}` requires the provider `plink_*` id. | `razorpay.com/docs/api/payments/payment-links/fetch-id-standard` |
+| List/filter by `reference_id`? | **Yes.** `GET /v1/payment_links?reference_id=X` — supported query param, returns `{payment_links: [...]}`. | `…/fetch-all-standard` (query param `reference_id`; example `params.put("reference_id","TS1989")`) |
+| Uniqueness on `reference_id`? | **Yes, enforced.** `reference_id` "Must be a unique number for each Payment Link. Max 40 chars." | `…/create-standard` + entity docs |
+| Same `reference_id` reused? | `400` — "payment link creation with reference ID already attempted" / "An existing reference id has been passed." | `…/create-standard` errors |
+| `Idempotency-Key` header? | **Not for Payment Links.** No documented `Idempotency-Key`; the unique `reference_id` is the de-facto idempotency primitive. | API ref shows only `reference_id` |
+| Stable binding primitive? | `reference_id` + `notes` (`notes.recoveryos_case_id`, `notes.recoveryos_action_id`) plus `amount`/`currency`/`status` validation. | Code + docs |
 
 ```python
 # app/services/razorpay_client.py:48
 if not settings.RAZORPAY_API_ENABLED:
     return _simulated_payment_link(...)      # default
 
-if not credentials_configured():             # key + secret both non-empty
+if not credentials_configured():
     raise RazorpayAPIError("… incomplete")
 
 if not settings.RAZORPAY_KEY_ID.startswith("rzp_test_"):
     raise RazorpayAPIError("… Test Mode API keys")
-# then httpx.post(BASE_URL/payment_links, json={amount (paise), …},
-#                 auth=(key, secret), timeout=10s)
+# then httpx.post(BASE_URL/payment_links,
+#   json={amount (paise), currency, description,
+#         reference_id: build_provider_reference(Action.id),  # canonical, stable
+#         notes: {recoveryos_case_id, recoveryos_action_id},
+#         callback_method: "get"}, auth, timeout)
+# Provider I/O is outside any long DB transaction; sanitized via _sanitize_link().
 ```
 
+- **Canonical identity:** `build_provider_reference(Action.id) == Action.id` (`razorpay_client.py:140`) — one `Action` ↔ one intended provider link. One `RevenueCase` may legitimately have many `Actions`; each gets its own `reference_id`. `notes` carry the same ids for second-factor validation.
 - **Simulation is the default.** Non-empty `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` alone **never** enable network — `RAZORPAY_API_ENABLED=true` is required explicitly (`backend/.env.example:8`) and is independent of webhook signature verification (which fails **closed** when `RAZORPAY_WEBHOOK_SECRET` is empty — security vs missing-integration have different defaults by design).
-- **Simulated link** (`_simulated_payment_link`): `id=plink_sim_<uuid14>`, `short_url=https://rzp.io/simulated/<id>`, `simulated=true`, `note="… local simulation, not a real Payment Link …"`. Link IDs are unique per call. Visible at `GET /cases/{id}.actions[0].result` and `case.razorpay_payment_link_id`.
-- **Live Test Mode link** (`create_payment_link` under flag): `POST https://api.razorpay.com/v1/payment_links` with `{amount: paise, currency, description: "Recovery for case <uuid>", reference_id: case.id, notes: {}}`. Response is `response.json()` (genuine `plink_*` + `rzp.io`), with no `simulated` key — absence of `simulated` **is** the live signal in inspectors/tests. Failures raise `RazorpayAPIError` → `Action(status=FAILED)` + `HUMAN_REVIEW` in the executor.
+- **Simulated link** (`_simulated_payment_link`): `id=plink_sim_<uuid14>`, `short_url=https://rzp.io/simulated/<id>`, `simulated=true`, `reference_id=Action.id`, `note="… local simulation …"`. Link IDs are unique per call. Visible at `GET /cases/{id}.actions[0].result` and `case.razorpay_payment_link_id`. List lookup (`list_payment_links_by_reference`) returns `[]` in simulation — no provider state to reconcile.
+- **Live Test Mode link** (`create_payment_link` under flag): `POST https://api.razorpay.com/v1/payment_links` as above. Response is sanitized to `{id, reference_id, short_url, amount, currency, notes, status, …}` (`_sanitize_link`) — headers/secrets never persisted. `RazorpayAPIError` vs `RazorpayAmbiguousError` classification: `Timeout`/`NetworkError`/`ConnectError`/`5xx`/`429`/`duplicate reference_id` → `RazorpayAmbiguousError` (reconcile before retry); other `4xx` (e.g., invalid amount) → `RazorpayAPIError` (bounded retry then `HUMAN_REVIEW`). Duplicate `reference_id` is intentionally treated as ambiguous/reconcile, not definite failure.
+- **Provider reconciliation** (`find_payment_link_for_action`): `list_payment_links_by_reference(Action.id)` → validate single result: `reference_id == Action.id`, `amount == expected paise`, `currency == expected`, `notes.recoveryos_*` must match if present, `status ∉ {expired, cancelled}`. Found+valid → return sanitized link for canonical `apply_success(..., _reconciled=true)` → `action_reconciled`. Mismatch (e.g., wrong amount/currency/notes, multiple matches, `expired`/`cancelled`) → raise `RazorpayAPIError` → `payment_link_reconciliation_failed` → `HUMAN_REVIEW`, never silently adopted. Reliably absent (empty) → caller schedules bounded retry. Lookup itself timing out/`5xx` → `RazorpayAmbiguousError` → bounded pending retry.
 - **Link fulfillment:** a `payment_link.paid` webhook carries **two** entities: `payload.payment_link.entity` (the link — what `RevenueCase.razorpay_payment_link_id` matches) and `payload.payment.entity` (the fulfilling payment, a new `pay_*` unrelated to the original failure — `orchestrator.py:61`). Matching on the wrong entity would silently fail.
 
 **Current limitations:**
@@ -61,6 +78,7 @@ if not settings.RAZORPAY_KEY_ID.startswith("rzp_test_"):
 - Only the Payment Links API is integrated; `payment_link.paid` matching on a `link_id` that was never created is an acknowledged noop (`200 {case_id: null}`).
 - The link is created but **never delivered** to a customer — no SMS/email/WhatsApp — so payment depends on the operator sharing the `short_url` or on a future delivery transport (`docs/INTEGRATIONS.md` → LLM/delivery).
 - Amount edge cases (e.g., captured ≠ link amount) are not validated; any `payment_link.paid` for the `link_id` recovers.
+- **Exactly-once limit:** DB claim + unique `reference_id` + `list?reference_id` reconciliation reduce the narrow `POST`-accepted/response-lost window to a single validated `GET`, but true exactly-once still depends on Razorpay's documented uniqueness guarantee. If Razorpay's provider commit and `list` filtering ever diverged, the safe fallback is `HUMAN_REVIEW`, not a second `POST`.
 
 ### `TEST MODE ≠ production`
 
@@ -157,21 +175,27 @@ Job IDs are deterministic per action attempt: `action-{action_id}-{attempt_count
 ### Transaction and failure contract
 
 - Request handlers commit before Redis publish. Redis failure does not roll back webhook ingestion.
-- Workers lock the case, atomically claim due work, and commit before provider I/O.
-- Success/failure finalization uses a new short transaction and rechecks status, case state, and supersession.
-- Expected provider failures use bounded application retries. Persisted error text is sanitized.
-- Unexpected worker death leaves an expiring `EXECUTING` lease. Reconciliation resets it or marks it exhausted.
-- Payment Link requests use `Action.id` as `reference_id` and include case/action IDs in notes. Provider-side reconciliation is still required for the narrow crash-after-accept/before-finalize window.
+- Workers lock the case, atomically claim due work, and commit before provider I/O — **provider HTTP is never inside a long DB transaction** (`temporal_runtime` snapshots the `Case` and closes the claim txn before `action_executor.perform`).
+- Success/failure finalization uses a new short transaction and rechecks `Action.status == EXECUTING`, `case.state`, and supersession (`_is_superseded`).
+- **Error classification:** `RazorpayAmbiguousError` (`Timeout`/`NetworkError`/`5xx`/`429`/duplicate `reference_id`) → `provider_outcome_ambiguous` → `GET /v1/payment_links?reference_id=Action.id` before any retry; `RazorpayAPIError` (definite `4xx` validation) → bounded `SCHEDULED` retry (exponential) with sanitized `last_error`, then `FAILED + HUMAN_REVIEW`.
+- **Crash-after-accept:** never blindly recreates. `reconcile_actions()` finds stale `EXECUTING` `CREATE_PAYMENT_LINK` claims and runs `_reconcile_stale_payment_link()` outside any txn — validated adopt (`action_reconciled`) or bounded retry; `expired`/`cancelled` or mismatch → `payment_link_reconciliation_failed` → `HUMAN_REVIEW`.
+- **Expired/cancelled provider link:** treated as mismatch, not adopted — safe manual review.
+- **Result sanitization:** every persisted `Action.result` is filtered through `_sanitize_link()` (`id, reference_id, short_url, amount, currency, notes, status, …` only; `auth`/`headers` dropped); error payloads are truncated to 300 chars.
+- **Manual repair:** `python scripts/reconcile_payment_links.py --action-id <uuid>` or `--all-ambiguous [--dry-run]` reuses the same `find_payment_link_for_action` validation and canonical `apply_success(_reconciled=true)` path; case-terminal (`RECOVERED`/`DISPUTED`) is re-checked before lookup.
+- Payment Link requests use `Action.id` as `reference_id` and include case/action IDs in notes. The narrow crash-after-accept/before-finalize window is now closed via provider reconciliation; remaining exactly-once limit is `reference_id` uniqueness on Razorpay's side.
 
 ---
 
 ## External-side-effect audit
 
-| Capability | External call today | When it fires | Fallback |
-|------------|---------------------|---------------|----------|
-| Payment Link create | `POST /v1/payment_links` **only when** `RAZORPAY_API_ENABLED=true` + `rzp_test_*` | Claimed worker action, outside DB transaction | `_simulated_payment_link` |
+| Capability | External call today | When it fires | Fallback / on-ambiguity |
+|------------|---------------------|---------------|--------------------------|
+| Payment Link create | `POST /v1/payment_links` **only when** `RAZORPAY_API_ENABLED=true` + `rzp_test_*` (`reference_id=Action.id`) | Claimed worker action, outside DB transaction | `_simulated_payment_link`; on `RazorpayAmbiguousError` → `GET /v1/payment_links?reference_id=Action.id` (provider reconciliation) before any retry |
+| Payment Link reconcile | `GET /v1/payment_links?reference_id=Action.id` + `GET /v1/payment_links/{id}` (via `list_payment_links_by_reference`/`fetch_payment_link`) | `RazorpayAmbiguousError` path in `temporal_runtime._handle_ambiguous_payment_link`; stale `EXECUTING` in `reconcile_actions()`; manual `scripts/reconcile_payment_links.py` | Validated adopt (`action_reconciled`) or bounded `HUMAN_REVIEW` on mismatch; empty → retry creation; itself ambiguous → `payment_link_reconciliation_pending` then retry |
 | LLM draft | `POST https://api.anthropic.com/v1/messages` **only when** `LLM_API_ENABLED=true` + provider=anthropic + key | Claimed worker action, outside DB transaction | `_simulated_draft` (`_TEMPLATES`) |
 | LLM PTP extract | Same endpoint, same gate | Before the customer-reply row-lock transaction | `_simulated_extract` (keywords + regex) |
-| Redis/RQ enqueue | Redis at `REDIS_URL` when `TASK_QUEUE_ENABLED=true` | After request commit, after retry commit, or reconciliation | Durable `SCHEDULED` DB row remains recoverable |
+| Redis/RQ enqueue | Redis at `REDIS_URL` when `TASK_QUEUE_ENABLED=true` | After request commit, after retry commit, or reconciliation | Durable `SCHEDULED` DB row remains recoverable; `last_error=provider_outcome_ambiguous` preserves need |
+
+Every external call path can be **fully exercised under tests without network** via the `simulated` branch and the fake `httpx.post`/`httpx.get` monkeypatches (`tests/test_razorpay_client.py:53`, `tests/test_payment_link_reconciliation.py:396`, `tests/test_llm_client.py:49`).
 
 Every external call path can be **fully exercised under tests without network** via the `simulated` branch and the fake `httpx.post` monkeypatches (`tests/test_razorpay_client.py:53`, `tests/test_llm_client.py:49`).

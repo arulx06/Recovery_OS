@@ -286,7 +286,46 @@ erDiagram
 5. Finalization re-locks state. Stale/terminal/superseded work is cancelled or ignored; expected failures retry with bounded exponential delay.
 6. Reconciliation resets expired leases and republishes every scheduled action, including future jobs after Redis loss.
 
-RQ delivery is at least once. The DB claim prevents concurrent duplicate execution. Payment Links use deterministic `Action.id` references, but absolute provider exactly-once still requires future reconciliation for a crash after provider acceptance and before finalization.
+RQ delivery is at least once. The DB claim prevents concurrent duplicate execution.
+
+### Provider-side Payment Link reconciliation — at-least-once execution + provider validation
+
+```
+Action SCHEDULED (reference_id = Action.id, notes={recoveryos_case_id, recoveryos_action_id})
+        │
+        ▼
+Worker claims EXECUTING (attempt++)  ──COMMIT
+        │
+        ▼
+Provider POST /v1/payment_links  (outside any DB transaction)
+        │
+   ┌────┼───────────────────────┐
+   │    │                       │
+ success  definite 4xx      ambiguous (timeout / network / 5xx / 429 / duplicate reference_id)
+   │    │ failure               │
+   │    ▼                       ▼
+   │  retry → HUMAN_REVIEW   provider GET /v1/payment_links?reference_id=Action.id
+   │                            │
+   ▼                            ├─ found + validated (reference_id, amount, currency, notes, status not expired/cancelled)
+ finalize:                      │     → canonical apply_success() → EXECUTED / AWAITING_OUTCOME, audit action_reconciled
+  apply_success()               │       (reuses same DB path as normal success; result marked _reconciled=true)
+  → EXECUTED                     │
+  → AWAITING_OUTCOME            ├─ found but mismatch / expired / cancelled → FAILED + HUMAN_REVIEW, audit payment_link_reconciliation_failed
+                                │
+                                ├─ reliably absent → bounded retry (exponential), audit payment_link_reconciliation_absent
+                                │
+                                └─ lookup itself ambiguous → keep EXECUTING, audit pending, bounded retry later
+```
+
+- **Stable identity:** `reference_id = Action.id` (UUID, 36 chars < 40-char limit) — `razorpay_client.build_provider_reference()` is the single canonical helper. One `RevenueCase` may have many `Actions`, but one `CREATE_PAYMENT_LINK` `Action` maps to one intended provider link. Notes carry `recoveryos_case_id` + `recoveryos_action_id` for second-factor validation.
+- **Provider primitive verified (official docs, Sep 2026):**
+  - `POST /v1/payment_links` with `reference_id` — must be unique per link; duplicate returns `400 An existing reference id has been passed`.
+  - `GET /v1/payment_links?reference_id=X` — list/filter by `reference_id` (returns `{payment_links: [...]}`); direct `GET /v1/payment_links/{id}` also exists but requires the `plink_*` id.
+  - `GET /v1/payment_links?reference_id=` is the strongest safe lookup; no separate `Idempotency-Key` header exists for Payment Links.
+  - Statuses `created`/`partially_paid`/`expired`/`cancelled`/`paid` — only `created`/`partially_paid`/`paid` are adoptable; `expired`/`cancelled` route to `HUMAN_REVIEW`.
+- **Crash-after-accept:** `EXECUTING` lease expires → `reconcile_actions()` runs `_reconcile_stale_payment_link()` **before** generic lease reset — it does `list?reference_id` outside any transaction, validates, and either adopts (`EXECUTED`) or allows the normal `SCHEDULED` retry. No second `POST` is sent when the link already exists.
+- **Timeout/unknown result:** same provider lookup before any retry; if lookup says absent, retry is safe; if lookup is itself ambiguous, the action stays `EXECUTING` and is retried later with bounded `max_attempts` (→ `payment_link_manual_review_required` when exhausted).
+- **Redis loss:** PostgreSQL retains `SCHEDULED` with `last_error=provider_outcome_ambiguous`; `reconcile_actions()` republishes without immediately creating another provider link — the next worker claim will reconcile first.
 
 The live publisher and reconciler require `RevenueCase.source=razorpay`. Experiment/synthetic actions remain offline records even though they use the same policy and table.
 
@@ -375,7 +414,7 @@ ground_truth.py: BASE_PROBABILITY[(category, action)]  ──┐
 | Action type | Side effect | Transport | Delivery guarantee |
 |-------------|------------|-----------|--------------------|
 | `WAIT`, `WAIT_FOR_NATIVE_RETRY` | Re-evaluate baseline policy | RQ delayed job | DB claim + stale no-op; no provider call |
-| `CREATE_PAYMENT_LINK` | Payment Link creation | RQ worker -> Razorpay REST API (or simulation) | Bounded retry; deterministic action reference |
+| `CREATE_PAYMENT_LINK` | Payment Link creation | RQ worker → Razorpay `POST /v1/payment_links` (`reference_id=Action.id`) or simulation → `GET /v1/payment_links?reference_id=` on ambiguity/stale | At-least-once worker claim + provider reconciliation + `reference_id` uniqueness; `DB claim alone cannot give exactly-once` — validated adoption (`action_reconciled`) or bounded `HUMAN_REVIEW` on mismatch; never blindly recreates |
 | `CONTACT_CUSTOMER`, `COLLECT_PROMISE_TO_PAY` | Customer message drafted + stored | RQ worker; no delivery transport | Bounded draft retry; one DB finalization |
 | `FOLLOW_UP_PTP` | Break exact unpaid promise after local day | RQ delayed job | DB claim + exact FK linkage |
 | `ESCALATE` | None | None | Immediately `EXECUTED` + `HUMAN_REVIEW` |
@@ -385,7 +424,6 @@ ground_truth.py: BASE_PROBABILITY[(category, action)]  ──┐
 
 ## Future components
 
-- **Provider-side Payment Link reconciliation [PLANNED]:** Close the narrow crash-after-accept/before-DB-finalize uncertainty window by querying deterministic action references.
 - **Production Razorpay live-money path [PLANNED]:** Separate credentials, environment gate, and hardened HMAC/secret management.
 - **Message delivery transport [PLANNED]:** Actual SMS/email/WhatsApp dispatch for drafted `CONTACT_CUSTOMER` messages.
 - **Live adaptive policy [PLANNED]:** Replace the baseline `policy_engine.decide` call in `orchestrator._diagnose` with guarded `ml_policy.decide_ml` behind a feature flag, after real outcome logging validates the model.

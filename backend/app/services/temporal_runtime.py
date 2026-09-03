@@ -5,7 +5,7 @@ from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.time import utc_now
 from app.models import Action, AuditEvent, PromiseToPay, RevenueCase
-from app.services import action_executor, policy_engine, ptp_followup, task_queue
+from app.services import action_executor, policy_engine, ptp_followup, razorpay_client, task_queue
 
 
 TERMINAL_CASE_STATES = {"RECOVERED", "STOPPED", "DISPUTED"}
@@ -211,6 +211,177 @@ def _complete_external(action_id: str, result: dict, now) -> str:
         return outcome
 
 
+def _reconcile_payment_link(action_id: str, case_snapshot, now) -> dict | None:
+    """Attempt provider reconciliation for one CREATE_PAYMENT_LINK.
+
+    Returns sanitized provider link if found and validated, None if reliably
+    absent, and raises RazorpayAPIError on mismatch or RazorpayAmbiguousError
+    if lookup itself is ambiguous (caller must retry later).
+    """
+    expected_amount_paise = int(case_snapshot.amount * 100) if case_snapshot.amount else 0
+    expected_currency = case_snapshot.currency or "INR"
+    expected_case_id = case_snapshot.id
+    try:
+        link = razorpay_client.find_payment_link_for_action(
+            action_id, expected_amount_paise, expected_currency, expected_case_id,
+        )
+    except razorpay_client.RazorpayAmbiguousError:
+        raise
+    except razorpay_client.RazorpayAPIError:
+        raise
+    return link
+
+
+def _handle_ambiguous_payment_link(action_id: str, now, error_detail: str) -> str:
+    # Audit the ambiguity before any provider I/O.
+    with SessionLocal() as db:
+        action = db.query(Action).filter(Action.id == action_id).first()
+        if action:
+            db.add(AuditEvent(
+                revenue_case_id=action.revenue_case_id,
+                event="provider_outcome_ambiguous",
+                detail={"action_id": action_id, "error": error_detail[:300]},
+            ))
+            db.commit()
+
+    snapshot = _execution_snapshot(action_id)
+    if not snapshot:
+        return "stale"
+    _, action_type, case_snapshot = snapshot
+    if action_type != "CREATE_PAYMENT_LINK":
+        return _record_external_failure(action_id, now)
+
+    # Reload authoritative case state before provider lookup (spec 38).
+    with SessionLocal() as db:
+        case = db.query(RevenueCase).filter(RevenueCase.id == case_snapshot.id).first()
+        if not case or case.state in TERMINAL_CASE_STATES:
+            db.rollback()
+            # Terminal — cancel stale and do not reconcile.
+            with SessionLocal() as cdb:
+                action2, case2 = _lock_action_and_case(cdb, action_id)
+                if action2 and action2.status == "EXECUTING":
+                    _cancel_stale(cdb, action2, now, "case_terminal_before_reconcile")
+                    cdb.commit()
+                else:
+                    cdb.rollback()
+            return "stale"
+        db.rollback()
+
+    try:
+        link = _reconcile_payment_link(action_id, case_snapshot, now)
+    except razorpay_client.RazorpayAmbiguousError as exc:
+        # Lookup itself ambiguous — keep EXECUTING lease to expire and retry
+        # later rather than blindly creating another link. Bounded by attempt_count.
+        with SessionLocal() as db:
+            action, case = _lock_action_and_case(db, action_id)
+            if not action or action.status != "EXECUTING":
+                db.rollback()
+                return "stale"
+            db.add(AuditEvent(
+                revenue_case_id=case.id,
+                event="payment_link_reconciliation_pending",
+                detail={"action_id": action_id, "reason": str(exc)[:200]},
+            ))
+            db.commit()
+        # Treat as retry-scheduled: reset to SCHEDULED with delay so next
+        # attempt will reconcile again. Do not create a new provider link now.
+        return _schedule_ambiguous_retry(action_id, now)
+    except razorpay_client.RazorpayAPIError as exc:
+        # Mismatch — never adopt, go to HUMAN_REVIEW.
+        with SessionLocal() as db:
+            action, case = _lock_action_and_case(db, action_id)
+            if not action or not case or action.status != "EXECUTING":
+                db.rollback()
+                return "stale"
+            action_executor.apply_reconciliation_failure(db, case, action, str(exc))
+            db.commit()
+        return "failed"
+
+    if link is not None:
+        # Found and validated — adopt via canonical success path with reconciled marker.
+        reconciled_result = dict(link)
+        reconciled_result["_reconciled"] = True
+        reconciled_result["simulated"] = False
+        # Ensure reference_id present for audit.
+        if "reference_id" not in reconciled_result:
+            reconciled_result["reference_id"] = action_id
+        with SessionLocal() as db:
+            action, case = _lock_action_and_case(db, action_id)
+            if not action or not case or action.status != "EXECUTING":
+                db.rollback()
+                return "stale"
+            if case.state != "ACTION_SCHEDULED" or _is_superseded(db, action):
+                _cancel_stale(db, action, now, "case_state_or_newer_action")
+                db.commit()
+                return "stale"
+            db.add(AuditEvent(
+                revenue_case_id=case.id,
+                event="payment_link_reconciliation_started",
+                detail={"action_id": action_id, "provider_link_id": link.get("id")},
+            ))
+            db.commit()
+        outcome = _complete_external(action_id, reconciled_result, now)
+        # Overwrite audit from apply_success to reconciled variant if needed.
+        # apply_success already emitted action_reconciled when _reconciled flag set.
+        return outcome
+
+    # Reliably absent — safe to retry the create (bounded).
+    with SessionLocal() as db:
+        action = db.query(Action).filter(Action.id == action_id).first()
+        if action:
+            db.add(AuditEvent(
+                revenue_case_id=action.revenue_case_id,
+                event="payment_link_reconciliation_absent",
+                detail={"action_id": action_id},
+            ))
+            db.commit()
+    return _record_external_failure(action_id, now)
+
+
+def _schedule_ambiguous_retry(action_id: str, now) -> str:
+    retry = False
+    with SessionLocal() as db:
+        action, case = _lock_action_and_case(db, action_id)
+        if not action or not case or action.status != "EXECUTING":
+            db.rollback()
+            return "stale"
+        if case.state != "ACTION_SCHEDULED" or _is_superseded(db, action):
+            outcome = _cancel_stale(db, action, now, "case_state_or_newer_action")
+        elif action.attempt_count < action.max_attempts:
+            delay = settings.ACTION_RETRY_DELAY_SECONDS * (2 ** (action.attempt_count - 1))
+            action.status = "SCHEDULED"
+            action.scheduled_for = now + timedelta(seconds=delay)
+            action.claimed_at = None
+            action.enqueued_at = None
+            action.queue_job_id = None
+            action.last_error = "provider_outcome_ambiguous"
+            db.add(AuditEvent(
+                revenue_case_id=case.id,
+                event="payment_link_reconciliation_retry_scheduled",
+                detail={"action_id": action.id, "attempt": action.attempt_count, "delay_seconds": delay},
+            ))
+            retry = True
+            outcome = "reconcile_retry_scheduled"
+        else:
+            # Exhausted ambiguous retries — conservative manual review.
+            action.status = "FAILED"
+            action.executed_at = now
+            action.result = {"error": "provider reconciliation unresolved — manual review required"}
+            action.last_error = "provider reconciliation unresolved"
+            case.state = "HUMAN_REVIEW"
+            case.updated_at = now
+            db.add(AuditEvent(
+                revenue_case_id=case.id,
+                event="payment_link_manual_review_required",
+                detail={"action_id": action.id, "reason": "reconciliation_attempts_exhausted"},
+            ))
+            outcome = "failed"
+        db.commit()
+    if retry:
+        task_queue.enqueue_action(action_id)
+    return outcome
+
+
 def _record_external_failure(action_id: str, now) -> str:
     retry = False
     with SessionLocal() as db:
@@ -244,6 +415,84 @@ def _record_external_failure(action_id: str, now) -> str:
     return outcome
 
 
+def _reconcile_stale_payment_link(action_id: str, now, stale_before) -> str | None:
+    """Provider-aware stale handling for CREATE_PAYMENT_LINK. Returns outcome or None to fall back."""
+    snapshot = _execution_snapshot(action_id)
+    if not snapshot:
+        return None
+    _, action_type, case_snapshot = snapshot
+    if action_type != "CREATE_PAYMENT_LINK":
+        return None
+
+    # Check authoritative case state first.
+    with SessionLocal() as db:
+        case = db.query(RevenueCase).filter(RevenueCase.id == case_snapshot.id).first()
+        action = db.query(Action).filter(Action.id == action_id).first()
+        if not action or action.status != "EXECUTING" or action.claimed_at is None or action.claimed_at > stale_before:
+            db.rollback()
+            return "stale"
+        if not case or case.state in TERMINAL_CASE_STATES or _is_superseded(db, action):
+            db.rollback()
+            with SessionLocal() as cdb:
+                a, c = _lock_action_and_case(cdb, action_id)
+                if a and a.status == "EXECUTING":
+                    _cancel_stale(cdb, a, now, "ineligible_expired_claim")
+                    cdb.commit()
+                else:
+                    cdb.rollback()
+            return "stale"
+        # Determine if reconciliation is needed — always for payment links with
+        # potential provider ambiguity. Do provider lookup outside the DB txn.
+        db.rollback()
+
+    with SessionLocal() as db:
+        action_check = db.query(Action).filter(Action.id == action_id).first()
+        case_check = db.query(RevenueCase).filter(RevenueCase.id == case_snapshot.id).first()
+        if not action_check or not case_check:
+            db.rollback()
+            return "stale"
+        db.add(AuditEvent(
+            revenue_case_id=case_check.id,
+            event="payment_link_reconciliation_started",
+            detail={"action_id": action_id, "reason": "stale_executing_claim"},
+        ))
+        db.commit()
+
+    try:
+        link = _reconcile_payment_link(action_id, case_snapshot, now)
+    except razorpay_client.RazorpayAmbiguousError as exc:
+        # Lookup ambiguous — keep lease to retry later; do not reset to SCHEDULED
+        # that would immediately recreate. Bounded by next reconcile cycle.
+        with SessionLocal() as db:
+            action, case = _lock_action_and_case(db, action_id)
+            if action and action.status == "EXECUTING":
+                db.add(AuditEvent(
+                    revenue_case_id=case.id,
+                    event="payment_link_reconciliation_pending",
+                    detail={"action_id": action_id, "reason": str(exc)[:200]},
+                ))
+                db.commit()
+        return "reconcile_pending"
+    except razorpay_client.RazorpayAPIError as exc:
+        with SessionLocal() as db:
+            action, case = _lock_action_and_case(db, action_id)
+            if action and case and action.status == "EXECUTING":
+                action_executor.apply_reconciliation_failure(db, case, action, str(exc))
+                db.commit()
+        return "failed"
+
+    if link is not None:
+        reconciled_result = dict(link)
+        reconciled_result["_reconciled"] = True
+        reconciled_result["simulated"] = False
+        if "reference_id" not in reconciled_result:
+            reconciled_result["reference_id"] = action_id
+        return _complete_external(action_id, reconciled_result, now)
+
+    # Absent — allow normal stale reset to retry create.
+    return None
+
+
 def process_action(action_id: str, now=None) -> str:
     """RQ entry point. Duplicate or stale deliveries are safe no-ops."""
     now = now or utc_now()
@@ -264,6 +513,8 @@ def process_action(action_id: str, now=None) -> str:
 
     try:
         result = action_executor.perform(claimed_id, action_type, case)
+    except razorpay_client.RazorpayAmbiguousError as exc:
+        return _handle_ambiguous_payment_link(action_id, now, str(exc))
     except action_executor.EXPECTED_EXECUTION_ERRORS:
         return _record_external_failure(action_id, now)
     return _complete_external(action_id, result, now)
@@ -286,6 +537,16 @@ def reconcile_actions(now=None, limit: int | None = None) -> dict:
         db.rollback()
 
     for action_id in stale_ids:
+        # Provider-aware path for stale CREATE_PAYMENT_LINK — check provider
+        # before blindly resetting to SCHEDULED (spec: 14, 17).
+        stale_snapshot = _execution_snapshot(action_id)
+        if stale_snapshot and stale_snapshot[1] == "CREATE_PAYMENT_LINK":
+            outcome = _reconcile_stale_payment_link(action_id, now, stale_before)
+            if outcome is not None:
+                if outcome == "failed":
+                    failed += 1
+                continue
+            # absent (None) -> fall through to generic lease recovery
         with SessionLocal() as db:
             action, case = _lock_action_and_case(db, action_id)
             if not action or not case or action.status != "EXECUTING" or action.claimed_at > stale_before:

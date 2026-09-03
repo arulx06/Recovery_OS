@@ -10,9 +10,9 @@
 
 | Property | Value |
 |----------|-------|
-| Branch | `feat/recoveryos-live-runtime` |
-| Baseline ancestry | Verified hardening baseline (`chore: harden RecoveryOS baseline`, `chore: establish verified RecoveryOS baseline`) |
-| Backend tests | 257 passed (hermetic, `sqlite://` temp DB, external network and Redis denied) |
+| Branch | `feat/payment-link-reconciliation` |
+| Baseline ancestry | Verified hardening baseline (`chore: harden RecoveryOS baseline`, `chore: establish verified RecoveryOS baseline`) + temporal runtime `3debc27` |
+| Backend tests | 292 passed (hermetic, `sqlite://` temp DB, external network and Redis denied) |
 | Frontend `npm run build` | PASS |
 | Frontend `npm run lint` (`oxlint`) | PASS |
 | Database | PostgreSQL (required); SQLite for tests/CI |
@@ -23,11 +23,11 @@
 
 ### How this branch was verified
 
-- `python -m pytest -q` -> 257 passed with socket-denial guard, fake credentials, and `TASK_QUEUE_ENABLED=false` (`conftest.py`).
+- `python -m pytest -q` -> 292 passed with socket-denial guard, fake credentials, and `TASK_QUEUE_ENABLED=false` (`conftest.py`).
 - `npm run build` and `npm run lint` pass on Node 22 / Vite 8.
-- `alembic upgrade head` applies cleanly on SQLite (`ci.yml`) and on local PostgreSQL 16 at revision `8d6e24f91a73`.
+- `alembic upgrade head` applies cleanly on SQLite (`ci.yml`) and on local PostgreSQL 16 at revision `8d6e24f91a73` (no new migration — existing Action fields suffice for reconciliation).
 - A real Redis/RQ smoke test verified an ID-only `WAIT` job through `app.worker.WindowsWorker`; the default RQ worker is not Windows-compatible.
-- Manual Razorpay TEST MODE path verified independently: `payment.failed` (`card_expired`) → `INVALID_INSTRUMENT` → `CREATE_PAYMENT_LINK` → `plink_*` via `https://api.razorpay.com/v1/payment_links` → `rzp.io` short URL, with `Action.result.simulated == false` when `RAZORPAY_API_ENABLED=true` and `rzp_test_*` credentials are present.
+- Manual Razorpay TEST MODE path verified independently: `payment.failed` (`card_expired`) → `INVALID_INSTRUMENT` → `CREATE_PAYMENT_LINK` → `plink_*` via `https://api.razorpay.com/v1/payment_links` → `rzp.io` short URL, with `Action.result.simulated == false` and `reference_id == Action.id` when `RAZORPAY_API_ENABLED=true` and `rzp_test_*` credentials are present. Provider reconciliation via `list_payment_links?reference_id=<Action.id>` validated against official docs and mocked tests — genuine `plink_*` found without a second create.
 
 ---
 
@@ -42,8 +42,10 @@
 | Baseline guardrail + policy engine | **IMPLEMENTED / VERIFIED** | `app/services/policy_engine.py:176`, `tests/test_policy_engine.py` | `max_contacts_per_case=3`, `max_contacts_per_7_days=2`, `min_contact_interval_hours=12`, `max_automated_amount=₹25,000`, `max_total_attempts=5`; contact limits use `Action` history |
 | Deterministic guardrails around adaptive policy | **IMPLEMENTED** | `app/services/ml_policy.py:71` reuses `policy_engine.check_action_allowed` + `record_decision` | Adaptive scorer never bypasses guardrails |
 | Payment Link creation — simulated | **IMPLEMENTED / VERIFIED** | `app/services/razorpay_client.py:65`, `tests/test_razorpay_client.py:35`, `tests/test_webhooks.py:176` | Default; `id=plink_sim_*`, `short_url=https://rzp.io/simulated/*`, `simulated=true` |
-| Payment Link creation — Razorpay Test Mode live call | **TEST_MODE_ONLY / VERIFIED** | `app/services/razorpay_client.py:48` (`httpx.post` to `https://api.razorpay.com/v1/payment_links`), `tests/test_razorpay_client.py:53` | Gated by `RAZORPAY_API_ENABLED=true` **and** `rzp_test_*` key; live-mode keys rejected; verified manually to return genuine `plink_*` + `rzp.io` URL |
-| Action executor (`CREATE_PAYMENT_LINK`, `CONTACT_CUSTOMER`, `COLLECT_PROMISE_TO_PAY`) | **IMPLEMENTED / VERIFIED** | `app/services/action_executor.py`, `app/services/temporal_runtime.py`, `tests/test_temporal_runtime.py` | Worker commits its claim before provider calls; contact actions store but do not deliver messages |
+| Payment Link creation — Razorpay Test Mode live call | **TEST_MODE_ONLY / VERIFIED** | `app/services/razorpay_client.py:48` (`httpx.post` to `https://api.razorpay.com/v1/payment_links`, `reference_id=Action.id`, `notes={recoveryos_case_id, recoveryos_action_id}`), `tests/test_razorpay_client.py:53` | Gated by `RAZORPAY_API_ENABLED=true` **and** `rzp_test_*` key; live-mode keys rejected; verified manually to return genuine `plink_*` + `rzp.io` URL; `reference_id` is stable Action-scoped identity |
+| Payment Link provider reconciliation | **IMPLEMENTED / VERIFIED** | `app/services/razorpay_client.py:184` (`list_payment_links_by_reference`), `app/services/temporal_runtime.py:234` (`_handle_ambiguous_*`, `_reconcile_stale_*`), `tests/test_payment_link_reconciliation.py:100`, `scripts/reconcile_payment_links.py` | Finds existing provider link by `reference_id=Action.id`; validates `amount`/`currency`/`notes`/`status` before adoption; `expired`/`cancelled` → `HUMAN_REVIEW`; lookup itself is `RazorpayAmbiguousError`-aware; bounded by `max_attempts` |
+| Ambiguous provider outcome handling | **IMPLEMENTED / VERIFIED** | `app/services/razorpay_client.py:27` (`RazorpayAmbiguousError`), `app/services/temporal_runtime.py:235`, `tests/test_payment_link_reconciliation.py:136` | `Timeout`/`NetworkError`/`5xx`/`429`/`duplicate reference_id` → `RazorpayAmbiguousError` → reconcile before retry; definite `400` validation → `RazorpayAPIError` → bounded retry then `HUMAN_REVIEW`; never blindly creates another link |
+| Action executor (`CREATE_PAYMENT_LINK`, `CONTACT_CUSTOMER`, `COLLECT_PROMISE_TO_PAY`) | **IMPLEMENTED / VERIFIED** | `app/services/action_executor.py`, `app/services/temporal_runtime.py`, `tests/test_temporal_runtime.py` | Worker commits its claim before provider calls; provider HTTP is outside any DB transaction; contact actions store but do not deliver messages; payment-link success/failure is sanitized (`_sanitize_link`) and audited as `action_executed` vs `action_reconciled` |
 | Payment recovery (`payment.captured` / `subscription.charged` -> `RECOVERED`) | **IMPLEMENTED / VERIFIED** | `app/services/orchestrator.py`, `tests/test_temporal_runtime.py` | Correlates payment or subscription IDs; also recovers `STOPPED`; cancels scheduled actions and marks pending promises `KEPT` |
 | Payment Link paid (`payment_link.paid` → `RECOVERED`) | **IMPLEMENTED / VERIFIED** | `app/services/orchestrator.py:215`, `tests/test_webhooks.py:219` | Matches on `RevenueCase.razorpay_payment_link_id` (different payment than original failure); `payment_link.paid` with unknown `link_id` is a noop |
 | Dispute handling (`payment.dispute.created` + customer reply `dispute`) | **IMPLEMENTED / VERIFIED** | `app/services/orchestrator.py:248`, `tests/test_customer_reply.py:68`, `tests/test_webhooks.py:250` | Dispute **overrides** terminal states (including `RECOVERED`); cancels all `SCHEDULED` actions |
@@ -70,7 +72,7 @@
 |-------------|------------|----------------------------------|------------------------------|--------------------|
 | `WAIT` | `SCHEDULED` for `now + WAIT_DELAY_SECONDS`, case -> `WAITING` | Worker atomically claims it, marks it complete, and re-runs baseline policy | `WAITING` | Yes, via RQ scheduler |
 | `WAIT_FOR_NATIVE_RETRY` | `SCHEDULED` for `now + NATIVE_RETRY_DELAY_SECONDS` | Same durable wake-up path as `WAIT` | `WAITING` | Yes |
-| `CREATE_PAYMENT_LINK` | `SCHEDULED` after webhook commit | Worker performs simulated/Test Mode call outside a DB transaction, then finalizes | `ACTION_SCHEDULED` | Yes |
+| `CREATE_PAYMENT_LINK` | `SCHEDULED` after webhook commit | Worker claims `EXECUTING`, then: ambiguous outcome → provider lookup `list?reference_id=Action.id`→ validated adopt via `action_reconciled` **without second create**; reliably absent → bounded retry; mismatch/expired → `HUMAN_REVIEW`. All provider HTTP is outside any DB transaction. | `ACTION_SCHEDULED` | Yes (RQ + provider reconciliation) |
 | `CONTACT_CUSTOMER` / `COLLECT_PROMISE_TO_PAY` | `SCHEDULED` after webhook commit | Worker drafts outside a DB transaction, then stores the message | `ACTION_SCHEDULED` | Yes |
 | `FOLLOW_UP_PTP` | `SCHEDULED` at exclusive end of configured merchant-local promise date | Worker resolves the exact linked promise to `BROKEN`, or no-ops if stale | `AWAITING_OUTCOME` | Yes |
 | `ESCALATE` | `EXECUTED`, case -> `HUMAN_REVIEW` | Recorded immediately; no transport operation | `HUMAN_REVIEW` | Not applicable |
@@ -83,20 +85,22 @@ The request transaction commits `PaymentEvent`, case, decision, and action befor
 ## Known technical debt
 
 1. **Worker/reconciliation processes are operational dependencies** - committed actions remain safe if they stop, but execution is delayed until a worker and periodic reconciliation resume.
-2. **Provider exactly-once is bounded, not absolute** - the DB claim prevents concurrent execution and Payment Links use deterministic `Action.id` references, but a process crash after a provider accepts a request and before DB finalization can require provider-side reconciliation.
+2. **Provider exactly-once remains bounded by provider primitive** - Razorpay enforces uniqueness on `reference_id` (400 on duplicate) and supports `list?reference_id=` filtering, which this stage uses for reconciliation. A provider crash between `POST /payment_links` commit on Razorpay's side and response transmission still requires one extra `GET /payment_links?reference_id=` to discover the already-created link. DB claim + `reference_id` + reconciliation reduce ambiguity to a single validated lookup, but true exactly-once still depends on Razorpay's documented uniqueness guarantee, not on DB idempotency alone.
 3. **`DECISION_READY` is vestigial in reply handling** - it is an ephemeral policy state.
 4. **Customer identity is synthetic** - `Customer` rows are not enriched from Razorpay customer/subscription entities.
 5. **Contact fatigue is per-case only** - limits are not aggregated per customer or merchant.
 6. **Database timestamps remain naive UTC** - merchant-local conversion is explicit only for PTP business dates.
 7. **Model artifact is gitignored** - a fresh clone must run `python -m app.ml.train` for experiments.
 8. **No API authentication** - webhook authenticity relies on signature and event ID; other routes are unauthenticated.
-9. **Frontend has no case-detail renderer** - the API exposes temporal metadata but the dashboard does not render it.
+9. **Frontend has no case-detail renderer** - the API exposes temporal metadata (`provider_ambiguous` / `reconciled` / `reference_id`) but the dashboard does not render the new `action_reconciled` / `payment_link_reconciliation_*` audit trail distinctly.
 
 ---
 
 ## Next planned subsystem
 
-No next subsystem is committed. Likely follow-ups are provider-side Payment Link reconciliation, customer-level guardrails, authenticated operator APIs, and production deployment hardening. The adaptive ML policy remains intentionally offline.
+> **LIVE ADAPTIVE POLICY + FRICTION-AWARE DECISIONING — PLANNED, not implemented.**
+>
+> With provider-side reconciliation complete, the next major stage wires the offline adaptive ML scorer into real runtime decisions behind a feature flag, retains deterministic baseline fallback, exposes model provenance, redesigns expected utility to penalize customer friction, and improves evaluation methodology. See `docs/DECISIONS.md` and `docs/ML_AND_EVALUATION.md` for the retained limitation (`adaptive synthetic recovery improves but contacts increase substantially`) that this next stage will address.
 
 ---
 

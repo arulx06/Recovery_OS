@@ -79,7 +79,7 @@ recoveryos/
 
 ## Branch expectations
 
-- Active branch for this pass: `feat/recoveryos-live-runtime`.
+- Active branch for this pass: `feat/payment-link-reconciliation`.
 - Do **not** switch / merge / rebase / stash / commit from documentation passes — leave changes uncommitted.
 - Feature work branches from the same baseline must keep `docs/CURRENT_STATE.md` as its first doc update when behavior changes.
 
@@ -165,9 +165,12 @@ Before adding a test that needs the trained model, accept a `trained_model_path`
 2. Add `ACTION_TO_STATE[action] = …` mapping (`policy_engine.py:41`) — every state must exist or the orchestrator invariant breaks.
 3. Decide if the baseline prefers it: add to `CATEGORY_ACTION_PREFERENCE[category]` in preference order. If it is always guardrail-filtered, add its check to `_check_action_allowed`.
 4. Decide if it needs execution: add delayed/internal types to `task_queue.QUEUEABLE_ACTION_TYPES` and a branch in `temporal_runtime.process_action`; add provider-call types to `action_executor.EXECUTABLE_ACTION_TYPES` and `perform`. Provider calls must occur after the claim commit, never in a request transaction.
-5. Update ML ground truth if appropriate: `BASE_PROBABILITY[(category, action)]` in `app/ml/ground_truth.py:33`; out-of-table pairs fall back to `FALLBACK_PROBABILITY`, which may not be what you want.
-6. Update `CONTACT_ACTIONS` if the action counts as contact/friction (`policy_engine.py:38` also drives `ptp_followup` and experiment counting).
-7. Add tests: policy choice/guardrails plus duplicate delivery, terminal-state stale work, retry exhaustion, expired-claim reconciliation, and ID-only queue payloads in `test_temporal_runtime.py`.
+5. **Provider side effects must use a stable provider identity** — `razorpay_client.build_provider_reference(Action.id)` is canonical; every external create must send `reference_id=Action.id` plus `notes={recoveryos_case_id, recoveryos_action_id}` and be sanitized via `_sanitize_link()`.
+6. **External calls must classify ambiguity:** `Timeout`/`NetworkError`/`5xx`/`429`/duplicate `reference_id` → `RazorpayAmbiguousError` → `find_payment_link_for_action` reconciliation before any retry; definite `4xx` → `RazorpayAPIError` → bounded retry. Never blindly recreate on ambiguous outcome. See `razorpay_client.py` and `temporal_runtime._handle_ambiguous_payment_link`.
+7. **Reconciliation is mandatory:** stale `EXECUTING` payment-link claims must `GET /v1/payment_links?reference_id=Action.id` outside any txn, validate `reference_id`/`amount`/`currency`/`notes`/`status`, and either adopt via canonical `apply_success(_reconciled=true)` → `action_reconciled` or route to `HUMAN_REVIEW` on mismatch. Add manual repair in `scripts/reconcile_payment_links.py`.
+8. Update ML ground truth if appropriate: `BASE_PROBABILITY[(category, action)]` in `app/ml/ground_truth.py:33`; out-of-table pairs fall back to `FALLBACK_PROBABILITY`, which may not be what you want.
+9. Update `CONTACT_ACTIONS` if the action counts as contact/friction (`policy_engine.py:38` also drives `ptp_followup` and experiment counting).
+10. Add tests: policy choice/guardrails plus duplicate delivery, terminal-state stale work, retry exhaustion, expired-claim reconciliation, provider ambiguity/reconciliation (adopt/absent/mismatch), and ID-only queue payloads in `test_temporal_runtime.py` / `test_payment_link_reconciliation.py`.
 
 ---
 
@@ -197,10 +200,10 @@ Before adding a test that needs the trained model, accept a `trained_model_path`
 - Queue publishing/reconciliation must join the case and require `source=razorpay`; experiment actions are never executable work.
 - Publish only after the action transaction commits. Queue failure must leave recoverable `SCHEDULED` state.
 - Lock the case before conditionally claiming an action to preserve lock ordering.
-- Commit `EXECUTING` before any Redis/provider/LLM network call; finalize in a new transaction.
-- Recheck terminal state and supersession during finalization.
-- Persist sanitized failure categories, not raw provider exceptions.
-- Any schema or status change must update `scripts/reconcile_actions.py`, `GET /cases/{id}`, runtime tests, and canonical docs.
+- Commit `EXECUTING` before any Redis/provider/LLM network call; finalize in a new transaction — **provider HTTP is never inside a long DB transaction** (`temporal_runtime` snapshots the case and closes the claim txn before `action_executor.perform`; reconciliation does `GET /v1/payment_links?reference_id=` outside any txn before finalize).
+- Recheck terminal state and supersession during finalization, and re-check `case.state` before provider reconciliation (spec 38).
+- Persist sanitized failure categories, not raw provider exceptions — use `_sanitize_link()` and truncated `sanitize_provider_error()`.
+- Any schema or status change must update `scripts/reconcile_actions.py`, `scripts/reconcile_payment_links.py`, `GET /cases/{id}`, runtime tests, and canonical docs.
 
 ---
 
@@ -305,9 +308,9 @@ docs/DECISIONS.md       — append-only ADRs; phase lead proposes, reviewers app
 
 ## Checklist before opening a PR
 
-- [ ] Tests pass: `cd backend && python -m pytest -q` (233 pass, no external network).
+- [ ] Tests pass: `cd backend && python -m pytest -q` (292 pass, no external network, no Redis required).
 - [ ] Frontend passes: `cd frontend && npm run lint && npm run build`.
-- [ ] Migrations verify: `cd backend && DATABASE_URL=sqlite:///./ci_migration.db python -m alembic upgrade head`.
-- [ ] No secrets introduced into diff (`backend/.env`, `frontend/.env` are gitignored — check `.env.example` only).
+- [ ] Migrations verify: `cd backend && DATABASE_URL=sqlite:///./ci_migration.db python -m alembic upgrade head` (head `8d6e24f91a73`; this stage uses existing Action fields, no new migration).
+- [ ] No secrets introduced into diff (`backend/.env`, `frontend/.env` are gitignored — check `.env.example` only); `httpx` calls are mocked in tests, simulation remains default.
 - [ ] Documentation updated per table above; `git diff --check` (whitespace) clean.
 - [ ] Report lists docs changed / intentionally unchanged / reason.

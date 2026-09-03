@@ -157,6 +157,20 @@
 
 ---
 
+## ADR-12 — External side effects require provider reconciliation; DB claim alone is not exactly-once
+
+| Field | Value |
+|-------|-------|
+| **Status** | Accepted and implemented |
+| **Date** | 2026-09-03 |
+| **Context** | `POST /v1/payment_links` can commit on Razorpay's side while the worker crashes or the response is lost before DB finalization. The previous durable runtime correctly used `SCHEDULED → EXECUTING` atomic claims, deterministic `Action.id`→`reference_id`, and bounded retries, but a `POST`-accepted/response-lost window still allowed a retry to `POST` again and create a second `plink_*`. No `Idempotency-Key` header exists for Payment Links; only `reference_id` uniqueness and `GET /v1/payment_links?reference_id=` filtering are documented. |
+| **Decision** | Extend `CREATE_PAYMENT_LINK` with provider-side reconciliation: (1) canonical stable identity `reference_id = Action.id` via `build_provider_reference()`; (2) error classification — `Timeout`/`NetworkError`/`5xx`/`429`/duplicate-`reference_id` → `RazorpayAmbiguousError` (reconcile before retry), other `4xx` → `RazorpayAPIError` (bounded retry); (3) on `RazorpayAmbiguousError` and on stale `EXECUTING` lease expiry, `GET /v1/payment_links?reference_id=Action.id` outside any DB transaction, validate `reference_id`/`amount`/`currency`/`notes`/`status` (reject `expired`/`cancelled`, mismatch → `HUMAN_REVIEW`), and either adopt via canonical `apply_success(_reconciled=true)` → `action_reconciled` or retry only when reliably absent; lookup itself ambiguous → bounded `payment_link_reconciliation_pending` retry; all provider I/O remains outside long DB transactions; results sanitized via `_sanitize_link()`. Add manual `scripts/reconcile_payment_links.py`. |
+| **Why** | DB claim prevents concurrent local execution, but only a provider `list?reference_id` can tell whether Razorpay already committed. Duplicate `reference_id` returns `400` — the documented idempotency primitive — so the safe path is to `GET` before any second `POST`. `expired`/`cancelled` and mismatched `amount`/`currency`/`notes` must not be silently adopted. |
+| **Consequences** | Positive: at-least-once worker claim + `reference_id` uniqueness + validated `GET` closes the crash-after-accept window without duplicates; stale `EXECUTING` reconciles before lease reset; Redis loss preserves ambiguity (republishes without immediate second `POST`); simulation remains `simulated=true` default; audit trail distinguishes `action_executed` vs `action_reconciled`. Negative: one extra `GET` per ambiguous attempt (bounded by `max_attempts`), one-time `GET` per stale payment-link claim; remaining exactly-once guarantee is bounded by Razorpay's `reference_id` uniqueness, not by DB alone — documented as such. |
+| **Reference** | `app/services/razorpay_client.py:140` + `find_payment_link_for_action`, `app/services/temporal_runtime.py:234`, `app/services/action_executor.py:88`, `scripts/reconcile_payment_links.py`, `tests/test_payment_link_reconciliation.py`, `docs/INTEGRATIONS.md: Razorpay` + `docs/SYSTEM_FLOWS.md: 2a–2c` |
+
+---
+
 ## Proposed template for future ADRs
 
 ```markdown

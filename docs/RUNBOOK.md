@@ -13,7 +13,7 @@
 | Docker Desktop | any recent | `docker --version` |
 | Git | any recent | `git --version` |
 
-This runbook assumes the repository root is `D:\Razorpay` (or wherever you cloned to) and that you are on branch `feat/recoveryos-live-runtime` (`git branch --show-current`).
+This runbook assumes the repository root is `D:\Razorpay` (or wherever you cloned to) and that you are on branch `feat/payment-link-reconciliation` (`git branch --show-current`).
 
 ---
 
@@ -236,7 +236,7 @@ Working directory: **`backend/`** with the venv activated.
 
 ```bash
 python -m pytest -q
-# 257 passed
+# 292 passed
 ```
 
 What "hermetic" means here (`tests/conftest.py`):
@@ -423,6 +423,26 @@ python scripts/reconcile_actions.py
 # process_followups.py remains a compatibility alias for the same reconciliation
 ```
 
+**Provider reconciliation (Payment Links):** If a `CREATE_PAYMENT_LINK` worker timed out or crashed after Razorpay accepted the link but before DB finalization, no second link is created blindly. The same reconciliation entry points recover it:
+
+```bash
+# working directory: backend/
+
+# scan all ambiguous/stale payment-link actions and show what would happen
+python scripts/reconcile_payment_links.py --all-ambiguous --dry-run
+
+# reconcile one specific Action (uses provider list?reference_id=Action.id, validates, adopts)
+python scripts/reconcile_payment_links.py --action-id <Action.id>
+
+# scan and actually reconcile all ambiguous payment-link actions
+python scripts/reconcile_payment_links.py --all-ambiguous
+
+# generic reconciliation also handles stale EXECUTING payment-link claims
+python scripts/reconcile_actions.py
+```
+
+All provider calls are sanitized (no secrets in output) and gate on `RAZORPAY_API_ENABLED=true` with `rzp_test_*` credentials; simulation mode (`RAZORPAY_API_ENABLED=false`) returns `simulation mode — provider reconciliation not applicable`. The manual tool reuses the same `find_payment_link_for_action` validation (reference, amount, currency, notes, status) and canonical `action_reconciled` path as the worker.
+
 For a short local wait test, stop/restart the backend and worker with `WAIT_DELAY_SECONDS=5`, send a transient failure, and watch the worker move the case out of `WAITING`. Do not use shortened delays in shared environments.
 
 ---
@@ -495,6 +515,7 @@ See `docs/SYSTEM_FLOWS.md` flow 8 and `app/routers/experiments.py`:
 | `python scripts/evaluate_policies.py …` | `backend/` |
 | `python scripts/process_followups.py` | `backend/` |
 | `python scripts/reconcile_actions.py` | `backend/` |
+| `python scripts/reconcile_payment_links.py --action-id <id> --dry-run` | `backend/` |
 | `rq worker ... recoveryos` | `backend/` |
 | `python scripts/run_synthetic_batch.py …` | `backend/` (it sets `DATABASE_URL=sqlite:///:memory:` itself) |
 | `python -m pytest` | `backend/` |

@@ -12,8 +12,8 @@ This is intentionally **not** `failure → LLM → WhatsApp message → payment 
 
 - **Problem:** Payment failures beyond gateway routing — every failed payment needs a recovery decision, but most stacks treat all failures the same.
 - **What RecoveryOS adds** (vs. Razorpay today): deterministic failure taxonomy → guardrailed policy → measured baseline-vs-adaptive experiments with downloadable audits. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full boundary table.
-- **Current scope:** Signed webhook ingestion, deterministic diagnosis, guardrails + baseline policy, PostgreSQL-authoritative Redis/RQ temporal execution, simulated and Test-Mode Payment Links, linked promise-to-pay deadlines, offline adaptive ML, and a measurement dashboard.
-- **What is not there yet:** No delivered SMS/email/WhatsApp, no production live-money integration, no provider-side closure of the rare accepted-request/worker-crash window, and no LLM controlling money moves.
+- **Current scope:** Signed webhook ingestion, deterministic diagnosis, guardrails + baseline policy, PostgreSQL-authoritative Redis/RQ temporal execution, provider-reconciled Payment Links (stable `Action.id` `reference_id` + `GET ?reference_id=` validation; no second `POST` on ambiguity/crash), simulated and Test-Mode Payment Links, linked promise-to-pay deadlines, offline adaptive ML, and a measurement dashboard.
+- **What is not there yet:** No delivered SMS/email/WhatsApp, no production live-money integration, and no LLM controlling money moves. Provider exactly-once is bounded by Razorpay's `reference_id` uniqueness + reconciliation — not true exactly-once by DB alone.
 
 **Two disclaimers (read before evaluating numbers):**
 
@@ -30,17 +30,18 @@ This is intentionally **not** `failure → LLM → WhatsApp message → payment 
 | 8-category deterministic failure diagnosis | ✅ Verified |
 | Guardrailed baseline policy (contact limits, cooldown, amount cap, stopping rule) | ✅ Verified |
 | Payment Links — simulated (`plink_sim_*`) | ✅ Verified |
-| Payment Links — Razorpay **Test Mode** live call | ✅ Verified (manual) |
-| `payment.captured` / `payment_link.paid` → `RECOVERED` | ✅ Verified |
+| Payment Links — Razorpay **Test Mode** live call (`reference_id=Action.id`) | ✅ Verified (manual) |
+| Payment Link provider reconciliation (`GET ?reference_id=` + validated adopt) | ✅ Verified — ambiguous/stale `EXECUTING` reconciles before retry; mismatch → `HUMAN_REVIEW` |
+| `payment.captured` / `payment_link.paid` → `RECOVERED` | ✅ Verified (idempotent) |
 | Promise-to-Pay extraction (regex heuristic / optional Anthropic) | ✅ Simulated default |
 | Durable `WAIT` / native-retry / linked PTP scheduling via Redis/RQ | ✅ Verified on PostgreSQL + Redis |
-| Atomic action claims, bounded retries, stale-job no-ops, DB reconciliation | ✅ Verified |
+| Atomic action claims, bounded retries, stale-job no-ops, DB reconciliation | ✅ Verified (now with Payment Link ambiguity) |
 | Adaptive ML scorer (`HistGradientBoostingClassifier`, expected-value ranking) | ✅ Offline only — not live |
 | Persisted experiments (baseline vs adaptive, `run_id` + CSV audit) | ✅ Verified |
 | React dashboard + health + case list | ✅ Verified |
-| Hermetic test suite (257 tests; no external network or Redis required) | ✅ Verified |
+| Hermetic test suite (292 tests; no external network or Redis required) | ✅ Verified |
 
-**Important limits:** The worker and periodic reconciliation are required operational processes. Drafted customer messages are **stored, not delivered**. The adaptive policy remains **offline/synthetic** and does not serve the live webhook path. See the full matrix at [`docs/CURRENT_STATE.md`](./docs/CURRENT_STATE.md).
+**Important limits:** The worker and periodic reconciliation are required operational processes. Drafted customer messages are **stored, not delivered**. The adaptive policy remains **offline/synthetic** and does not serve the live webhook path. Provider exact duplication is prevented via `reference_id=Action.id` + reconciliation, but absolute exactly-once still depends on Razorpay's `reference_id` uniqueness — not DB alone. See the full matrix at [`docs/CURRENT_STATE.md`](./docs/CURRENT_STATE.md).
 
 ---
 
@@ -154,8 +155,8 @@ Future subsystems are not considered complete until their documentation still de
 
 ## Repository
 
-- Branch for this pass: `feat/recoveryos-live-runtime` (see `docs/CURRENT_STATE.md` for verified baseline).
-- Backend tests: `cd backend && python -m pytest` — uses a temp SQLite DB and denies external sockets.
+- Branch for this pass: `feat/payment-link-reconciliation` (see `docs/CURRENT_STATE.md` for verified baseline).
+- Backend tests: `cd backend && python -m pytest` — 292 tests, temp SQLite DB, no external sockets, no Redis.
 - Frontend: `cd frontend && npm run lint && npm run build`.
 
 Detailed validation, state-machine, API, and configuration references are in `ARCHITECTURE.md` and `docs/*`.

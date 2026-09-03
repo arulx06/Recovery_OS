@@ -20,20 +20,60 @@
 
 ---
 
-## 2. `card_expired` → `INVALID_INSTRUMENT` → `CREATE_PAYMENT_LINK` (including `payment_link.paid`)
+## 2. `card_expired` → `INVALID_INSTRUMENT` → `CREATE_PAYMENT_LINK` (normal success)
 
 | Aspect | Detail |
 |--------|--------|
 | **Trigger** | `payment.failed` with `error_reason` containing `expired`/`invalid_card`/`card_blocked`/`invalid_vpa`/… (`failure_diagnosis.py:59`) → `INVALID_INSTRUMENT` |
 | **Baseline policy choice** | `CATEGORY_ACTION_PREFERENCE[INVALID_INSTRUMENT] = [CREATE_PAYMENT_LINK, CONTACT_CUSTOMER, ESCALATE]` (`policy_engine.py:60`). If guardrails allow (amount ≤ 25k, contacts not throttled), `CREATE_PAYMENT_LINK` is chosen. |
 | **Persisted (failure side)** | Same as flow 1, plus `Decision(chosen_action=CREATE_PAYMENT_LINK, alternatives, guardrails_applied)` + `Action(action_type=CREATE_PAYMENT_LINK, status=SCHEDULED, scheduled_for=now)` |
-| **Execution** | RQ calls `app.jobs.process_action(action_id)`. `temporal_runtime` locks the case and atomically claims `SCHEDULED -> EXECUTING`, commits, snapshots required fields, and closes the transaction before `action_executor.perform`. Payment Link `reference_id` is deterministic `Action.id`. Success is finalized in a new short transaction. Expected provider failures use exponential delay and the row's bounded `max_attempts`; final failure stores only sanitized text and moves the case to `HUMAN_REVIEW`. |
-| **Recovery: `payment_link.paid`** | Reads `payload.payment_link.entity.id`, locks the case by `razorpay_payment_link_id`, cancels scheduled work, marks pending promises `KEPT`, and sets `RECOVERED`. `STOPPED` can legitimately recover; `RECOVERED` and `DISPUTED` are ignored. Unknown links are no-ops. |
-| **External services** | Razorpay Payment Links API (Test Mode only, gated). Webhook for `payment_link.paid` is matched on the *link* id, not the payment id. |
-| **Failure behavior** | `RazorpayAPIError` schedules bounded retries; exhausted attempts -> `FAILED + HUMAN_REVIEW`. Unexpected worker death leaves an `EXECUTING` lease that reconciliation resets or fails. |
-| **Current limitation** | Payment Link creation **does not deliver** the link to the customer — no SMS/email/WhatsApp. The customer pays by visiting `short_url` and Razorpay emits `payment_link.paid`. The short URL is genuine only when Test Mode is enabled and verified; otherwise it is obviously simulated. |
+| **Execution** | RQ `app.jobs.process_action(action_id)`. Worker claims `SCHEDULED → EXECUTING` (commit), snapshots `{amount, currency, case_id, failure_category}`, closes txn, then `POST /v1/payment_links` with `reference_id=Action.id` + `notes={recoveryos_case_id, recoveryos_action_id}` outside any DB transaction. On `200`, sanitized result stored, `Action → EXECUTED`, `case.razorpay_payment_link_id = plink_*`, `case → AWAITING_OUTCOME`, `AuditEvent(action_executed, {reconciled:false, simulated})`. See `action_executor.perform` + `temporal_runtime._complete_external`. |
+| **External services** | Razorpay Payment Links API (Test Mode only, gated) — `POST /v1/payment_links`. |
+| **Failure behavior** | Definite `4xx` validation → `RazorpayAPIError` → bounded `SCHEDULED` retry (exponential), then `FAILED + HUMAN_REVIEW` with sanitized error (no secrets). Duplicate `Razorpay` redelivery is bounded by atomic claim; second delivery is `stale` no-op. |
+| **Verification** | `tests/test_temporal_runtime.py:41` (duplicate delivery once), `tests/test_payment_link_reconciliation.py:18` (reference_id == Action.id) |
 
-Verification: `tests/test_webhooks.py:163` (`card_expired` → `AWAITING_OUTCOME`, `razorpay_payment_link_id` set), `tests/test_webhooks.py:219` (`payment_link.paid` → `RECOVERED`).
+## 2a. `CREATE_PAYMENT_LINK` — provider timeout / ambiguous outcome
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | Worker `POST /v1/payment_links` raises `Timeout`/`NetworkError`/`5xx`/`429` or duplicate-reference `400` — outcome unknown: Razorpay may have committed before dropping the response. |
+| **Persisted before I/O** | `AuditEvent(provider_outcome_ambiguous, {action_id, error})` (outside finalize txn) |
+| **Reconciliation** | Outside any long DB txn, `GET /v1/payment_links?reference_id=Action.id` (`razorpay_client.find_payment_link_for_action`). This list call is the provider-supported primitive; Razorpay enforces uniqueness on `reference_id` (duplicate create returns `400`), so `reference_id` is the stable at-least-once key. |
+| **Outcomes** | **Found + validated** (reference_id, amount paise, currency, notes case/action, status not `expired`/`cancelled`) → adopt via canonical `apply_success` with `_reconciled=true` → `EXECUTED`, `AuditEvent(action_reconciled, {reconciled:true, provider_link_id})`. **Reliably absent** (empty list) → `AuditEvent(payment_link_reconciliation_absent)` → bounded retry `SCHEDULED` (exponential). **Lookup itself ambiguous** (timeout/`5xx`) → `AuditEvent(payment_link_reconciliation_pending)` → `SCHEDULED` with `last_error=provider_outcome_ambiguous`, bounded retry later. **Mismatch** (amount/currency/reference/notes/status) → `FAILED + HUMAN_REVIEW`, `payment_link_reconciliation_failed`, never silently adopted. |
+| **Retry/bound** | Every ambiguous path respects `Action.max_attempts` (default 3); exhausted → `payment_link_manual_review_required` → `HUMAN_REVIEW`, never infinite polling. Provider lookup is targeted (one `GET` per ambiguous attempt, not per periodic reconciliation cycle). |
+| **Verification** | `tests/test_payment_link_reconciliation.py:100` (ambiguous → adopted), `…:136` (absent → retry), `…:152` (lookup ambiguous → retry), `…:256` (mismatch → HUMAN_REVIEW) |
+
+## 2b. `CREATE_PAYMENT_LINK` — crash after provider acceptance / stale `EXECUTING`
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | Worker `POST` succeeded, Razorpay stored `plink_*` with `reference_id=Action.id`, but worker crashed/network dropped before `apply_success` commit. Action remains `EXECUTING` with `claimed_at` lease. |
+| **Detection** | `reconcile_actions()` scans `EXECUTING` with `claimed_at ≤ now - ACTION_CLAIM_TIMEOUT_SECONDS (300s)`. For `CREATE_PAYMENT_LINK` it calls `_reconcile_stale_payment_link()` **before** generic lease reset. |
+| **Reconciliation** | Same `GET /v1/payment_links?reference_id=Action.id` outside any txn, validated as above. If **found**, `AuditEvent(payment_link_reconciliation_started, {reason: stale_executing_claim})` then `_complete_external` with `_reconciled=true` → `EXECUTED`. If **absent**, falls through to generic `SCHEDULED` reset (`execution lease expired`) for a bounded retry. If **lookup ambiguous**, emits `payment_link_reconciliation_pending` and leaves `EXECUTING` lease to be retried next cycle. If **mismatch**, `payment_link_reconciliation_failed` → `HUMAN_REVIEW`. |
+| **No duplicate create** | No second `POST` is sent when the provider already holds the link — the reconciling path adopts instead. |
+| **Redis loss** | `SCHEDULED` rows remain `SCHEDULED` in PostgreSQL; `reconcile_actions()` republishes them via `task_queue.enqueue_action` without creating another provider link — the next worker claim will reconcile first. |
+| **Verification** | `tests/test_payment_link_reconciliation.py:194` (stale adopts), `…:213` (stale absent → SCHEDULED) |
+
+## 2c. `CREATE_PAYMENT_LINK` — provider object mismatch
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | Reconciliation found a link for `reference_id` but `amount`/`currency`/`reference_id`/`notes` or `status` do not match the local snapshot (e.g., `plink_*` was manually edited, amount drift, currency change, `expired`/`cancelled`). |
+| **Behavior** | `find_payment_link_for_action` raises `RazorpayAPIError` with mismatch description; caller (`_handle_ambiguous_payment_link` / `_reconcile_stale_payment_link`) catches and calls `action_executor.apply_reconciliation_failure()` → `FAILED`, `last_error` sanitized, `case → HUMAN_REVIEW`, `AuditEvent(payment_link_reconciliation_failed, {reason})`. Never adopted. Requires manual investigation — no automatic second `POST` until the inconsistency is understood. |
+| **Verification** | `tests/test_payment_link_reconciliation.py:256` (reference mismatch), `…:271` (amount), `…:281` (currency), `…:289` (expired) |
+
+## 2d. `CREATE_PAYMENT_LINK` → `payment_link.paid` recovery path
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | Customer pays the `short_url`; Razorpay emits `payment_link.paid` with `payload.payment_link.entity.id = plink_*`. |
+| **Persisted** | Same as flow 2 success side, plus `payment.captured` recovery: locks by `razorpay_payment_link_id`, cancels `SCHEDULED` work, marks pending promises `KEPT`, `RECOVERED`. |
+| **Relationship to reconciliation** | Reconciliation adopts the `plink_*` and sets `AWAITING_OUTCOME`; `payment_link.paid` later drives `RECOVERED` idempotently. Duplicate `payment_link.paid` is harmless (ignored when `RECOVERED`/`DISPUTED`). A reconciled link that is already `paid` is still adopted — `paid` status is not treated as failure; recovery remains webhook-authoritative (no fabricated payment success from `paid` status alone). |
+| **Verification** | `tests/test_payment_link_reconciliation.py:311` (webhook after reconcile), `tests/test_webhooks.py:219` |
+
+## 2e. `CREATE_PAYMENT_LINK` — currently NOT delivered
+
+Payment Link creation **does not deliver** the link to the customer — no SMS/email/WhatsApp. The customer pays by visiting `short_url` and Razorpay emits `payment_link.paid`. The short URL is genuine only when Test Mode is enabled and verified (`simulated=false`); otherwise it is `https://rzp.io/simulated/plink_sim_*` with `simulated=true`.
 
 ---
 
