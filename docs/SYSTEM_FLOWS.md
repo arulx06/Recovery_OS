@@ -167,8 +167,8 @@ Verification: `tests/test_experiments.py:30` (2 rows per scenario), `...:37` (re
 |--------|--------|
 | **Trigger** | Guardrail-filtered baseline choice `WAIT` (for `TRANSIENT_INFRASTRUCTURE`, `INSUFFICIENT_BALANCE`) or `WAIT_FOR_NATIVE_RETRY` (for `SUBSCRIPTION_PENDING_NATIVE_RETRY`). See `policy_engine.py:55`. |
 | **Persisted** | `WAIT` is due after `WAIT_DELAY_SECONDS`; native retry wait uses `NATIVE_RETRY_DELAY_SECONDS`. Both set case `WAITING`. |
-| **Execution** | The scheduled worker claim marks the wait `EXECUTED`, returns the case to `DIAGNOSED`, and re-runs the deterministic baseline policy. A completed wait is guardrail-blocked from repeating, so the policy advances to the next candidate or `ESCALATE`. Live adaptive ML remains uninvolved. |
-| **Stale behavior** | Duplicate jobs, early jobs, terminal cases, or superseded waits are no-ops/cancelled. A new failure in an active state cancels the old scheduled wait and re-diagnoses from the new payload. |
+| **Execution** | The scheduled worker claim marks the wait `EXECUTED`, returns the case to `DIAGNOSED`, and re-runs the policy via `policy_dispatcher.decide_for_case` (so `RECOVERY_POLICY=baseline/shadow/adaptive` applies consistently at wake). A completed wait is guardrail-blocked from repeating, so the next decision advances via the configured policy. |
+| **Stale behavior** | Duplicate jobs, early jobs, terminal cases, or superseded waits are no-ops/cancelled. A new failure in an active state cancels the old scheduled wait and re-diagnoses via dispatcher. |
 
 ---
 
@@ -185,10 +185,30 @@ Verification: `tests/test_ptp_followup.py` (module-level coverage); `tests/test_
 
 ---
 
+## 11. Policy dispatch — baseline / shadow / adaptive
+
+| Aspect | Detail |
+|--------|--------|
+| **Config** | `RECOVERY_POLICY` env (`baseline` default, `shadow`, `adaptive`), `ADAPTIVE_POLICY_PROFILE` (`balanced` default, `revenue_first`, `low_friction`), `ADAPTIVE_FRICTION_WEIGHT` explicit override. Requires process restart. |
+| **Baseline** | `policy_dispatcher.decide_for_case` → `policy_engine.decide` → `Decision(policy_mode=baseline, …)` → `Action(SCHEDULED)` → enqueue. No model load. |
+| **Shadow** | Baseline decision executes (creates `Action`, enqueues, moves case). Separately, `ml_policy.shadow_recommend` scores the same guardrail-allowed set with `rank_actions_with_friction` **without** persisting a second Decision/Action — emits `AuditEvent(shadow_adaptive_recommendation, {baseline_chosen, adaptive_suggested, top_utility, fingerprint, friction_profile, candidates, disagreement})`. No queue job, no provider call, no PTP. Verified side-effect-free in `tests/test_adaptive_policy.py`. |
+| **Adaptive** | `ml_policy.decide_ml` via `_adaptive_choose`: guardrails → semantic filter (`WAIT_FOR_NATIVE_RETRY` only if `subscription_linked`), `friction_scores` via `compute_friction_score` (base + `previous_contacts*12`), `scorer.rank_actions_with_friction` (batched) → `utility = p*amount - cost - weight*friction` → highest utility wins → `Decision(policy_mode=adaptive, model_version, fingerprint, friction_profile, friction_weight, alternatives[_provenance], expected_value=top EV)` + `AuditEvent(adaptive_decision)`. Guardrails and stopping rule remain authoritative; `STOP` still deterministic. |
+| **Fallback** | Any `ModelNotTrainedError`/`manifest`/`smoke`/`NaN`/`invalid probability` → `AuditEvent(adaptive_fallback)` → `case.state` reset to `DIAGNOSED` if needed → `policy_engine.decide` → `Decision(policy_mode=adaptive_fallback)`. Never stranded `DIAGNOSED`/`DECISION_READY`. |
+| **WAIT/repeated failure** | Both `temporal_runtime._complete_wait` and `orchestrator._diagnose` now call `policy_dispatcher.decide_for_case`, so the configured policy applies consistently at wake and on repeated `payment.failed` (global-at-decision-time, not pinned). Verified `tests/test_adaptive_policy.py::test_wait_wake_reenters_dispatcher` etc. |
+| **Execution** | Adaptive only **chooses**; durable `Action` → `temporal_runtime` → `action_executor` → provider reconciliation if `CREATE_PAYMENT_LINK` → same safe pipeline as baseline (no direct `Razorpay` from policy). |
+
+---
+
+## 12. Adaptive `CREATE_PAYMENT_LINK` — still provider-reconciled
+
+Same flow as `2`/`2a`–`2c` — adaptive `CREATE_PAYMENT_LINK` creates a `SCHEDULED` `Action(reference_id=Action.id)` and enqueues; worker `POST` outside txn; ambiguous/stale → `GET ?reference_id=` validated adopt or bounded retry; mismatch → `HUMAN_REVIEW`. Adaptive never bypasses `task_queue` or `razorpay_client` gates.
+
+---
+
 ## Cross-cutting guarantees
 
 - **Idempotency:** Webhook event IDs are unique. Action jobs contain only `action_id`; atomic `SCHEDULED -> EXECUTING` updates ensure only one worker claims a generation. Deterministic job IDs use `(action_id, attempt_count)`.
-- **Audit trail:** Every mutation is recorded as an `AuditEvent` (`case_detected`, `case_diagnosed`, `decision_made`, `action_executed`, `action_execution_failed`, `case_recovered_silently`, `case_disputed`, `promise_to_pay_recorded`, `promise_broken_escalated`, `ptp_validation_failed`, …). Payloads live in `detail` JSON.
-- **No external network from tests:** tests force provider and queue gates off, use a temp SQLite DB, point `REDIS_URL` at an inert local port, and deny external sockets.
-- **Failure isolation:** expected provider failures retry with bounded exponential delay and sanitized persisted errors. Lease expiry is repaired by reconciliation; exhausted attempts become `FAILED + HUMAN_REVIEW`.
-- **Transaction boundary:** no Redis, Razorpay, or Anthropic call is made while a production request/worker DB transaction remains open.
+- **Audit trail:** Every mutation is recorded as an `AuditEvent` (`case_detected`, `case_diagnosed`, `decision_made`, `action_executed`/`action_reconciled`, `adaptive_decision`/`adaptive_fallback`/`shadow_adaptive_recommendation`, `payment_link_reconciliation_*`, `case_recovered_silently`, …). Payloads live in `detail` JSON; `Decision` carries first-class `policy_mode/model_version/fingerprint/friction_*` plus `alternatives[_provenance]` with per-candidate `p_recovery`, `expected_value`, `utility`, `friction_score`.
+- **No external network from tests:** tests force provider and queue gates off, use a temp SQLite DB, point `REDIS_URL` at an inert local port, deny external sockets, and mock `httpx` — 329 tests pass with fake `rzp_test`/`sk-ant` keys.
+- **Failure isolation:** expected provider failures retry with bounded exponential delay and sanitized persisted errors. Lease expiry is repaired by reconciliation; exhausted attempts become `FAILED + HUMAN_REVIEW`. Adaptive model failure never strands a case — `adaptive_fallback` → baseline `Decision` in same transaction.
+- **Transaction boundary:** no Redis, Razorpay, or Anthropic call is made while a production request/worker DB transaction remains open; adaptive scoring is `scorer.rank_actions_with_friction` batched (one `predict_proba` per decision), provenance is flushed after `record_decision`.

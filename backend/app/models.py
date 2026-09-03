@@ -118,6 +118,12 @@ class Decision(Base):
     alternatives = Column(JSON, nullable=True)  # {action: score, ...}
     guardrails_applied = Column(JSON, nullable=True)
     explanation = Column(Text, nullable=True)
+    # Provenance for live adaptive dispatch (nullable for legacy baseline rows)
+    policy_mode = Column(String, nullable=True)  # baseline | adaptive | shadow | adaptive_fallback
+    model_version = Column(String, nullable=True)
+    model_fingerprint = Column(String, nullable=True)
+    friction_profile = Column(String, nullable=True)
+    friction_weight = Column(Numeric(6, 3), nullable=True)
 
     created_at = Column(DateTime, default=utc_now)
 
@@ -193,6 +199,21 @@ class AuditEvent(Base):
     created_at = Column(DateTime, default=utc_now)
 
     revenue_case = relationship("RevenueCase", back_populates="audit_events")
+
+
+class ExperimentRun(Base):
+    """Durable provenance for one synthetic experiment — historical runs are immutable."""
+    __tablename__ = "experiment_runs"
+
+    run_id = Column(String, primary_key=True)
+    resolved_seed = Column(Integer, nullable=False)
+    scenario_count = Column(Integer, nullable=False)
+    model_version = Column(String, nullable=True)
+    model_fingerprint = Column(String, nullable=True)
+    feature_schema_version = Column(String, nullable=True)
+    adaptive_profile = Column(String, nullable=True)
+    friction_weight = Column(Numeric(6, 3), nullable=True)
+    created_at = Column(DateTime, default=utc_now)
 
 
 class ExperimentCase(Base):

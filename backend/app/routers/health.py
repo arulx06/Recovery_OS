@@ -31,10 +31,42 @@ def health(db: Session = Depends(get_db)):
         except Exception:
             redis_status = "unreachable"
 
+    # Adaptive policy readiness — no provider calls, no secrets
+    from app.core.config import settings as cfg
+    from app.ml import scorer
+
+    policy_mode = (cfg.RECOVERY_POLICY or "baseline").strip().lower()
+    if policy_mode not in ("baseline", "shadow", "adaptive"):
+        policy_mode = "baseline"
+    adaptive_info = {
+        "configured_mode": policy_mode,
+        "model_available": False,
+        "model_version": None,
+        "fingerprint": None,
+        "fingerprint_short": None,
+        "feature_schema_compatible": False,
+    }
+    try:
+        info = scorer.get_model_info()
+        adaptive_info["model_available"] = bool(info.get("available"))
+        adaptive_info["model_version"] = info.get("model_version")
+        adaptive_info["fingerprint"] = info.get("fingerprint")
+        adaptive_info["fingerprint_short"] = info.get("fingerprint_short")
+        adaptive_info["feature_schema_compatible"] = bool(info.get("available"))
+        if policy_mode == "baseline" and not info.get("available"):
+            # baseline mode: model unavailable is not unhealthy
+            pass
+    except Exception:
+        pass
+
+    # Determine overall status: baseline fallback always available, so adaptive degraded is not "degraded" for baseline
+    overall = "ok" if db_ok and redis_status != "unreachable" else "degraded"
+
     return {
-        "status": "ok" if db_ok and redis_status != "unreachable" else "degraded",
+        "status": overall,
         "service": "recoveryos-backend",
         "database": "connected" if db_ok else "unreachable",
         "redis": redis_status,
         "queue": settings.RQ_QUEUE_NAME if settings.TASK_QUEUE_ENABLED else "disabled",
+        "adaptive_policy": adaptive_info,
     }

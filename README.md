@@ -12,8 +12,8 @@ This is intentionally **not** `failure → LLM → WhatsApp message → payment 
 
 - **Problem:** Payment failures beyond gateway routing — every failed payment needs a recovery decision, but most stacks treat all failures the same.
 - **What RecoveryOS adds** (vs. Razorpay today): deterministic failure taxonomy → guardrailed policy → measured baseline-vs-adaptive experiments with downloadable audits. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full boundary table.
-- **Current scope:** Signed webhook ingestion, deterministic diagnosis, guardrails + baseline policy, PostgreSQL-authoritative Redis/RQ temporal execution, provider-reconciled Payment Links (stable `Action.id` `reference_id` + `GET ?reference_id=` validation; no second `POST` on ambiguity/crash), simulated and Test-Mode Payment Links, linked promise-to-pay deadlines, offline adaptive ML, and a measurement dashboard.
-- **What is not there yet:** No delivered SMS/email/WhatsApp, no production live-money integration, and no LLM controlling money moves. Provider exactly-once is bounded by Razorpay's `reference_id` uniqueness + reconciliation — not true exactly-once by DB alone.
+- **Current scope:** Signed webhook ingestion, deterministic diagnosis, guardrails + baseline policy, **live friction-aware adaptive policy** (`RECOVERY_POLICY=baseline|shadow|adaptive`, `recovery-v1` `75e9cfd6`, `balanced` weight 18, manifest + fingerprint), PostgreSQL-authoritative Redis/RQ temporal execution, provider-reconciled Payment Links, linked promise-to-pay deadlines, and a measurement dashboard.
+- **What is not there yet:** No delivered SMS/email/WhatsApp, no production live-money integration, and no LLM controlling money moves. Provider exactly-once is bounded by `reference_id` uniqueness + reconciliation; synthetic training remains the only labeled data.
 
 **Two disclaimers (read before evaluating numbers):**
 
@@ -36,28 +36,29 @@ This is intentionally **not** `failure → LLM → WhatsApp message → payment 
 | Promise-to-Pay extraction (regex heuristic / optional Anthropic) | ✅ Simulated default |
 | Durable `WAIT` / native-retry / linked PTP scheduling via Redis/RQ | ✅ Verified on PostgreSQL + Redis |
 | Atomic action claims, bounded retries, stale-job no-ops, DB reconciliation | ✅ Verified (now with Payment Link ambiguity) |
-| Adaptive ML scorer (`HistGradientBoostingClassifier`, expected-value ranking) | ✅ Offline only — not live |
-| Persisted experiments (baseline vs adaptive, `run_id` + CSV audit) | ✅ Verified |
-| React dashboard + health + case list | ✅ Verified |
-| Hermetic test suite (292 tests; no external network or Redis required) | ✅ Verified |
+| Adaptive ML scorer (`HistGradientBoostingClassifier`, friction-aware `P*amount - cost - weight*friction`, `recovery-v1`) | ✅ **Live** — `baseline` (default, safe), `shadow` (audited), `adaptive` (balanced, fallback to baseline) |
+| Friction-aware experiments (baseline vs balanced adaptive, `run_id` + CSV + `friction_score`/`utility`) | ✅ Verified (synthetic) |
+| React dashboard + health + case list (policy/model/friction visible) | ✅ Verified |
+| Hermetic test suite (329 tests; no external network or Redis required) | ✅ Verified |
 
-**Important limits:** The worker and periodic reconciliation are required operational processes. Drafted customer messages are **stored, not delivered**. The adaptive policy remains **offline/synthetic** and does not serve the live webhook path. Provider exact duplication is prevented via `reference_id=Action.id` + reconciliation, but absolute exactly-once still depends on Razorpay's `reference_id` uniqueness — not DB alone. See the full matrix at [`docs/CURRENT_STATE.md`](./docs/CURRENT_STATE.md).
+**Important limits:** The worker and periodic reconciliation are required operational processes. Drafted customer messages are **stored, not delivered**. Training/evaluation remain **synthetic** (no production Razorpay lift claim); adaptive is live but friction weights are policy preferences, not measured costs. See the full matrix at [`docs/CURRENT_STATE.md`](./docs/CURRENT_STATE.md).
 
 ---
 
 ## Architecture at a glance
 
 ```
-Razorpay Test Mode  ──webhooks──►  FastAPI  ──►  Failure diagnosis ──►  Guardrails ──►  Baseline policy
+Razorpay Test Mode  ──webhooks──►  FastAPI  ──►  Failure diagnosis ──►  Guardrails ──►  Policy Dispatcher (baseline|shadow|adaptive)
                                     │                     │                  │                    │
-                                    │                     ▼                  ▼                    ▼
-                                    │              PostgreSQL (source of truth: cases, events, decisions, actions, audit)
+                                    │                     └─────────┬────────┘                    │
+                                    │                               ▼                             ▼
+                                    │              PostgreSQL (cases, events, decisions+provenance, actions, audit)
                                     │                     ▲
-                                    └────  Redis/RQ worker (ID-only jobs; atomic DB claims; delayed WAIT/PTP)
-                                    └────  Action executor (Payment Links — simulated or Test Mode; contact drafts — stored only)
+                                    └────  Redis/RQ worker (ID-only jobs; atomic DB claims; provider-reconciled Links)
+                                    └────  Action executor (Payment Links — simulated or Test-Mode; contact drafts — stored only)
                                     └────  Customer reply / linked PTP follow-up
-                                    └────  Offline adaptive ML + experiment runner (synthetic)
-                                    └────  React dashboard
+                                    └────  Experiment runner (baseline vs friction-aware adaptive, common-random)
+                                    └────  React dashboard (policy/model/friction visible)
 ```
 
 - Deterministic code decides when money moves; LLM never does — it drafts text or parses a reply.
@@ -130,7 +131,7 @@ See [`docs/RUNBOOK.md`](./docs/RUNBOOK.md) for Payment Link → `payment_link.pa
 | Backend | Python + FastAPI, Pydantic, SQLAlchemy + Alembic |
 | Database | PostgreSQL (SQLite for tests) |
 | Delayed actions | PostgreSQL-authoritative `Action` rows + Redis/RQ worker/scheduler |
-| ML | scikit-learn `HistGradientBoostingClassifier` (offline/synthetic) |
+| ML | scikit-learn `HistGradientBoostingClassifier` (`recovery-v1`, 75e9cfd6, `features v1`, friction-aware utility, `manifest.json`) |
 | LLM | Optional Anthropic Messages API; templated/regex simulation otherwise |
 | Payments | Signed webhooks; simulated or opt-in Test-Mode Payment Links |
 
@@ -155,8 +156,8 @@ Future subsystems are not considered complete until their documentation still de
 
 ## Repository
 
-- Branch for this pass: `feat/payment-link-reconciliation` (see `docs/CURRENT_STATE.md` for verified baseline).
-- Backend tests: `cd backend && python -m pytest` — 292 tests, temp SQLite DB, no external sockets, no Redis.
-- Frontend: `cd frontend && npm run lint && npm run build`.
+- Branch for this pass: `feat/adaptive-recovery-policy` (see `docs/CURRENT_STATE.md` for verified baseline).
+- Backend tests: `cd backend && python -m pytest` — 329 tests, temp SQLite DB, no external sockets, no Redis.
+- Frontend: `cd frontend && npm run lint && npm run build` — header shows `policy`/`model`/`fingerprint`.
 
 Detailed validation, state-machine, API, and configuration references are in `ARCHITECTURE.md` and `docs/*`.

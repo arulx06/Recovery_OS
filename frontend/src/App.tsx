@@ -61,7 +61,15 @@ export default function App() {
         <div className="flex flex-col items-start gap-2 md:items-end">
           <StatusPill ok={backendUp} label={backendUp === null ? "checking backend…" : backendUp ? "backend healthy" : "backend unreachable"} />
           {health && (
-            <span className="text-xs text-gray-500">db: {health.database}</span>
+            <>
+              <span className="text-xs text-gray-500">db: {health.database} · queue: {health.queue ?? "—"} · policy: {health.adaptive_policy?.configured_mode ?? "baseline"}</span>
+              {health.adaptive_policy && (
+                <span className="text-[10px] text-gray-600">
+                  model: {health.adaptive_policy.model_version ?? "none"} {health.adaptive_policy.fingerprint_short ? `· ${health.adaptive_policy.fingerprint_short}` : ""}
+                  {health.adaptive_policy.model_available ? "" : " (unavailable → baseline fallback)"}
+                </span>
+              )}
+            </>
           )}
         </div>
       </header>

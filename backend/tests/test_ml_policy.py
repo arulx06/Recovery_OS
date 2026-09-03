@@ -100,9 +100,23 @@ def test_decide_ml_falls_back_to_escalate_when_model_missing(db_session, monkeyp
     def raise_not_trained(*args, **kwargs):
         raise scorer.ModelNotTrainedError("no model for this test")
 
-    monkeypatch.setattr(scorer, "rank_actions", raise_not_trained)
+    monkeypatch.setattr(scorer, "rank_actions_with_friction", raise_not_trained)
+    monkeypatch.setattr(scorer, "rank_actions", raise_not_trained, raising=False)
 
     case = make_case(db_session, failure_category="TRANSIENT_INFRASTRUCTURE")
-    decision = ml_policy.decide_ml(db_session, case)
-    assert decision.chosen_action == "ESCALATE"
-    assert case.state == "HUMAN_REVIEW"
+    # Direct ml_policy call now raises for model failure — dispatcher is the single fallback owner
+    with pytest.raises(scorer.ModelNotTrainedError):
+        ml_policy.decide_ml(db_session, case)
+    assert case.state == "DIAGNOSED"
+    # Dispatcher fallback still works
+    from app.services import policy_dispatcher
+    from app.core.config import settings as _settings
+    old = _settings.RECOVERY_POLICY
+    _settings.RECOVERY_POLICY = "adaptive"
+    try:
+        # Need a fresh case because previous was left in DECISION_READY
+        case2 = make_case(db_session, failure_category="TRANSIENT_INFRASTRUCTURE")
+        decision = policy_dispatcher.decide_for_case(db_session, case2)
+        assert decision.policy_mode == "adaptive_fallback"
+    finally:
+        _settings.RECOVERY_POLICY = old

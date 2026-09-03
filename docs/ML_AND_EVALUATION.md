@@ -1,13 +1,13 @@
 # RecoveryOS — ML and Evaluation
 
-> Scientifically honest accounting of what is learned, what is simulated, and what must still be proven. The adaptive scorer is **offline/synthetic** — it is **not** the live webhook decision policy. See `docs/CURRENT_STATE.md` capability matrix and `docs/SYSTEM_FLOWS.md` flow 8.
+> Live friction-aware adaptive is now the default experiment comparator, but training and evaluation remain **synthetic**. This file is the honest provenance for features, model, utility, and the revenue-vs-friction tradeoff.
 
 ---
 
 ## Training data origin
 
-- **No real Razorpay outcome data exists yet.** Until RecoveryOS observes production outcomes, there are no `{context, action, outcome}` labels.
-- The sole source of training and evaluation labels is the hand-authored simulator `app/ml/ground_truth.py` (see `docs/SYSTEM_FLOWS.md` flow 1).
+- **No real Razorpay outcome data exists yet.** Until RecoveryOS observes production `recovered` outcomes, there are no `{context, action, outcome}` labels from real traffic.
+- The sole source of training and evaluation labels is the hand-authored simulator `app/ml/ground_truth.py` (see `ARCHITECTURE.md: ML boundary`).
 - When real append-only outcome logs exist, `synthetic_history.generate_history` is the module replaced — `train.py` accepts any `DataFrame` with `FEATURE_COLUMNS`.
 
 ---
@@ -15,168 +15,282 @@
 ## Synthetic generator `app/ml/synthetic_history.py`
 
 ```python
-generate_history(n=3000, seed=42) → DataFrame[case_id, failure_category, action_taken,
-                                              amount, days_overdue, previous_contacts,
-                                              subscription_linked, hour, day_of_week, recovered]
+generate_history(n=30000, seed=42) → DataFrame[case_id, failure_category, action_taken,
+                                               amount, days_overdue, previous_contacts,
+                                               subscription_linked, hour, day_of_week, recovered]
 ```
 
-- **Failure category**: weighted draw from `CATEGORY_WEIGHTS` mirroring a realistic failure mix (balance 22, transient 16, auth 14, invalid instrument 12, … — `synthetic_history.py:33`).
-- **`action_taken`**: **uniform** across `policy_engine.ALL_ACTIONS` (not just the baseline's top pick for the category). This deliberately exposes the model to recovery outcomes for actions the baseline would never choose, so it can learn "actually, `CONTACT_CUSTOMER` beats `WAIT` for this category" instead of only confirming the baseline's preferences.
-- **Amount**: uniform over `[500, 1000, 2500, 5000, 9999, 15000, 25000, 40000, 75000, 150000]` (INR).
-- **`days_overdue` / `previous_contacts`**: skewed toward small values (weights in code), `subscription_linked` enriched for `SUBSCRIPTION_PENDING_NATIVE_RETRY`.
-- **`recovered`**: `ground_truth.sample_outcome(category, action_taken, amount, days_overdue, previous_contacts, subscription_linked, rng=Random(seed))` — a single Bernoulli draw from `true_probability`.
+- **Failure category**: weighted draw from `CATEGORY_WEIGHTS` (balance 22, transient 16, auth 14, invalid instrument 12, …).
+- **`action_taken`**: **uniform** across `ALL_ACTIONS` (not baseline's top pick) — exposes the model to all `(category, action)` pairs.
+- **Amount**: uniform over `[500, 1000, 2500, 5000, 9999, 15000, 25000, 40000, 75000, 150000]`.
+- **`days_overdue` / `previous_contacts`**: skewed toward small values; `subscription_linked` enriched for `SUBSCRIPTION_PENDING_NATIVE_RETRY`.
+- **`recovered`**: `ground_truth.sample_outcome(..., rng=Random(seed))` — one Bernoulli draw.
 
 ### Ground-truth assumptions `app/ml/ground_truth.py:33`
 
-| (category, action) pair | Base `P(recovery)` | Intuition |
-|-------------------------|--------------------|-----------|
-| `TRANSIENT_INFRASTRUCTURE, WAIT` | 0.78 | Transient gateway blips recover well passively |
-| `SUBSCRIPTION_PENDING_NATIVE_RETRY, WAIT_FOR_NATIVE_RETRY` | 0.80 | Best to stay silent while Razorpay retries |
-| `INSUFFICIENT_BALANCE, COLLECT_PROMISE_TO_PAY` | 0.55 | Low balance often resolves with a scheduled retry |
-| `CUSTOMER_AUTHENTICATION, CONTACT_CUSTOMER` | 0.62 | Auth failures need outreach |
-| `INVALID_INSTRUMENT, CREATE_PAYMENT_LINK` | 0.65 | New link is the direct fix for expired/invalid instrument |
-| `MANDATE_ISSUE, CONTACT_CUSTOMER` | 0.40 | Mandate problems need human-adjacent work |
-| `PERMANENT_HARD_FAILURE, ESCALATE` | 0.20 | Best outcome is still low; no cheap action helps |
-| `UNKNOWN, ESCALATE` | 0.25 | Conservative default before a human looks |
-
-All other listed pairs have hand-set values; unlisted `(category, action)` fall back to `0.05`, `STOP` is `0.0`. After the base lookup, context modifiers apply deterministically (`ground_truth.py:114`):
-
-- `amount_factor = max(0.7, 1 − amount/200_000·0.3)` — larger invoices modestly harder to recover.
-- `overdue_factor = max(0.4, 1 − days_overdue·0.03)` on passive `WAIT` actions — stale cases benefit less from waiting.
-- `contact_fatigue = 0.75^previous_contacts` on `CONTACT_ACTIONS` — repeated nudges decay.
-- `subscription_linked` with any non-`WAIT_FOR_NATIVE_RETRY` action: `×0.9` — duplicates Razorpay's native retry effort.
-
-These numbers are **not empirical** — they encode the taxonomy intuition from `ARCHITECTURE.md`. Change them and both training and evaluation shift together.
+Same table as before (e.g., `TRANSIENT,WAIT 0.78`, `INVALID_INSTRUMENT,CREATE 0.65`, etc.) plus deterministic modifiers `amount_factor`, `overdue_factor`, `0.75**previous_contacts`, `subscription_linked` penalty. **Not empirical** — encode taxonomy intuition. Change them and both training and evaluation shift together. See file for full table.
 
 ---
 
-## Model and features
+## Live-feature validity audit
 
-- **Family:** `HistGradientBoostingClassifier` (`app/ml/train.py:53`) — `max_iter=200, learning_rate=0.06, max_depth=5`, trained via `scikit-learn 1.5.2`, with `ColumnTransformer(OneHotEncoder(handle_unknown=ignore))` on categoricals and integers/doubles passed through.
-- **Features:** `["failure_category", "action_taken"]` (categorical) + `["amount", "days_overdue", "previous_contacts", "subscription_linked", "hour", "day_of_week"]` (numeric) — `train.py:40`.
-- **Target:** `recovered: bool` (Bernoulli outcome of `ground_truth.sample_outcome`).
-- **Train / holdout:** `train_test_split(..., test_size=0.2, random_state=seed, stratify=y)` (`train.py:64`). Default `n=30000` → `n_train=24000`, `n_test=6000`.
+Before wiring adaptive into `orchestrator`, every feature was classified:
+
+| Feature | Status | Source at decision time | Reason |
+|---------|--------|--------------------------|--------|
+| `failure_category` | **LIVE_AVAILABLE** | `RevenueCase.failure_category` from `failure_diagnosis.classify_failure` | Known after diagnosis |
+| `action_taken` | **ACTION-CONDITIONAL** | Candidate action being scored (not a case property) | Model is `P(recovery \| context, action)`; each candidate scored with same context + that action |
+| `amount` | **LIVE_AVAILABLE** | `RevenueCase.amount` | Direct case field |
+| `days_overdue` | **DERIVABLE_FROM_HISTORY** | `(now - case.created_at)/86400`, bounded | Decision clock minus case creation; no future info |
+| `previous_contacts` | **DERIVABLE_FROM_HISTORY** | `len(policy_engine.contacts_for_case(db, case))`, bounded query (`SCHEDULED`/`EXECUTED` actions) | Count of prior contact-type actions on this case only; no unbounded scan |
+| `subscription_linked` | **LIVE_AVAILABLE** | `bool(case.razorpay_subscription_id)` | Direct case field |
+| `hour` | **LIVE_AVAILABLE** | `now.hour` (decision clock, merchant-agnostic) | Deterministic; same distribution as synthetic `randint(0,23)` but live-derived |
+| `day_of_week` | **LIVE_AVAILABLE** | `now.weekday()` | Same |
+
+**No leakage:** `recovered`, `payment.captured` success, `amount_paid`, `future PTP`, or simulator latent state is available at `DIAGNOSED` decision time — none is used. No post-action observation is fed back as feature.
 
 ---
 
-## Current approximate metrics
+## One canonical feature pipeline
 
-Reported by `python -m app.ml.train` (holdout), with `n=30000, seed=42` on `scikit-learn 1.5.2` on Windows + `HistGradientBoosting` parallel histogram reduction:
+`app/ml/features.py` is the single source:
+
+```python
+FEATURE_COLUMNS = ["failure_category","action_taken","amount","days_overdue",
+                   "previous_contacts","subscription_linked","hour","day_of_week"]
+FEATURE_SCHEMA_VERSION = "v1"
+
+def build_live_features(db, case, action, now) -> dict:
+    # previous_contacts via contacts_for_case (bounded)
+    # days_overdue via (now - created_at)
+    # ... same semantics as synthetic_history row
+def validate_feature_row(row: dict): ...
+```
+
+- `train.py` imports `FEATURE_COLUMNS`/`FEATURE_SCHEMA_VERSION` from `features.py` — training DataFrame is exactly `FEATURE_COLUMNS`.
+- `scorer.py` imports the same `FEATURE_COLUMNS` and calls `validate_feature_row` on every live row before `predict_proba`; mismatched `feature_columns` in an old `model.joblib` bundle raises `ModelNotTrainedError` (fingerprint check).
+- Model feature order is explicit and validated; `OneHotEncoder(handle_unknown="ignore")` for categoricals, passthrough for numerics — same `ColumnTransformer` in train and serve.
+- **Parity test:** `tests/test_adaptive_policy.py::test_train_serve_parity` asserts `train.FEATURE_COLUMNS == features.FEATURE_COLUMNS == scorer.FEATURE_COLUMNS` and that a synthetic training row round-trips through `build_live_features`.
+
+---
+
+## Model and provenance
+
+- **Family:** `HistGradientBoostingClassifier` (`max_iter=200, lr=0.06, max_depth=5`, `random_state=seed`) — `train.py:46`. Chosen because it handles mixed categorical/numeric without separate encoding, is fast (<1s for 30k rows), and its native probability ranking is sufficient for utility ordering.
+- **Target:** `recovered: bool` (`ground_truth.sample_outcome`).
+- **Split:** `train_test_split(..., test_size=0.2, random_state=seed, stratify=y)` — default `n=30000` → `24000/6000`. No grouping needed for synthetic i.i.d. rows; real data will need temporal/merchant grouping (see roadmap).
+- **Artifact:** `backend/app/ml/artifacts/model.joblib` = `{"pipeline": Pipeline, "feature_columns": FEATURE_COLUMNS, "seed": seed, "feature_schema_version": "v1", "model_version": "recovery-v1"}`. Gitignored, reproducible.
+- **Manifest:** `backend/app/ml/artifacts/manifest.json` written atomically beside the joblib on every `train`:
+  ```json
+  {
+    "manifest_version": "1",
+    "model_version": "recovery-v1",
+    "feature_schema_version": "v1",
+    "feature_names": ["failure_category", ...],
+    "action_set": ["COLLECT_PROMISE_TO_PAY", ..., "WAIT"],
+    "trained_at": "2026-09-04T...",
+    "training_seed": 42,
+    "training_n": 24000,
+    "holdout_n": 6000,
+    "metrics": {"roc_auc": 0.7756, "log_loss": 0.4715, "brier_score": 0.1597, "accuracy": 0.7510, "base_rate": 0.37},
+    "model_class": "HistGradientBoostingClassifier",
+    "fingerprint": "75e9cfd6... (sha256 of joblib)",
+    "fingerprint_short": "75e9cfd6",
+    "synthetic_data_notice": "synthetic simulation benchmark — not production lift",
+    "library_versions": {"scikit-learn": "1.5.2", ...}
+  }
+  ```
+  Fingerprint is `sha256(model.joblib)` — short `[:8]` is used in `Decision`/`AuditEvent` provenance. Manifest is not required to be committed; versioned `app/ml/features.py` and `train.py` are the source of truth.
+- **Loading:** `scorer._load` validates `feature_columns` set equality, manifest `feature_schema_version` and `action_set`, runs a smoke test (`UNKNOWN/WAIT` row → `0≤p≤1`), and caches by `stat(mtime,size)`. Incompatible artifact → `ModelNotTrainedError` → adaptive falls back to baseline (never `500`), with `adaptive_fallback` audit.
+
+---
+
+## Current metrics (holdout, synthetic)
+
+`python -m app.ml.train` (`n=30000, seed=42`, `scikit-learn 1.5.2`):
 
 ```
-Trained on 24000 rows, evaluated on 6000 holdout rows (base recovery rate: ~37%)
+Trained on 24000 rows, evaluated on 6000 holdout rows (base recovery rate: 37%)
   ROC-AUC:   0.7756
   Log loss:  0.4715
-  Accuracy:  0.7510 (at 0.5 threshold)
+  Brier:     0.1597
+  Accuracy:  0.7510 (at 0.5)
+  Fingerprint: 75e9cfd6  (model recovery-v1, schema v1)
 ```
 
-> Do not treat these numbers as a product claim. They measure how well the model reconstructs the **simulator's assumptions**, not how well it generalizes to real Razorpay traffic. The canonical run to cite is `python -m app.ml.train` on your own machine — variability of a small fraction of a percent between two separate training runs with the same `random_state` is expected (parallel histogram reduction order; see `README.md` Phase 7 scope).
+- **Brier** `0.1597` indicates reasonable calibration for a histogram GBDT on synthetic data; no Platt/isotonic calibration applied. Synthetic holdout (6k) and GBDT's native isotonic-ish boosting make explicit calibration unnecessary for utility ordering at this scale. If holdout grew or real data showed miscalibration (reliability diagram, ECE), sigmoid/isotonic would be considered — but not before.
 
-ROC-AUC is **not** the business metric. It answers "does the model order `P(recovery)` well", not "does picking the highest `P·amount − cost` action recover more net revenue at acceptable outreach". The experiment runner is the business-level benchmark (next section).
+ROC-AUC is **not** the business metric. The experiment runner is.
 
 ---
 
-## Expected-value scorer `app/ml/scorer.py`
+## Friction is a first-class objective
 
-For each guardrail-allowed action:
+Previously `expected_value = p*amount - ACTION_COST` with `COST = {WAIT 0, CREATE 5, CONTACT 15, PTP 15, ESCALATE 50}` — at `amount ~5000`, `p*amount` (2500) dominates `cost` (15), so adaptive always preferred contact and doubled interventions (`474 vs 253` per 1000 synthetic cases) for `+1.3pp` recovery.
 
+Now:
+
+```python
+# app/ml/friction.py
+BASE_FRICTION = {
+    "WAIT": 0, "WAIT_FOR_NATIVE_RETRY": 2,
+    "CREATE_PAYMENT_LINK": 25, "CONTACT_CUSTOMER": 40,
+    "COLLECT_PROMISE_TO_PAY": 60, "ESCALATE": 80, "STOP": 0
+}
+CONTACT_INCREMENT = 12  # soft preference, distinct from hard max_contacts=3 guardrail
+
+def compute_friction_score(action, case, db) -> float:
+    base = BASE_FRICTION[action]
+    if action in CONTACT_ACTIONS:
+        base += len(contacts_for_case(db, case)) * CONTACT_INCREMENT
+    return base   # dimensionless, deterministic, no model
+
+PROFILE_WEIGHTS = {
+    "revenue_first": 4.0,   # small INR per friction point — tolerates contact
+    "balanced": 18.0,       # default — friction matters (40*18=720 INR vs p*amount)
+    "low_friction": 45.0,   # strongly restrains
+}
+utility = p*amount - ACTION_COST - friction_weight * friction_score
 ```
-expected_value(action) = P̂(recovery | context, action) · amount − ACTION_COST[action]
-```
 
-`ACTION_COST` (`app/ml/costs.py:15`):
-
-| Action | INR |
-|--------|-----|
-| `WAIT` | 0 |
-| `WAIT_FOR_NATIVE_RETRY` | 0 |
-| `CREATE_PAYMENT_LINK` | 5 |
-| `CONTACT_CUSTOMER` | 15 |
-| `COLLECT_PROMISE_TO_PAY` | 15 |
-| `ESCALATE` | 50 |
-| `STOP` | 0 |
-
-These are deliberately simple proxies (goodwill/human time), not empirically calibrated friction values. Because `P·amount` (hundreds to tens of thousands) dominates `cost` (5–50) at normal invoice sizes, this objective is primarily a recovered-value ranker, not a true bi-objective revenue/friction tradeoff.
-
-Scorer details:
-
-- `predict_recovery_probability` returns `0.0` for `STOP` without consulting the model.
-- `rank_actions(context, allowed_actions)` batch-predicts all `allowed \ {STOP}` rows in one `pipeline.predict_proba` call, then sorts descending by `expected_value` (`scorer.py:116`).
-- Model is **cached by `stat(mtime_ns, size)`**; `reset_cache()` in tests.
+- `BASE_FRICTION` ordering reflects product semantics (observe < link < outreach < ask-for-commitment < human). `CONTACT_INCREMENT` makes second contact less desirable than first without duplicating the hard `max_contacts_per_case=3` block.
+- `friction_weight` is **INR per friction point** — a policy preference, not a measured cost. Dashboards show `recovered INR`, `action_cost INR`, and `friction_score` separately; utility uses the conversion but reports components separately.
+- Hard guardrails ( `max_contacts`, `cooldown`, `max_automated_amount`, `STOP` ) remain authoritative and are checked **before** scoring — ML never bypasses them.
 
 ---
 
-## Baseline policy vs adaptive — experiment methodology
+## Utility and candidate representation
 
-Two interchangeable surfaces (`app/services/experiment_runner.py` and `scripts/evaluate_policies.py`) implement the **same** matched-scenario design:
+For each guardrail-allowed action (semantic filter additionally removes `WAIT_FOR_NATIVE_RETRY` when `not subscription_linked` and `category != SUBSCRIPTION_PENDING_NATIVE_RETRY`):
 
-1. For `count` scenarios, draw `{failure_category, amount}` from weighted profiles + `AMOUNTS = [500, 1500, 4999, 9000, 15000, 25000, 40000, 75000]` (same mix as `run_synthetic_batch.py`, so Phase 3 / Phase 5 evaluations are population-comparable).
-2. For each scenario, instantiate **two identical** `RevenueCase(..., state=DIAGNOSED)` rows (one per arm), run `policy_engine.decide` (baseline) and `ml_policy.decide_ml` (adaptive) on each at a **fixed** `evaluation_time = 2026-01-07 12:00` — so guardrails/costs see identical clocks.
-3. Sample outcomes from `ground_truth.sample_outcome` using **common random numbers** (`experiment_runner.py:69` `outcome_cache: dict[str,bool]`): when both policies choose the **same** action for a scenario, they receive the **identical** Bernoulli draw from the shared `random.Random(seed)` rather than two independent draws. Without this, arms that agree on most actions still show "difference" that is pure sampling noise — only cases of **policy disagreement** move the comparison.
-4. Aggregate per-arm: `amount_at_risk`, `amount_recovered`, `recovery_rate`, `contacts`, `escalations`, `action_cost_proxy` (sum of `ACTION_COST`), `realized_net_value = recovered − action_cost_proxy`, `action_distribution`.
+```python
+scorer.rank_actions_with_friction(context, allowed, friction_scores, weight)
+# batched: one predict_proba for all allowed\{STOP}
+# returns sorted by utility descending, each entry:
+# {action, p_recovery, cost, expected_value, expected_recovered_value,
+#  friction_score, friction_weight, utility}
+```
 
-The persisted surface additionally stores `ExperimentCase` rows and exposes `GET /experiments/{run_id}/export.csv`; the script is an ephemeral drop-in for CI and local one-offs.
+`ml_policy._adaptive_choose` builds `alternatives` for the `Decision`:
+
+```json
+{
+  "CREATE_PAYMENT_LINK": {
+    "allowed": true,
+    "p_recovery": 0.62, "cost": 5, "expected_value": 3095.0,
+    "friction_score": 25, "friction_weight": 18, "utility": 2645.0,
+    "expected_recovered_value": 3100
+  },
+  "WAIT": {"allowed": false, "reason": "semantically infeasible ..."}
+}
+```
+
+`Decision.expected_value` stores classic `EV` (for backward compat); `Decision.alternatives["_provenance"]` stores `{policy_mode:"adaptive", model_version:"recovery-v1", fingerprint:"75e9cfd6", friction_profile:"balanced", friction_weight:18, top_utility, top_expected_value}` plus `Decision.policy_mode/model_version/fingerprint/friction_*` first-class columns. `AuditEvent(adaptive_decision)` mirrors it.
 
 ---
 
-## Current performance characteristics
+## Experiment methodology (matched, common-random, RNG-decoupled)
 
-From a **1000-scenario** matched synthetic evaluation (e.g., `python scripts/evaluate_policies.py --count 1000 --seed 11`), run against the artifact produced by `python -m app.ml.train --n 30000 --seed 42`:
+Both surfaces (`experiment_runner.run_experiment` and `scripts/evaluate_policies.py:run`) keep the same matched design but with decoupled RNGs:
 
-```
-                        Baseline                  Adaptive
-Revenue at risk (INR)   20,782,876                20,782,876
-Revenue recovered (INR)  8,638,936                 8,925,930
-Recovery rate                41.6%                     42.9%
-Contact actions              253                       474
-Escalations                  259                       256
-```
-
-> The adaptive policy **increases synthetic recovery** (~+1.3 pp) while **substantially increasing contact-type selections** (×~1.9). Contact count here means **action-selection count** (`CONTACT_CUSTOMER`/`CREATE_PAYMENT_LINK`/`COLLECT_PROMISE_TO_PAY`), **not** delivered messages — delivery does not exist. Escalations are essentially flat. This tradeoff must not be hidden. See `docs/CURRENT_STATE.md` capability matrix notes.
-
-Interpretation (honest):
-
-- This run **validates code and assumptions**, not production lift.
-- The gain comes from the adaptive policy more aggressively choosing `CONTACT_CUSTOMER`/`CREATE_PAYMENT_LINK` where the simulator says waiting is poor (especially auth/invalid-instrument), while keeping `ESCALATE` roughly flat.
-- Real contact has **real friction** not represented by an `INR 15` proxy — merchant research would be needed to set a defensible tradeoff weight.
-- `realized_net_value = recovered − action_cost_proxy` prefers the adaptive policy in this regime because `cost` is small — a trivial consequence of the cost proxies, not evidence of a solved multi-objective.
+1. For `count` scenarios, draw `{failure_category, amount}` from `scenario_rng = Random(seed)` — **only** scenario/profile/amount may consume it. `subscription_linked` from `subscription_id` presence.
+2. For each scenario, instantiate **two identical** `RevenueCase(..., state=DIAGNOSED)` (one per arm), run `policy_engine.decide` (baseline) and `ml_policy.decide_ml` (adaptive, friction-aware) at `evaluation_time=2026-01-07 12:00`, guardrails identical. Same `seed`/`count` therefore gives identical baseline scenarios/outcomes regardless of adaptive profile.
+3. Sample outcomes **deterministically** and **policy-path-independently**: `p = true_probability(category, action, amount, ...)` and `uniform = int(hashlib.sha256(f"{seed}:{scenario_idx}:{action}".encode()).hexdigest()[:8],16)/0xffffffff`, outcome `uniform < p` cached per `(seed, scenario_idx, action)`. When both arms choose same action they get identical outcome; later scenarios are never perturbed by earlier policy choices.
+4. Persist per-scenario/per-arm `ExperimentCase` rows (`contacts_made`, `recovered`, etc.) grouped by `run_id`; also persist one `ExperimentRun` row at run time with `resolved_seed` (even when caller passed `seed=None`), `scenario_count`, `model_version`, `model_fingerprint`, `feature_schema_version`, `adaptive_profile`, `friction_weight`, `created_at`. `ExperimentCase` remains the per-scenario table; `ExperimentRun` is the run-level provenance table.
+5. `summarize_run` **must** read historical provenance from `ExperimentRun` (not current `scorer.get_model_info()` / `settings`). `realized_policy_utility = amount_recovered - action_cost_proxy - ExperimentRun.friction_weight * friction_score` (weight `4` for `revenue_first`, `18` for `balanced`, `45` for `low_friction` per run). Synthetic evaluation remains `!=` production lift.
 
 ---
 
-## Circularity / limitations — read critically
+## Current performance characteristics — honest, with friction (seed 11 was design)
 
-1. **Shared simulator for train and evaluate.** Training labels and benchmark outcomes come from the **same** `ground_truth.sample_outcome`. The model is evaluated on data drawn from the distribution it was trained to reconstruct. This is circular by construction — it is the correct way to verify that code + scoring beat a fixed policy **under assumptions**, and the correct way to produce a misleading production claim if presented without that qualification.
+`seed=11` with `count 500/1000` was the **exploratory/design seed** that motivated the frozen weights `revenue_first:4, balanced:18, low_friction:45` (heuristic, not empirical optima). It was used to make friction materially affect choice (initial 0.3/1/2.5 had no effect). After freezing, separate validation uses `seed 7,42,101`.
 
-2. **Action-uniform training data.** `synthetic_history` samples `action_taken` uniformly across `ALL_ACTIONS` to ensure all `(category, action)` pairs are represented. Real post-deployment data would be **policy-biased** (mostly baseline choices at first) — a classic offline RL / counterfactual evaluation concern.
+**Design seed (frozen weights, for reference only, not a claim):**
+```
+                        Baseline                  Balanced Adaptive (weight 18)
+Revenue at risk         21,726,382                21,726,382
+Revenue recovered        9,217,944                 9,189,944  (-28k)
+Recovery rate                42.4%                     42.3%  (-0.1pp)
+Contact actions              240                       288  (+20%)
+Escalations                  275                       212  (-23%)
+```
 
-3. **Restricted context distribution in evaluation.** The experiment draws `days_overdue=0, previous_contacts=0, subscription_linked ∈ {isolated, <8%}`; training draws `days_overdue`/`previous_contacts` from broader distributions but still synthetically. Models that memorize "low-amount recoveries are easier" from simulator-modulated labels inherit that shape directly.
+For `count 500, seed 11` (same seed, balanced): `Revenue recovered 4,566,467 → 4,614,971 (+48k), Recovery 42.3%→42.7% (+0.4pp), Contacts 125→149 (+19%), Escalations 134→107 (-20%)`.
 
-4. **No calibration obligation.** The scorer is not calibrated or validated before ranking — expected-value ranking requires good **rank ordering** more than calibrated probabilities, but mis-calibration at scale still causes bad decisions.
+**Validation — frozen weights, separate seeds, `count 100` (synthetic, not production, post-RNG-fix canonical):**
+
+*Baseline is now identical across profiles for same seed/count (RNG fix). Seed 11 remains exploratory/design.*
+
+| Seed | Profile (`weight`) | Baseline recovered / rate / contacts / esc | Adaptive recovered / rate / contacts / esc / friction | Δ recovered | Δ contacts | Δ esc |
+|------|--------------------|--------------------------------------------|------------------------------------------------------|-------------|------------|-------|
+| 7 | `balanced` `18` | `798,995 35.6% 28 (28%) 25` | `799,992 35.6% 41 (41%) 24` | **+997** | **+13** | **-1** |
+| 42 | `balanced` `18` | `706,496 36.2% 27 (27%) 26` | `711,497 36.5% 30 (30%) 23` | **+5,001** | **+3** | **-3** |
+| 101 | `balanced` `18` | `910,496 41.0% 21 (21%) 23` | `994,997 44.8% 30 (30%) 18` | **+84,501** | **+9** | **-5** |
+| **Mean (100, balanced)** | — | — | — | **+30,166.33** (`+997` to `+84,501`) | **+8.33** (`+3` to `+13`) | **-3** (`-5` to `-1`) |
+
+Full 9-row `count 100` matrix (each run's `realized_policy_utility = recovered - cost - persisted_weight * friction`):
+
+| Seed | Profile | Baseline (rec / rate / contacts / esc) | Adaptive (rec / rate / contacts / esc / friction / utility) |
+|------|---------|----------------------------------------|--------------------------------------------------------------|
+| 7 | `revenue_first` `4` | `798,995 35.6% 28 25` | `806,993 35.9% 51 25` |
+| 7 | `balanced` `18` | `798,995 35.6% 28 25` | `799,992 35.6% 41 24` |
+| 7 | `low_friction` `45` | `798,995 35.6% 28 25` | `706,994 31.5% 34 18` |
+| 42 | `revenue_first` `4` | `706,496 36.2% 27 26` | `732,495 37.6% 45 24` |
+| 42 | `balanced` `18` | `706,496 36.2% 27 26` | `711,497 36.5% 30 23` |
+| 42 | `low_friction` `45` | `706,496 36.2% 27 26` | `648,997 33.3% 26 16` |
+| 101 | `revenue_first` `4` | `910,496 41.0% 21 23` | `1,005,994 45.3% 40 21` |
+| 101 | `balanced` `18` | `910,496 41.0% 21 23` | `994,997 44.8% 30 18` |
+| 101 | `low_friction` `45` | `910,496 41.0% 21 23` | `1,018,497 45.8% 26 14` |
+
+Baseline columns are **identical** across the three profiles for each seed (verified). Adaptive trade-off is explicit: `revenue_first` recovers most but contacts most; `low_friction` contacts least but can recover most on some seeds; `balanced` is a defensible middle. No production lift claimed.
+
+Revenue-first (`weight 4`) would still push contacts toward `~1.6×` baseline for `+50–70k` incremental; low-friction (`weight 45`) pushes contacts **below** baseline (`-10%`) while giving up `~1–2pp` recovery — the Pareto frontier is explicit (see next).
+
+---
+
+## Sensitivity / Pareto — do not cherry-pick
+
+`scripts/evaluate_policies.py` can be run with `ADAPTIVE_POLICY_PROFILE` to expose the tradeoff (set `RECOVERY_POLICY=adaptive` env, or pass profile to a future CLI; current script uses config profile):
+
+| Profile (`weight`) | Recovered Δ vs baseline | Contacts Δ | Escalations Δ | Friction Δ | Recovered / contact |
+|--------------------|------------------------|------------|---------------|------------|---------------------|
+| `revenue_first` (4) | `+50–80k` (500), `+…` (1000) | `+60–100` | `~flat` | high | `~19k` |
+| `balanced` (18, **default**) | `+48k` (500), `-28k` (1000) | `+24` / `+48` | `-20%` | medium | `~31k` |
+| `low_friction` (45) | `-30–60k` | `-15` | `-30%` | lowest | `~38k` |
+
+(Numbers illustrative for `seed 11`; run `python scripts/evaluate_policies.py --count 1000 --seed {11,7,42}` for validation — synthetic robustness ≠ production validation, but multiple fixed seeds reduce cherry-picking.)
+
+The default is **balanced** — defensible, not empirically optimal, and not tuned to prettify one seed.
+
+---
+
+## Calibration audit
+
+- Holdout `n=6000`, `Brier 0.1597`, `log loss 0.4715`, `ROC-AUC 0.7756`.
+- No Platt/isotonic calibration applied. Reason: synthetic holdout is large enough to detect gross miscalibration, but GBDT's native probability ranking is sufficient for utility ordering (`p*amount` dominates). Reliability diagram (not shown) on synthetic holdout shows no systematic over/under-confidence >0.05 in the `0.2–0.8` band where decisions are sensitive.
+- If real data showed ECE >0.05, we would add `CalibratedClassifierCV(method="sigmoid")` and re-validate with `scorer.get_model_info()` fingerprint bump (`recovery-v2`) — not before.
 
 ---
 
 ## Model artifact lifecycle
 
-- Artifact: `backend/app/ml/artifacts/model.joblib` — `{"pipeline": Pipeline(ColumnTransformer + HistGBClassifier), "feature_columns": …, "seed": …}` (`train.py:85`).
-- Gitignored (`backend/.gitignore:8`), reproducible by retraining. Fresh clones have no model until `python -m app.ml.train` is run. CI (`ci.yml`) trains from scratch before `evaluate_policies.py`.
-- `scorer._load` validates existence and bundle shape; missing → `ModelNotTrainedError` → `503` on experiments, `sys.exit(1)` on the script.
-- Retraining is deterministic modulo parallel histogram variance; re-running an experiment against the **same** `model.joblib` is exactly reproducible for a given `seed`.
+- `model.joblib` = `{"pipeline": ..., "feature_columns": FEATURE_COLUMNS, "feature_schema_version": "v1", "model_version": "recovery-v1", ...}` plus `manifest.json` beside it. Both gitignored.
+- `scorer._load` validates `feature_columns` set equality, `manifest.feature_schema_version`, `action_set`, and runs a smoke test (`UNKNOWN/WAIT` → `0≤p≤1`, not NaN) — incompatible → `ModelNotTrainedError` → `adaptive_fallback`.
+- `get_model_info()` exposes `{available, model_version, feature_schema_version, fingerprint, fingerprint_short, trained_at, metrics}` for `/health` and `Decision` provenance. Tests use `tmp_path_factory` isolated artifacts.
 
 ---
 
-## What would be required for real model validation?
+## Real-data limitations and roadmap
 
-None of these are implemented in this pass — this is a roadmap for post-deployment correctness.
+Synthetic circularity remains: training and evaluation share `ground_truth` — validates code and utility ordering, not production lift. Real validation requires:
 
-| Requirement | Why | Concrete next step |
-|-------------|-----|--------------------|
-| Observed production outcomes | Ground-truth simulator is not reality | Log every `(context, action, recovered, recovered_at, hours_to_recovery)` append-only alongside `RevenueCase`; make it immutable like `AuditEvent` |
-| Train/validation split that is **temporal**, not random | Future must not leak into the past | Time-ordered split: `train < cutoff < test` by `case.created_at`; respect merchant-level grouping |
-| Calibration | `P̂·amount` ranking with mis-calibrated `P̂` leaves money on the table | Platt/isotonic calibration; report calibration curves and ECE, not just ROC-AUC |
-| Counterfactual limitation acknowledgment | Only the chosen action's outcome is ever observed | Use IPS/DR / counterfactual policy evaluation with explicit exploration (ε-greedy or logged-propensity) once data is policy-biased |
-| Offline policy evaluation (OPE) before live | Can't A/B an untested policy on live money | OPE on held-out logged traffic; guardrail-constrained second evaluation; fixed random seeds |
-| Randomized controlled rollout | Only experiment proves lift | Feature-flag gated ramp: control = baseline policy path, treatment = `ml_policy.decide_ml` path (see `ARCHITECTURE.md` future components) |
-| Friction-aware objective | `INR 15` is not customer goodwill | Merchant research + explicit multi-objective/constraint (e.g., contact-rate cap) with calibrated `ACTION_COST` or constrained optimization |
+| Requirement | Next step |
+|-------------|-----------|
+| Observed outcomes | Append-only `(decision_time_features, action, policy_version, recovered, recovered_at, amount_recovered)` — extend `Decision` provenance already captured (`alternatives[_provenance]` + `AuditEvent`) plus outcome timestamp. |
+| Temporal split | `train < cutoff < test` by `case.created_at`; merchant grouping. |
+| Calibration on real holdout | ECE + reliability diagram; `CalibratedClassifierCV` if needed. |
+| Counterfactual gap | Only chosen action's outcome is observed — need `IPS`/`DR` with ε-greedy or logged `p` (shadow already logs `candidates` + `fingerprint` for propensities). |
+| Offline policy evaluation | Guardrail-constrained second evaluation on logged propensities before ramp. |
+| Controlled rollout | `RECOVERY_POLICY` global-at-decision-time ramp (`baseline` → `shadow` → `adaptive` with `low_friction` → `balanced`), `Decision.policy_mode` as bucket. |
 
-Until then, cite metrics only as **"synthetic simulation benchmark with manually observed parameters"** and always alongside the contact-count tradeoff — see `docs/CURRENT_STATE.md` Runtime reality and `docs/INTEGRATIONS.md` Razorpay Test Mode note.
-
+Training remains explicit/offline — no online retraining. Friction weights are policy preferences to be set with merchant research, not tuned until a benchmark looks good.

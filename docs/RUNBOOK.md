@@ -447,21 +447,83 @@ For a short local wait test, stop/restart the backend and worker with `WAIT_DELA
 
 ---
 
+## 7b. Adaptive policy — baseline / shadow / adaptive
+
+`RECOVERY_POLICY` is startup-loaded from `backend/.env` (`baseline` default, `shadow`, `adaptive`); changing it requires a process restart ( `uvicorn --reload` picks it up).
+
+**PowerShell (set in backend/.env then restart uvicorn):**
+```powershell
+# baseline (default, safe)
+Copy-Item .env.example .env   # then set RECOVERY_POLICY=baseline
+# shadow — baseline executes, adaptive recommendation audited side-effect-free
+# set RECOVERY_POLICY=shadow
+# adaptive — friction-aware (balanced) with baseline fallback
+# set RECOVERY_POLICY=adaptive
+# optional profile/weight
+# set ADAPTIVE_POLICY_PROFILE=balanced   # revenue_first | balanced | low_friction
+# set ADAPTIVE_FRICTION_WEIGHT=18
+```
+
+**Test each mode (from backend/, with worker running for adaptive CREATE_PAYMENT_LINK):**
+
+*Baseline* — deterministic:
+```powershell
+$env:RECOVERY_POLICY="baseline"
+# restart uvicorn, then:
+python scripts/send_test_webhook.py payment.failed --payment-id pay_demo_baseline --amount 2000 --error-reason insufficient_funds
+curl http://localhost:8000/cases/<id> | python -m json.tool   # decisions[0].policy_mode == "baseline"
+```
+
+*Shadow* — baseline executes, adaptive audited:
+```powershell
+$env:RECOVERY_POLICY="shadow"
+# restart, then same webhook; check audit:
+curl http://localhost:8000/cases/<id> | python -m json.tool
+# audit_trail contains shadow_adaptive_recommendation {baseline_chosen, adaptive_suggested, candidates, fingerprint, disagreement}
+# No second Action created
+```
+
+*Adaptive* — friction-aware live:
+```powershell
+$env:RECOVERY_POLICY="adaptive"
+$env:ADAPTIVE_POLICY_PROFILE="balanced"
+# restart, then webhook where adaptive differs (e.g., TRANSIENT_INFRASTRUCTURE may still WAIT, but INVALID_INSTRUMENT may choose CREATE vs CONTACT based on friction)
+python scripts/send_test_webhook.py payment.failed --payment-id pay_demo_adaptive --amount 2000 --error-reason card_expired
+curl http://localhost:8000/cases/<id> | python -m json.tool
+# decisions[0].policy_mode == "adaptive", model_version == "recovery-v1", fingerprint_short e.g. 75e9cfd6, friction_profile == "balanced", alternatives contain p_recovery/utility/friction_score
+```
+
+*Forced fallback* — corrupt/missing model falls back to baseline:
+```powershell
+# temporarily move artifact away, restart with RECOVERY_POLICY=adaptive, send webhook — should still create a valid Decision with policy_mode == "adaptive_fallback" and audit adaptive_fallback, not 500
+```
+
+Check health:
+```powershell
+curl http://localhost:8000/health | python -m json.tool
+# adaptive_policy {configured_mode, model_available, model_version, fingerprint_short, feature_schema_compatible}
+```
+
 ## 8. Model training
 
 Working directory: **`backend/`**
 
 ```bash
-# default: n=30000 synthetic rows, seed=42, artifact: app/ml/artifacts/model.joblib
+# default: n=30000 synthetic rows, seed=42, artifact: app/ml/artifacts/model.joblib + manifest.json
 python -m app.ml.train
 
 # options:
 python -m app.ml.train --n 6000 --seed 7
 ```
 
-Produces: `n_train=24000`, `n_test=6000` rows (80/20 stratified split), prints `ROC-AUC`, `Log loss`, `Accuracy @0.5`, and `base_rate` (see `docs/ML_AND_EVALUATION.md` for the caveats and current approximate numbers).
+Produces: `n_train=24000`, `n_test=6000` rows (80/20 stratified split), prints `ROC-AUC`, `Log loss`, `Brier`, `Accuracy @0.5`, `base_rate`, `Fingerprint` (`recovery-v1`, `schema v1`) and manifest path (see `docs/ML_AND_EVALUATION.md` for the caveats and current approximate numbers). Inspect manifest:
 
-The artifact directory is gitignored (`backend/.gitignore:8`). A fresh clone requires this step before any `POST /experiments` or `scripts/evaluate_policies.py` call — otherwise they return `503 ModelNotTrainedError`.
+```bash
+cat app/ml/artifacts/manifest.json | python -m json.tool
+# {model_version, feature_schema_version, fingerprint, metrics {roc_auc, log_loss, brier_score, ...}, synthetic_data_notice}
+```
+
+The artifact directory is gitignored (`backend/.gitignore:8` — `model.joblib` + `manifest.json`). A fresh clone requires this step before any `POST /experiments` or `scripts/evaluate_policies.py` call — otherwise they return `503 ModelNotTrainedError`.
 
 ---
 
@@ -469,24 +531,29 @@ The artifact directory is gitignored (`backend/.gitignore:8`). A fresh clone req
 
 Working directory: **`backend/`**
 
-### API (persisted, dashboard-visible)
+### API (persisted, dashboard-visible) — now reports friction
 
 ```bash
 curl -X POST http://localhost:8000/experiments -H "Content-Type: application/json" -d "{\"count\": 500, \"seed\": 11}"
-curl http://localhost:8000/experiments/<run_id>
+curl http://localhost:8000/experiments/<run_id> | python -m json.tool   # per-arm friction_score, contact_rate, recovered_per_contact, utility
 curl http://localhost:8000/experiments/<run_id>/export.csv -o audit.csv
 curl http://localhost:8000/experiments   # recent run_id list
 ```
 
-Or use the dashboard's **Run experiment** panel (`http://localhost:5173`).
+Dashboard's **Run experiment** panel (`http://localhost:5173`) now shows `Contact actions (rate)`, `Friction score`, `Recovered / contact` per arm alongside `Recovered` and `Escalations`.
 
-### Script (non-persisted, prints table)
+### Script (non-persisted, prints table) — with friction comparison
 
 ```bash
 python scripts/evaluate_policies.py --count 1000 --seed 11
+# prints per arm: recovered, recovery rate, contacts, contact_rate, friction, action_cost, utility, recovered_per_contact, plus incremental and action distribution
+# To compare profiles, set RECOVERY_POLICY env before run or run with different ADAPTIVE_POLICY_PROFILE:
+# PowerShell: $env:ADAPTIVE_POLICY_PROFILE="revenue_first"; python scripts/evaluate_policies.py --count 500 --seed 11
+#           $env:ADAPTIVE_POLICY_PROFILE="low_friction"; python scripts/evaluate_policies.py --count 500 --seed 11
+# (each uses common-random scenarios; run same count/seed per profile and compare)
 ```
 
-Both use **common random numbers** — when baseline and adaptive pick the same action for a scenario, they get the identical Bernoulli outcome (see `docs/ML_AND_EVALUATION.md`).
+Both use **common random numbers** — when baseline and adaptive pick the same action for a scenario, they get the identical Bernoulli outcome (see `docs/ML_AND_EVALUATION.md`). `adaptive` is now the friction-aware balanced policy (`weight 18`).
 
 ### Batch sanity check (Policy/Diagnosis only, no ML)
 
@@ -554,6 +621,6 @@ After a restart: start Compose, run `alembic upgrade head`, run `python scripts/
 | RQ fails with `os.fork` or `signal.SIGALRM` on Windows | Use `--worker-class app.worker.WindowsWorker`; `SimpleWorker` alone still uses the Unix timeout class. |
 | Actions remain `EXECUTING` after a worker crash | After `ACTION_CLAIM_TIMEOUT_SECONDS`, run reconciliation. It resets attempts still within budget and fails exhausted work to human review. |
 | `npm run lint` fails | `oxlint` (not eslint) — run `npm install` first; check Node 22+. |
-| `alembic upgrade head` says `already at head` | Fine - current head is `8d6e24f91a73`. CI verifies migrations against SQLite and local verification uses PostgreSQL. |
+| `alembic upgrade head` says `already at head` | Fine - current head is `a1b2c3d4e5f6` (decision provenance). CI verifies migrations against SQLite and local verification uses PostgreSQL. |
 
 No real credentials are included above. For full boundaries see `docs/INTEGRATIONS.md`.

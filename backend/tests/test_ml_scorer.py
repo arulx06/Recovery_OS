@@ -114,10 +114,15 @@ def test_model_cache_reloads_replaced_artifact(tmp_path, monkeypatch):
     original_mtime = model_path.stat().st_mtime_ns
     load_count = 0
 
+    class FakePipeline:
+        def predict_proba(self, rows):
+            import numpy as np
+            return np.array([[0.5, 0.5]] * len(rows))
+
     def fake_load(path):
         nonlocal load_count
         load_count += 1
-        return {"pipeline": object(), "load_number": load_count}
+        return {"pipeline": FakePipeline(), "load_number": load_count}
 
     monkeypatch.setattr(scorer.joblib, "load", fake_load)
     scorer.reset_cache()

@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = ""
     LLM_API_ENABLED: bool = False
 
+    # Recovery policy dispatch — baseline is the safe default.
+    RECOVERY_POLICY: str = "baseline"  # baseline | shadow | adaptive
+    ADAPTIVE_POLICY_PROFILE: str = "balanced"  # revenue_first | balanced | low_friction
+    ADAPTIVE_FRICTION_WEIGHT: float | None = None  # overrides profile if set
+    MODEL_ARTIFACT_PATH: str = "app/ml/artifacts/model.joblib"
+    MODEL_MANIFEST_PATH: str = "app/ml/artifacts/manifest.json"
+
     # CORS
     FRONTEND_ORIGIN: str = "http://localhost:5173"
 

@@ -13,6 +13,7 @@ Deliberately reuses policy_engine.decide / ml_policy.decide_ml exactly as
 they are — this module doesn't reimplement the recovery logic, only adds
 persistence and aggregation around calling it.
 """
+import hashlib
 import random
 import uuid
 from datetime import datetime
@@ -20,11 +21,24 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from app.models import RevenueCase, ExperimentCase
+from app.models import RevenueCase, ExperimentCase, ExperimentRun
 from app.services import policy_engine, ml_policy
 from app.ml import ground_truth
 from app.ml import scorer
 from app.ml.costs import ACTION_COST
+from app.ml.friction import BASE_FRICTION, get_friction_weight
+from app.ml.features import FEATURE_SCHEMA_VERSION
+from app.core.config import settings as _settings
+
+
+def _deterministic_uniform(seed: int, scenario_idx: int, action: str) -> float:
+    """Deterministic uniform in [0,1) for outcome — independent of policy path.
+
+    Uses stable hashlib, not Python's randomized hash(), so results are
+    reproducible across processes and runs.
+    """
+    h = hashlib.sha256(f"{seed}:{scenario_idx}:{action}".encode()).hexdigest()
+    return int(h[:8], 16) / 0xFFFFFFFF
 
 SCENARIO_PROFILES = [
     ({"failure_category": "INSUFFICIENT_BALANCE"}, 22),
@@ -51,20 +65,43 @@ def run_experiment(db: Session, count: int = 500, seed: int | None = None) -> st
     run_id. Does not compute the summary — call summarize_run() for that,
     so a huge run can be persisted without holding aggregates in memory
     beyond what SQL aggregation needs.
+
+    Note: if seed is None, a random seed is chosen and NOT persisted —
+    such runs are not reproducible via run_id alone. Callers should pass
+    an explicit seed for reproducibility (see docs/ML_AND_EVALUATION.md).
     """
+    # Use explicit seed for reproducibility; if None, generate one but warn
+    # that historical runs without an explicit seed cannot be reproduced
+    # from run_id alone (see docs).
     seed = seed if seed is not None else random.randrange(2**31)
-    scorer._load()  # fail before persisting a mislabeled adaptive fallback run
+    # Capture provenance at run time — historical runs must be immutable
+    model_info = scorer.get_model_info()
+    if not model_info.get("available"):
+        raise scorer.ModelNotTrainedError(model_info.get("reason") or "model unavailable")
+    profile, weight = get_friction_weight(_settings.ADAPTIVE_POLICY_PROFILE, _settings.ADAPTIVE_FRICTION_WEIGHT)
     run_id = str(uuid.uuid4())
-    rng = random.Random(seed)
+    # Persist run-level provenance before scenarios
+    db.add(ExperimentRun(
+        run_id=run_id,
+        resolved_seed=int(seed),
+        scenario_count=int(count),
+        model_version=model_info.get("model_version"),
+        model_fingerprint=model_info.get("fingerprint_short") or model_info.get("fingerprint"),
+        feature_schema_version=model_info.get("feature_schema_version") or FEATURE_SCHEMA_VERSION,
+        adaptive_profile=profile,
+        friction_weight=weight,
+    ))
+    db.flush()
+    scenario_rng = random.Random(seed)
     evaluation_time = datetime(2026, 1, 7, 12, 0, 0)
 
     CONTACT_ACTIONS = policy_engine.CONTACT_ACTIONS
 
     for i in range(count):
-        profile = _weighted_profile(rng)
+        profile = _weighted_profile(scenario_rng)
         category = profile["failure_category"]
         subscription_linked = "subscription_id" in profile
-        amount = Decimal(rng.choice(AMOUNTS))
+        amount = Decimal(scenario_rng.choice(AMOUNTS))
 
         outcome_cache: dict[str, bool] = {}
 
@@ -85,11 +122,15 @@ def run_experiment(db: Session, count: int = 500, seed: int | None = None) -> st
             action = decision.chosen_action
 
             if action not in outcome_cache:
-                outcome_cache[action] = ground_truth.sample_outcome(
+                # Deterministic outcome — same (seed, scenario_idx, action) always gives same uniform,
+                # so later scenarios are not perturbed by earlier policy choices.
+                p = ground_truth.true_probability(
                     category, action, float(amount),
                     days_overdue=0, previous_contacts=0,
-                    subscription_linked=subscription_linked, rng=rng,
+                    subscription_linked=subscription_linked,
                 )
+                uniform = _deterministic_uniform(seed, i, action)
+                outcome_cache[action] = uniform < p
             recovered = outcome_cache[action]
 
             db.add(ExperimentCase(
@@ -116,18 +157,55 @@ def summarize_run(db: Session, run_id: str) -> dict:
     Aggregates the persisted ExperimentCase rows for one run into the
     metrics the dashboard shows: per-arm revenue at risk/recovered,
     recovery rate, contacts, escalations, incremental ₹, and the action
-    distribution per arm.
+    distribution per arm. Also exposes evaluation provenance.
     """
     rows = db.query(ExperimentCase).filter(ExperimentCase.run_id == run_id).all()
     if not rows:
         return {"run_id": run_id, "found": False}
 
+    # Historical provenance — read from ExperimentRun persisted at run time
+    run_meta = db.query(ExperimentRun).filter(ExperimentRun.run_id == run_id).first()
+    if run_meta is not None:
+        eval_weight = float(run_meta.friction_weight) if run_meta.friction_weight is not None else 18.0
+        eval_profile = run_meta.adaptive_profile
+        model_version = run_meta.model_version
+        model_fingerprint = run_meta.model_fingerprint
+        feature_schema_version = run_meta.feature_schema_version
+        resolved_seed = run_meta.resolved_seed
+        scenario_count_persisted = run_meta.scenario_count
+        model_available = True
+        reproducibility_note = "historical provenance is immutable as of run time"
+    else:
+        # Fallback for pre-migration runs without ExperimentRun row
+        try:
+            model_info = scorer.get_model_info()
+        except Exception:
+            model_info = {"available": False}
+        from app.core.config import settings as _settings_fallback
+        from app.ml.friction import get_friction_weight as _get_weight_fallback
+        _, eval_weight = _get_weight_fallback(_settings_fallback.ADAPTIVE_POLICY_PROFILE, _settings_fallback.ADAPTIVE_FRICTION_WEIGHT)
+        eval_profile = _settings_fallback.ADAPTIVE_POLICY_PROFILE
+        model_version = model_info.get("model_version")
+        model_fingerprint = model_info.get("fingerprint_short") or model_info.get("fingerprint")
+        feature_schema_version = model_info.get("feature_schema_version")
+        resolved_seed = None
+        scenario_count_persisted = len(rows) // 2
+        model_available = model_info.get("available")
+        reproducibility_note = "pre-migration run without persisted ExperimentRun — seed/profile not durable"
     summary = {
         "run_id": run_id,
         "found": True,
         "case_count": len(rows),
-        "scenario_count": len(rows) // 2,
+        "scenario_count": scenario_count_persisted,
         "created_at": min(r.created_at for r in rows).isoformat() if rows else None,
+        "resolved_seed": resolved_seed,
+        "evaluation_friction_weight": eval_weight,
+        "evaluation_friction_profile": eval_profile,
+        "model_version": model_version,
+        "model_fingerprint": model_fingerprint,
+        "feature_schema_version": feature_schema_version,
+        "model_available": model_available,
+        "reproducibility_note": reproducibility_note,
         "arms": {},
     }
 
@@ -138,6 +216,11 @@ def summarize_run(db: Session, run_id: str) -> dict:
         contacts = sum(r.contacts_made or 0 for r in arm_rows)
         escalations = sum(1 for r in arm_rows if r.chosen_action == "ESCALATE")
         action_cost = sum(ACTION_COST[r.chosen_action] for r in arm_rows if r.chosen_action)
+        friction = sum(BASE_FRICTION.get(r.chosen_action, 0) for r in arm_rows if r.chosen_action)
+        waits = sum(1 for r in arm_rows if r.chosen_action == "WAIT")
+        native_waits = sum(1 for r in arm_rows if r.chosen_action == "WAIT_FOR_NATIVE_RETRY")
+        payment_links = sum(1 for r in arm_rows if r.chosen_action == "CREATE_PAYMENT_LINK")
+        ptps = sum(1 for r in arm_rows if r.chosen_action == "COLLECT_PROMISE_TO_PAY")
 
         action_dist: dict[str, int] = {}
         for r in arm_rows:
@@ -150,9 +233,20 @@ def summarize_run(db: Session, run_id: str) -> dict:
             "amount_recovered": recovered_amt,
             "recovery_rate": (recovered_amt / at_risk) if at_risk else 0.0,
             "contacts": contacts,
+            "contact_rate": (contacts / len(arm_rows) * 100) if arm_rows else 0.0,
+            "contacts_per_100": (contacts / len(arm_rows) * 100) if arm_rows else 0.0,
             "escalations": escalations,
+            "waits": waits,
+            "native_retry_waits": native_waits,
+            "payment_links": payment_links,
+            "ptps": ptps,
             "action_cost_proxy": action_cost,
+            "friction_score": friction,
             "realized_net_value": recovered_amt - action_cost,
+            "realized_policy_utility": recovered_amt - action_cost - (summary["evaluation_friction_weight"] * friction),
+            "utility": recovered_amt - action_cost - friction,  # deprecated alias (weight 1.0) — use realized_policy_utility
+            "evaluation_friction_weight": summary["evaluation_friction_weight"],
+            "recovered_per_contact": (recovered_amt / contacts) if contacts else (recovered_amt if recovered_amt else 0.0),
             "action_distribution": action_dist,
         }
 

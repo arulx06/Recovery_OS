@@ -27,19 +27,23 @@ import joblib
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import roc_auc_score, log_loss, accuracy_score
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score, accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
 from app.ml.synthetic_history import generate_history
+from app.ml.features import FEATURE_COLUMNS as CANONICAL_FEATURE_COLUMNS, FEATURE_SCHEMA_VERSION
+from app.ml.manifest import build_manifest, write_manifest, MODEL_VERSION
 
 ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts"
 MODEL_PATH = ARTIFACT_DIR / "model.joblib"
+MANIFEST_PATH = ARTIFACT_DIR / "manifest.json"
 
+# Keep local aliases for backward compat but canonical is features.py
 CATEGORICAL_FEATURES = ["failure_category", "action_taken"]
 NUMERIC_FEATURES = ["amount", "days_overdue", "previous_contacts", "subscription_linked", "hour", "day_of_week"]
-FEATURE_COLUMNS = CATEGORICAL_FEATURES + NUMERIC_FEATURES
+FEATURE_COLUMNS = CANONICAL_FEATURE_COLUMNS
 TARGET_COLUMN = "recovered"
 
 
@@ -77,13 +81,37 @@ def train(n: int = 30000, seed: int = 42, save: bool = True, save_path: Path = M
         "roc_auc": float(roc_auc_score(y_test, proba)),
         "log_loss": float(log_loss(y_test, proba)),
         "accuracy": float(accuracy_score(y_test, preds)),
+        "brier_score": float(brier_score_loss(y_test, proba)),
         "base_rate": float(y.mean()),
     }
 
     if save:
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump({"pipeline": pipeline, "feature_columns": FEATURE_COLUMNS, "seed": seed}, save_path)
+        # Include versioned bundle for compatibility checks
+        bundle = {
+            "pipeline": pipeline,
+            "feature_columns": FEATURE_COLUMNS,
+            "seed": seed,
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "model_version": MODEL_VERSION,
+        }
+        joblib.dump(bundle, save_path)
         metrics["saved_to"] = str(save_path)
+        # Manifest beside artifact — provenance, not secrets
+        from app.services.policy_engine import ALL_ACTIONS
+        manifest = build_manifest(
+            model_path=save_path,
+            feature_columns=FEATURE_COLUMNS,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            training_seed=seed,
+            training_n=len(X_train),
+            holdout_n=len(X_test),
+            metrics={k: v for k, v in metrics.items() if k not in ("saved_to",)},
+            action_set=ALL_ACTIONS,
+        )
+        write_manifest(MANIFEST_PATH, manifest)
+        metrics["manifest"] = str(MANIFEST_PATH)
+        metrics["fingerprint"] = manifest.get("fingerprint_short")
 
     return metrics
 
@@ -100,5 +128,13 @@ if __name__ == "__main__":
           f"(base recovery rate in holdout: {metrics['base_rate']:.1%})\n")
     print(f"  ROC-AUC:   {metrics['roc_auc']:.4f}")
     print(f"  Log loss:  {metrics['log_loss']:.4f}")
+    print(f"  Brier:     {metrics['brier_score']:.4f}")
     print(f"  Accuracy:  {metrics['accuracy']:.4f}  (at 0.5 threshold)")
+    # Calibration note: Brier ~0.18-0.20 is reasonable for this synthetic task;
+    # no Platt/isotonic calibration applied — synthetic holdout size and
+    # histogram GBDT's native probability ranking are sufficient for utility ordering.
+    if "fingerprint" in metrics:
+        print(f"  Fingerprint: {metrics['fingerprint']}  (model {MODEL_VERSION}, schema {FEATURE_SCHEMA_VERSION})")
     print(f"\nSaved model to {metrics['saved_to']}")
+    if "manifest" in metrics:
+        print(f"Saved manifest to {metrics['manifest']}")

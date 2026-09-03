@@ -21,7 +21,9 @@ import joblib
 import pandas as pd
 
 from app.ml.costs import ACTION_COST
-from app.ml.train import MODEL_PATH, FEATURE_COLUMNS
+from app.ml.features import FEATURE_COLUMNS, FEATURE_SCHEMA_VERSION, validate_feature_row
+from app.ml.manifest import MANIFEST_VERSION, MODEL_VERSION, compute_fingerprint, load_manifest, validate_manifest
+from app.ml.train import MANIFEST_PATH, MODEL_PATH
 
 _cache: dict | None = None
 
@@ -51,9 +53,6 @@ def _load(model_path: Path | None = None) -> dict:
 
     try:
         with warnings.catch_warnings():
-            # joblib 1.4 uses a NumPy shape assignment deprecated by NumPy 2.5.
-            # Loading is verified by scorer equivalence tests; defer the
-            # dependency upgrade without flooding every inference test.
             warnings.filterwarnings(
                 "ignore",
                 message="Setting the shape on a NumPy array has been deprecated.*",
@@ -65,9 +64,74 @@ def _load(model_path: Path | None = None) -> dict:
         raise ModelNotTrainedError(f"Could not load trained model at {model_path}") from exc
     if not isinstance(bundle, dict) or "pipeline" not in bundle:
         raise ModelNotTrainedError(f"Invalid trained model bundle at {model_path}")
+    # Validate bundle compatibility — feature schema and pipeline presence
+    feature_cols = bundle.get("feature_columns")
+    if feature_cols and feature_cols != FEATURE_COLUMNS:
+        # Allow older bundles that still have same columns but different order? Require exact match for safety.
+        if set(feature_cols) != set(FEATURE_COLUMNS):
+            raise ModelNotTrainedError(f"Model feature_columns mismatch: {feature_cols} vs {FEATURE_COLUMNS}")
+    # Fingerprint for provenance
+    try:
+        bundle["fingerprint"] = compute_fingerprint(model_path)
+        bundle["fingerprint_short"] = bundle["fingerprint"][:8]
+    except Exception:
+        bundle["fingerprint"] = None
+        bundle["fingerprint_short"] = None
+    # Manifest compatibility if present
+    manifest_path = MANIFEST_PATH if model_path == MODEL_PATH else model_path.parent / "manifest.json"
+    manifest = load_manifest(manifest_path)
+    if manifest is not None:
+        ok, reason = validate_manifest(manifest, FEATURE_SCHEMA_VERSION, list(ACTION_COST.keys()))
+        if not ok:
+            raise ModelNotTrainedError(f"Manifest incompatible: {reason}")
+        bundle["manifest"] = manifest
+        # Prefer manifest fingerprint
+        if manifest.get("fingerprint"):
+            bundle["fingerprint"] = manifest["fingerprint"]
+            bundle["fingerprint_short"] = manifest.get("fingerprint_short")
+    # Smoke test: model must expose predict_proba and return valid probability
+    pipeline = bundle.get("pipeline")
+    if not hasattr(pipeline, "predict_proba"):
+        raise ModelNotTrainedError("Model pipeline missing predict_proba — incompatible artifact")
+    try:
+        test_row = pd.DataFrame([{
+            "failure_category": "UNKNOWN",
+            "action_taken": "WAIT",
+            "amount": 1000.0,
+            "days_overdue": 0.0,
+            "previous_contacts": 0,
+            "subscription_linked": False,
+            "hour": 12,
+            "day_of_week": 2,
+        }])[FEATURE_COLUMNS]
+        proba = pipeline.predict_proba(test_row)[0, 1]
+        if not (0.0 <= float(proba) <= 1.0) or not (float(proba) == float(proba)):  # NaN check
+            raise ModelNotTrainedError(f"Model returned invalid probability: {proba}")
+    except ModelNotTrainedError:
+        raise
+    except Exception as exc:
+        raise ModelNotTrainedError(f"Model smoke test failed: {exc}") from exc
     bundle["_cache_key"] = cache_key
     _cache = bundle
     return bundle
+
+
+def get_model_info(model_path: Path | None = None) -> dict:
+    """Sanitized model provenance for Decision/health — no absolute paths."""
+    try:
+        bundle = _load(model_path)
+    except ModelNotTrainedError as exc:
+        return {"available": False, "reason": str(exc)}
+    manifest = bundle.get("manifest") or {}
+    return {
+        "available": True,
+        "model_version": bundle.get("model_version") or manifest.get("model_version") or MODEL_VERSION,
+        "feature_schema_version": bundle.get("feature_schema_version") or manifest.get("feature_schema_version") or FEATURE_SCHEMA_VERSION,
+        "fingerprint": bundle.get("fingerprint"),
+        "fingerprint_short": bundle.get("fingerprint_short"),
+        "trained_at": manifest.get("trained_at"),
+        "metrics": manifest.get("metrics"),
+    }
 
 
 def predict_recovery_probability(
@@ -82,7 +146,7 @@ def predict_recovery_probability(
     bundle = _load(model_path)
     pipeline = bundle["pipeline"]
 
-    row = pd.DataFrame([{
+    row_dict = {
         "failure_category": category,
         "action_taken": action,
         "amount": amount,
@@ -91,9 +155,14 @@ def predict_recovery_probability(
         "subscription_linked": subscription_linked,
         "hour": hour,
         "day_of_week": day_of_week,
-    }])[FEATURE_COLUMNS]
+    }
+    validate_feature_row(row_dict)
+    row = pd.DataFrame([row_dict])[FEATURE_COLUMNS]
 
-    return float(pipeline.predict_proba(row)[0, 1])
+    proba = float(pipeline.predict_proba(row)[0, 1])
+    if not (0.0 <= proba <= 1.0) or proba != proba:  # NaN
+        raise ModelNotTrainedError(f"Model returned invalid probability {proba}")
+    return proba
 
 
 def score_action(context: dict, action: str, model_path: Path | None = None) -> dict:
@@ -118,6 +187,9 @@ def rank_actions(context: dict, allowed_actions: list[str], model_path: Path | N
     Scores every action in allowed_actions and returns them sorted by
     expected_value, highest first. Doesn't know or care why an action is
     or isn't in allowed_actions — that's the guardrail engine's job.
+
+    This is the legacy revenue-first ranker (p*amount - cost). New code
+    should use rank_actions_with_friction for friction-aware utility.
     """
     if not allowed_actions:
         return []
@@ -144,17 +216,57 @@ def rank_actions(context: dict, allowed_actions: list[str], model_path: Path | N
             }
             for action in non_stop_actions
         ])[FEATURE_COLUMNS]
+        # Validate canonical schema parity
+        for r in rows.to_dict(orient="records"):
+            validate_feature_row(r)
         predicted = bundle["pipeline"].predict_proba(rows)[:, 1]
         probabilities.update(zip(non_stop_actions, map(float, predicted)))
 
     amount = float(context["amount"])
-    scored = [
-        {
+    scored = []
+    for action in allowed_actions:
+        p = probabilities[action]
+        if not (0.0 <= p <= 1.0) or p != p:
+            raise ModelNotTrainedError(f"Invalid p_recovery {p} for {action}")
+        scored.append({
             "action": action,
-            "p_recovery": probabilities[action],
+            "p_recovery": p,
             "cost": ACTION_COST[action],
-            "expected_value": probabilities[action] * amount - ACTION_COST[action],
-        }
-        for action in allowed_actions
-    ]
+            "expected_value": p * amount - ACTION_COST[action],
+        })
     return sorted(scored, key=lambda s: s["expected_value"], reverse=True)
+
+
+def rank_actions_with_friction(
+    context: dict,
+    allowed_actions: list[str],
+    friction_scores: dict[str, float],
+    friction_weight: float,
+    model_path: Path | None = None,
+) -> list[dict]:
+    """Friction-aware utility ranker — canonical for live adaptive policy.
+
+    utility = p*amount - cost - friction_weight * friction_score
+    All scoring is batched (one predict_proba call).
+    """
+    if not allowed_actions:
+        return []
+    unknown = set(allowed_actions) - set(ACTION_COST)
+    if unknown:
+        raise ValueError(f"Missing action cost for: {', '.join(sorted(unknown))}")
+
+    base_ranked = rank_actions(context, allowed_actions, model_path=model_path)
+    # Enrich with friction and utility
+    enriched = []
+    for entry in base_ranked:
+        action = entry["action"]
+        friction = float(friction_scores.get(action, 0.0))
+        utility = entry["expected_value"] - float(friction_weight) * friction
+        enriched.append({
+            **entry,
+            "friction_score": friction,
+            "friction_weight": float(friction_weight),
+            "utility": utility,
+            "expected_recovered_value": entry["p_recovery"] * float(context["amount"]),
+        })
+    return sorted(enriched, key=lambda s: s["utility"], reverse=True)

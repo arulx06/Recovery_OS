@@ -34,7 +34,7 @@ from app.models import RevenueCase, AuditEvent, PaymentEvent, Action, PromiseToP
 from app.core.config import settings
 from app.core.time import end_of_local_day_utc, utc_now, utc_to_local
 from app.services.failure_diagnosis import classify_failure
-from app.services import policy_engine, llm_client, ptp_extractor
+from app.services import llm_client, policy_dispatcher, policy_engine, ptp_extractor
 
 FAILURE_EVENTS = {"payment.failed", "subscription.halted"}
 # payment.captured / subscription.charged carry the original failed
@@ -188,7 +188,7 @@ def _diagnose(db: Session, case: RevenueCase, entity: dict):
             {"failure_category": category, "previous_category": previous_category},
         )
 
-    policy_engine.decide(db, case)
+    policy_dispatcher.decide_for_case(db, case)
 
 
 def handle_event(db: Session, payment_event: PaymentEvent, event_type: str, payload: dict) -> RevenueCase | None:

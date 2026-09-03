@@ -157,7 +157,8 @@ def _complete_wait(action_id: str, now) -> str:
                 detail={"action_id": action.id, "action_type": action.action_type},
             ))
             db.flush()
-            policy_engine.decide(db, case, now=now)
+            from app.services import policy_dispatcher
+            policy_dispatcher.decide_for_case(db, case, now=now)
             outcome = "executed"
         db.commit()
     if case_id:

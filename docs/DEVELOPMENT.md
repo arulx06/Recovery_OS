@@ -36,7 +36,7 @@ recoveryos/
 │   │   │   ├── policy_engine.py       # guardrails + baseline; ACTION_TO_STATE; CATEGORY_ACTION_PREFERENCE
 │   │   │   ├── razorpay_client.py     # Payment Links — simulated or Test Mode
 │   │   │   ├── action_executor.py     # SCHEDULED → EXECUTED / FAILED (+ CustomerMessage)
-│   │   │   ├── ml_policy.py           # adaptive scorer — offline only, guarded
+│   │   │   ├── ml_policy.py           # friction-aware adaptive — live via dispatcher, guarded + manifest
 │   │   │   ├── llm_client.py          # draft + extract — simulated or Anthropic
 │   │   │   ├── ptp_extractor.py       # validates extraction before PromiseToPay
 │   │   │   ├── ptp_followup.py        # exact linked-promise completion
@@ -205,6 +205,15 @@ Before adding a test that needs the trained model, accept a `trained_model_path`
 - Persist sanitized failure categories, not raw provider exceptions — use `_sanitize_link()` and truncated `sanitize_provider_error()`.
 - Any schema or status change must update `scripts/reconcile_actions.py`, `scripts/reconcile_payment_links.py`, `GET /cases/{id}`, runtime tests, and canonical docs.
 
+### Future policy/model change rules
+
+- **Feature schema compatibility:** `app/ml/features.py:FEATURE_SCHEMA_VERSION` gates `scorer._load` + manifest validation; bumping it requires retraining and a new `model_version`. Never silently add a feature to `train.py` without updating `features.py` and `MANIFEST_VERSION`.
+- **Manifest versioning:** `app/ml/manifest.py:MANIFEST_VERSION` + `MODEL_VERSION` must be bumped when feature set, action_set, or training semantics change; `scorer.get_model_info` must reflect it for `/health` and `Decision` provenance.
+- **Guardrail reuse:** Adaptive must call `policy_engine.check_action_allowed` and semantic `WAIT_FOR_NATIVE_RETRY` filter — never duplicate guardrails in `ml_policy.py`.
+- **Safe fallback:** Any `scorer` exception must emit `adaptive_fallback` audit and delegate to `policy_engine.decide` in the same transaction; `RECOVERY_POLICY` is startup-loaded, global-at-decision-time, and requires restart to change.
+- **Shadow-first rollout:** New adaptive logic should be validated in `RECOVERY_POLICY=shadow` (baseline executes, `shadow_adaptive_recommendation` audited) before `adaptive` promotion.
+- **No direct side effects from ML:** `ml_policy` may only rank; `action_executor` remains the only caller of `razorpay_client`/`llm_client` via `temporal_runtime`.
+
 ---
 
 ## How to update schema
@@ -308,9 +317,9 @@ docs/DECISIONS.md       — append-only ADRs; phase lead proposes, reviewers app
 
 ## Checklist before opening a PR
 
-- [ ] Tests pass: `cd backend && python -m pytest -q` (292 pass, no external network, no Redis required).
-- [ ] Frontend passes: `cd frontend && npm run lint && npm run build`.
-- [ ] Migrations verify: `cd backend && DATABASE_URL=sqlite:///./ci_migration.db python -m alembic upgrade head` (head `8d6e24f91a73`; this stage uses existing Action fields, no new migration).
+- [ ] Tests pass: `cd backend && python -m pytest -q` (329 pass, no external network, no Redis required; includes shadow/friction/provenance safety).
+- [ ] Frontend passes: `cd frontend && npm run lint && npm run build` (policy/model/friction visible in header/experiment cards).
+- [ ] Migrations verify: `cd backend && DATABASE_URL=sqlite:///./ci_migration.db python -m alembic upgrade head` (head `a1b2c3d4e5f6` decision provenance; downgrade/upgrade fresh verified).
 - [ ] No secrets introduced into diff (`backend/.env`, `frontend/.env` are gitignored — check `.env.example` only); `httpx` calls are mocked in tests, simulation remains default.
 - [ ] Documentation updated per table above; `git diff --check` (whitespace) clean.
 - [ ] Report lists docs changed / intentionally unchanged / reason.

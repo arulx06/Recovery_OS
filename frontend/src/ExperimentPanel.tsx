@@ -20,14 +20,22 @@ function ArmCard({ label, arm }: { label: string; arm: ArmSummary }) {
         <dd className="text-right font-semibold">{formatRupees(arm.amount_recovered)}</dd>
         <dt className="text-gray-500">Recovery rate</dt>
         <dd className="text-right">{(arm.recovery_rate * 100).toFixed(1)}%</dd>
-        <dt className="text-gray-500">Contact actions selected</dt>
-        <dd className="text-right">{arm.contacts}</dd>
+        <dt className="text-gray-500">Contact actions</dt>
+        <dd className="text-right">{arm.contacts} ({(arm.contact_rate ?? 0).toFixed(1)}%)</dd>
+        <dt className="text-gray-500">Friction score</dt>
+        <dd className="text-right">{arm.friction_score ?? "—"}</dd>
         <dt className="text-gray-500">Escalations</dt>
         <dd className="text-right">{arm.escalations}</dd>
         <dt className="text-gray-500">Action cost proxy</dt>
         <dd className="text-right">{formatRupees(arm.action_cost_proxy)}</dd>
         <dt className="text-gray-500">Realized net value</dt>
         <dd className="text-right">{formatRupees(arm.realized_net_value)}</dd>
+        {arm.recovered_per_contact !== undefined && (
+          <>
+            <dt className="text-gray-500">Recovered / contact</dt>
+            <dd className="text-right">{formatRupees(arm.recovered_per_contact ?? 0)}</dd>
+          </>
+        )}
       </dl>
       <div className="mt-3 border-t border-white/10 pt-3">
         <div className="mb-1 text-xs uppercase tracking-wide text-gray-500">Action distribution</div>

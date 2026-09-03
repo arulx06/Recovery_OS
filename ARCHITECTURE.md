@@ -31,7 +31,10 @@ flowchart LR
     CUST[Customer<br/>inbound reply] -- POST /cases/:id/customer-reply --> GW
     GW --> ORCH[Recovery Case<br/>Orchestrator]
     ORCH --> DIAG[Failure Intelligence<br/>Engine]
-    ORCH --> POL[Guardrails +<br/>Policy Engine]
+    ORCH --> DISPATCH[Policy Dispatcher<br/>RECOVERY_POLICY]
+    DISPATCH -- baseline/shadow/adaptive --> POL[Guardrails + Policy]
+    POL -- allowed actions --> ML[Adaptive ML<br/>P*amount - cost - friction]
+    ML --> POL
     POL --> DB
     DB --> RQ[Redis/RQ<br/>ID-only transport]
     RQ --> WORKER[Temporal Runtime<br/>claim / retry / reconcile]
@@ -39,8 +42,7 @@ flowchart LR
     EXEC -- simulated / Test Mode --> RZPAPI[Razorpay Payment Links API<br/>optional]
     EXEC -- stored only --> MSG[CustomerMessage<br/>no delivery transport]
     WORKER --> PTP[Linked PTP Follow-up]
-    POL -. offline/synthetic .-> ML[Adaptive ML Policy<br/>not on live path]
-    ML --> EXP[Experiment Runner<br/>baseline vs adaptive]
+    POL --> EXP[Experiment Runner<br/>baseline vs friction-aware adaptive]
     ORCH --> DB[(PostgreSQL<br/>source of truth)]
     EXP --> DB
     DB --> DASH[React Dashboard]
@@ -57,7 +59,8 @@ flowchart LR
 | Recovery Case Orchestrator `app/services/orchestrator.py` | [IMPLEMENTED] | Owns every `RevenueCase.state` mutation; routes events to diagnosis/policy/recovery/dispute/PTP | No directly — delegates |
 | Guardrail Engine `app/services/policy_engine.py` | [IMPLEMENTED] | Enforce `max_contacts_per_case`, `max_contacts_per_7_days`, `min_contact_interval_hours`, `max_automated_amount`, `max_total_attempts` | No |
 | Baseline Policy `app/services/policy_engine.py:decide` | [IMPLEMENTED] | Pick highest-ranked allowed action for the category (deterministic) | No |
-| Adaptive ML Policy `app/services/ml_policy.py:decide_ml` | [IMPLEMENTED · OFFLINE ONLY] | Score allowed actions by `P(recovery)*amount - cost`; never bypasses guardrails | No — model inference locally |
+| Policy Dispatcher `app/services/policy_dispatcher.py` | [IMPLEMENTED] | Routes `RECOVERY_POLICY=baseline/shadow/adaptive` to correct engine; shadow audits without side effect; adaptive falls back to baseline | No |
+| Adaptive ML Policy `app/services/ml_policy.py:decide_ml` | [IMPLEMENTED · LIVE] | Friction-aware `P*amount - cost - friction_weight*friction`; shares guardrails; provenance + manifest fingerprint | No — model inference locally; `Razorpay` never called directly |
 | Temporal Runtime `app/services/temporal_runtime.py` | [IMPLEMENTED · VERIFIED] | Atomic action claims, wait wake-up, bounded retry, stale-job checks, lease recovery, reconciliation | Delegates provider calls after claim commit |
 | RQ Transport `app/services/task_queue.py`, `app/jobs.py` | [IMPLEMENTED · VERIFIED] | Publish ID-only immediate/delayed jobs after DB commit; Redis is reconstructable | Redis only |
 | Action Executor `app/services/action_executor.py` | [IMPLEMENTED · VERIFIED] | Perform provider calls outside DB transactions and persist final results | Razorpay (Payment Links) and LLM (draft) when enabled |
@@ -222,6 +225,11 @@ erDiagram
         decimal expected_value
         json alternatives
         json guardrails_applied
+        string policy_mode
+        string model_version
+        string model_fingerprint
+        string friction_profile
+        decimal friction_weight
     }
     actions {
         string id PK
@@ -331,51 +339,93 @@ The live publisher and reconciler require `RevenueCase.source=razorpay`. Experim
 
 ---
 
-## Policy / guardrail boundary
+## Policy / guardrail boundary (adaptive is live — guardrails remain authoritative)
 
 ```
-policy_engine.decide(case)                       ml_policy.decide_ml(case)
-  │  state must be DIAGNOSED                        │  state must be DIAGNOSED
-  ▼                                                 ▼
-  max_total_attempts? → STOP                        same stopping rule
-  │                                                 │
-  candidates = CATEGORY_ACTION_PREFERENCE[cat]      allowed = {a | guardrail allows a}
-  │                                                 │
-  filter by check_action_allowed                    scorer.rank_actions(context, allowed)
-  │  first allowed wins                             │  P(recovery)*amount - cost, ranked
-  ▼                                                 ▼
-  record_decision → Action(SCHEDULED)               record_decision (same call)
-  │  state → ACTION_TO_STATE[action]                │  same ACTION_TO_STATE mapping
+                        Diagnosis
+                            │
+                    Stopping Rule (STOP deterministic)
+                            │
+                        Guardrails
+                            │
+                    Policy Dispatcher (RECOVERY_POLICY)
+                     /      |       \
+              baseline   shadow   adaptive
+                 │         │         │
+                 │         │         ▼
+                 │         │    ML + Utility
+                 │         │    P*amount - cost - friction_weight*friction
+                 │         │         │
+                 └─────────┴─────────┘
+                            │
+                        Decision
+                            │
+                         Action
+                            │
+                      temporal RQ
+                            │
+                    side-effect safety
 ```
 
-- Guardrails are applied **identically** for baseline and adaptive — the adaptive scorer never bypasses them. See `app/services/ml_policy.py:35`.
+```
+policy_engine.decide(case)               ml_policy.decide_ml(case)  [friction-aware]
+  │  DIAGNOSED                               │  DIAGNOSED
+  ▼                                         ▼
+  STOP? → STOP                              STOP? → STOP (deterministic)
+  │                                         │
+  CATEGORY_ACTION_PREFERENCE                ALL_ACTIONS → guardrail filter → semantic filter
+  │                                         (WAIT_FOR_NATIVE_RETRY only if subscription)
+  filter check_action_allowed               scorer.rank_actions_with_friction
+  │                                         (batched, canonical features)
+  first allowed wins                        utility = p*amount - cost - weight*friction
+  │                                         highest utility wins
+  ▼                                         ▼
+  record_decision (policy_mode=baseline)    record_decision (policy_mode=adaptive, provenance)
+```
+
+- Guardrails are applied **identically** for baseline, shadow, and adaptive — adaptive only ranks the `guardrail-allowed` set (see `policy_dispatcher` + `ml_policy._adaptive_choose`). Adaptive cannot bypass `max_contacts`, `cooldown`, `max_automated_amount`, or `max_total_attempts`; baseline fallback via `adaptive_fallback` audit never strands a case in `DIAGNOSED`.
+- Shadow: baseline executes and creates `shadow_adaptive_recommendation` audit with `baseline_chosen` vs `adaptive_suggested`, `fingerprint`, `friction_profile`, `candidates`; no second Decision/Action/queue job.
 - Guardrail defaults (`policy_engine.py:68`): `max_contacts_per_case=3`, `max_contacts_per_7_days=2`, `min_contact_interval_hours=12`, `max_automated_amount=₹25,000`, `max_total_attempts=5`.
 
 ---
 
-## ML boundary
+## ML boundary (live friction-aware adaptive)
 
 ```
-ground_truth.py: BASE_PROBABILITY[(category, action)]  ──┐
-     true_probability(category, action, amount,           │ modulated by amount,
-       days_overdue, previous_contacts, subscription) ◄── │ overdue decay, contact fatigue
+features.py: canonical FEATURE_COLUMNS ──────────────────┐
+  (failure_category, action_taken, amount, days_overdue,  │  ONE pipeline: train, offline eval, live scoring
+   previous_contacts, subscription_linked, hour, dow)     │  LIVE_AVAILABLE or DERIVABLE_FROM_HISTORY only
+                                                          │
+ground_truth.py: BASE_PROBABILITY[(category, action)]  ──┤
+     true_probability(...) modulated by amount/overdue/    │  synthetic only — same as before
+       contact fatigue/subscription                        │
                                                           │
   synthetic_history.py: generate_history(n, seed) ◄───────┤ uniform action sampling
                            │                               │
                      train.py: HistGradientBoosting ◄──────┘  CATEGORICAL: failure_category, action_taken
                               (OneHotEncoder + numeric)        NUMERIC: amount, days_overdue, ...
-                           │  → artifacts/model.joblib         saves {pipeline, feature_columns}
+                           │  → artifacts/model.joblib + manifest.json  (version, fingerprint, metrics, Brier)
+                           │     fingerprint = sha256(model.joblib) — provenance
                            ▼
-         scorer.py: rank_actions(context, allowed) — P(recovery)*amount - cost
+         scorer.py: rank_actions_with_friction — batched, manifest-validated
+           utility = p*amount - cost - friction_weight*friction
                            │
-                  ml_policy.py: decide_ml — guarded, offline only
+              friction.py: BASE_FRICTION + previous_contacts*increment
+                           │  WAIT 0, WAIT_NATIVE 2, CREATE 25, CONTACT 40, PTP 60, ESCALATE 80
+                           │  profiles: revenue_first(4), balanced(18, default), low_friction(45)
                            │
-           experiment_runner.py / evaluate_policies.py — common-random-numbers, synthetic outcomes
+                  ml_policy.py: decide_ml — guarded, dispatch-aware, provenance
+                           │  policy_mode, model_version, fingerprint, friction_profile in Decision
+                           │
+           experiment_runner.py / evaluate_policies.py — common-random-numbers, synthetic, friction metrics
 ```
 
-- **Synthetic-only scope:** `ground_truth.py` is the sole source of `P(recovery | category, action)` labels and of evaluation outcomes. Training against the same simulator that evaluates creates **circularity** — see `docs/ML_AND_EVALUATION.md`.
-- **Not on the live path:** `orchestrator.py` calls `policy_engine.decide`, never `ml_policy.decide_ml`.
-- Cost proxies: `WAIT=0`, `WAIT_FOR_NATIVE_RETRY=0`, `CREATE_PAYMENT_LINK=5`, `CONTACT_CUSTOMER=15`, `COLLECT_PROMISE_TO_PAY=15`, `ESCALATE=50`, `STOP=0` (`app/ml/costs.py:15`). These are not calibrated friction values; recovered value dominates.
+- **One feature pipeline:** `app/ml/features.py` defines `FEATURE_COLUMNS` + `FEATURE_SCHEMA_VERSION=v1`; `train.py` imports it, `scorer.py` validates `validate_feature_row`, and `ml_policy` builds via `build_live_features` — train and live share exact names/semantics.
+- **Synthetic-only scope:** `ground_truth.py` remains synthetic; training against same simulator is circular — see `docs/ML_AND_EVALUATION.md` calibration + offline-policy-evaluation limitation.
+- **Live path:** `orchestrator._diagnose` → `policy_dispatcher.decide_for_case` → `RECOVERY_POLICY=baseline` (default, safe) or `adaptive` (validated manifest + batched scoring) or `shadow` (baseline executes, adaptive audited). Adaptive respects stopping rule and guardrails; `Razorpay` never called directly from policy.
+- **Provenance:** `manifest.json` beside `model.joblib` (`model_version=recovery-v1`, `feature_schema_version`, `fingerprint`, `metrics` incl. Brier, `synthetic_data_notice`); `Decision.policy_mode / model_version / fingerprint / friction_*` plus `decision.alternatives[_provenance]` and `AuditEvent(adaptive_decision / adaptive_fallback / shadow_*)`.
+- **Cost vs friction:** `ACTION_COST` is financial proxy (`WAIT 0 … ESCALATE 50`); `BASE_FRICTION` is customer-intervention score (dimensionless) converted via `friction_weight` (profile-dependent, INR-equivalent). They are not double-counted: guardrails block, friction ranks.
+- **Calibration:** `train.py` reports `ROC-AUC 0.7756, log loss 0.4715, Brier 0.1597` on holdout; no Platt/isotonic calibration applied — synthetic holdout and GBDT native probabilities are sufficient for utility ordering (see `ML_AND_EVALUATION.md`).
 
 ---
 
@@ -426,10 +476,10 @@ ground_truth.py: BASE_PROBABILITY[(category, action)]  ──┐
 
 - **Production Razorpay live-money path [PLANNED]:** Separate credentials, environment gate, and hardened HMAC/secret management.
 - **Message delivery transport [PLANNED]:** Actual SMS/email/WhatsApp dispatch for drafted `CONTACT_CUSTOMER` messages.
-- **Live adaptive policy [PLANNED]:** Replace the baseline `policy_engine.decide` call in `orchestrator._diagnose` with guarded `ml_policy.decide_ml` behind a feature flag, after real outcome logging validates the model.
+- **Observability / explainability UI [PLANNED]:** Promote the minimal `GET /cases/{id}` provenance + `/health` adaptive readout into a polished dashboard (policy mode, fingerprint, friction vs revenue Pareto).
 
 ---
 
 ## Build order
 
-Event pipeline → state machine → guardrails + baseline → real recovery action (Payment Links) → ML policy (offline) → LLM + Promise-to-Pay → measurement dashboard → reliability. Each stage depends on the prior one being trustworthy before the next layer is added. This is historical context for maintainers, not a reopened plan.
+Event pipeline → state machine → guardrails + baseline → real recovery action (Payment Links) → ML policy (friction-aware live via dispatcher, RECOVERY_POLICY) → LLM + Promise-to-Pay → measurement dashboard → reliability. Each stage depends on the prior one being trustworthy before the next layer is added. This is historical context for maintainers, not a reopened plan.

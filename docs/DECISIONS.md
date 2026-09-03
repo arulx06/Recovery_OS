@@ -171,6 +171,62 @@
 
 ---
 
+## ADR-13 — ML ranks safe actions; deterministic guardrails remain authoritative
+
+| Field | Value |
+|-------|-------|
+| **Status** | Accepted and implemented |
+| **Date** | 2026-09-04 |
+| **Context** | Friction-unaware adaptive doubled contacts (`474 vs 253` per 1000 synthetic cases) for `+1.3pp` recovery. Letting ML bypass `max_contacts`/`cooldown`/`max_amount` would trade goodwill for model-favored outreach. |
+| **Decision** | Adaptive scores only the guardrail-allowed set (`policy_engine.check_action_allowed`) plus semantic filter (`WAIT_FOR_NATIVE_RETRY` only if `subscription_linked`). `scorer.rank_actions_with_friction` is batched and `policy_dispatcher` is the single dispatch point; `RECOVERY_POLICY=baseline` (default) never loads the model. |
+| **Why** | Guardrails are merchant-safety, friction is preference ranking — conflating them would hide blocks as huge penalties. Keeping them separate makes `HUMAN_REVIEW` auditable and prevents ML from spending past limits. |
+| **Consequences** | Positive: adaptive cannot bypass hard limits; shadow and adaptive share identical guardrail semantics; fallback remains deterministic. Negative: some model-preferred actions are muted by guardrails (e.g., large amount → `ESCALATE`). |
+| **Reference** | `app/services/ml_policy.py`, `app/services/policy_dispatcher.py`, `app/ml/friction.py`, `tests/test_adaptive_policy.py` |
+
+---
+
+## ADR-14 — Baseline is the default and fallback; shadow is side-effect-free
+
+| Field | Value |
+|-------|-------|
+| **Status** | Accepted and implemented |
+| **Date** | 2026-09-04 |
+| **Context** | New adaptive must not strand cases on model failure, nor require a second Decision/Action that confuses case state. Teams need a safe rollout path that compares without double-sending links. |
+| **Decision** | `RECOVERY_POLICY=baseline` is default and the fallback for `adaptive` on any `ModelNotTrainedError`/`manifest`/`smoke`/`NaN` — emits `adaptive_fallback` audit and delegates to `policy_engine.decide` in the same transaction (never stranded `DIAGNOSED`). `shadow` executes baseline's Decision/Action and only emits `shadow_adaptive_recommendation` (or `shadow_adaptive_error`) audit with `{baseline_chosen, adaptive_suggested, utility, fingerprint, candidates}` — no second Action, queue job, Payment Link, or PTP. |
+| **Why** | One dispatcher centralizes mode checks; orchestrator and `temporal_runtime._complete_wait` both call `policy_dispatcher.decide_for_case` so re-diagnosis and WAIT-wake share the flag. Startup-loaded `RECOVERY_POLICY` requires restart to change — no hot-reload races. |
+| **Consequences** | Positive: `adaptive` degraded is not `degraded` for baseline health; shadow proves no side effects (`tests/test_adaptive_policy.py`); `RECOVERED`/`STOPPED`/`DISPUTED` remain automation-terminal. Negative: shadow recommendations are audit-only until a dedicated timeline UI exists. |
+| **Reference** | `app/services/policy_dispatcher.py`, `app/services/orchestrator.py:191`, `app/services/temporal_runtime.py:160`, `app/models.py:Decision` provenance columns |
+
+---
+
+## ADR-15 — Customer friction is an explicit policy objective, not a hidden cost
+
+| Field | Value |
+|-------|-------|
+| **Status** | Accepted and implemented |
+| **Date** | 2026-09-04 |
+| **Context** | `ACTION_COST = {WAIT 0, CREATE 5, CONTACT 15, PTP 15, ESCALATE 50}` is too small vs `amount` to restrain revenue-first adaptive; tuning it until a benchmark looks good would hide the tradeoff. |
+| **Decision** | Introduce `friction_score` (`BASE_FRICTION: WAIT 0, WAIT_NATIVE 2, CREATE 25, CONTACT 40, PTP 60, ESCALATE 80` plus `+12 per prior contact` for contact types) and `utility = p*amount - cost - weight*friction` with explicit `PROFILE_WEIGHTS = {revenue_first:4, balanced:18 (default), low_friction:45}` INR per point. Dashboards show `recovered`, `cost`, and `friction` separately. |
+| **Why** | Makes intervention frequency a first-class, testable, documentable objective distinct from hard guardrails (`max_contacts`). Weight is a policy preference, not a measured monetary cost — honest about `synthetic_data_notice`. |
+| **Consequences** | Positive: balanced profile recovers `≈+48k` on `500/seed11` with `+19%` contacts (vs old `+87%`) and consistently reduces escalations; low_friction can go below baseline contacts; `recovered_per_contact` is reported. Negative: no weight is empirically optimal; merchant research and real outcome `recovered_per_contact` must set the production profile. |
+| **Reference** | `app/ml/friction.py`, `app/ml/scorer.py:rank_actions_with_friction`, `app/services/ml_policy.py`, `docs/ML_AND_EVALUATION.md: Friction is a first-class objective` |
+
+---
+
+## ADR-16 — Synthetic policy results are not production lift; training and evaluation remain synthetic but honest
+
+| Field | Value |
+|-------|-------|
+| **Status** | Accepted and implemented |
+| **Date** | 2026-09-04 |
+| **Context** | `ground_truth` is the only labeled data; training on it and evaluating on the same assumptions is circular if presented as lift. |
+| **Decision** | Keep synthetic `ground_truth`/`synthetic_history` but document circularity, add Brier score (`0.1597`) and no-calibration rationale, keep one canonical `features.py` pipeline (`FEATURE_SCHEMA_VERSION=v1`) validated at train and serve, require `manifest.json` (`model_version recovery-v1`, `fingerprint` sha256, `synthetic_data_notice`) with fingerprint exposed in `Decision`, `AuditEvent`, `/health`, `/cases/{id}`, and `common-random` matched scenarios. Real validation (temporal split, IPS/DR, controlled rollout) is documented as a roadmap, not implemented. |
+| **Why** | A lower honest metric (e.g., balanced adaptive `-28k` on one seed) is better than a high invalid claim; friction-aware evaluation reports `contacts`, `contact_rate`, `friction`, `recovered_per_contact` alongside `recovered`. |
+| **Consequences** | Positive: `train` prints `ROC-AUC 0.7756, Brier 0.1597, Accuracy 0.7510, fingerprint 75e9cfd6`; `GET /health` shows `model_available` without requiring Razorpay; `train_serve_parity` test guards drift. Negative: synthetic robustness ≠ production validation — still needs logged `Decision` provenance + outcome timestamps for future real learning. |
+| **Reference** | `app/ml/train.py`, `app/ml/scorer.py`, `app/ml/features.py`, `app/ml/manifest.py`, `app/services/experiment_runner.py`, `docs/ML_AND_EVALUATION.md` |
+
+---
+
 ## Proposed template for future ADRs
 
 ```markdown

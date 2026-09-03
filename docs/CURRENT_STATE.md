@@ -10,24 +10,25 @@
 
 | Property | Value |
 |----------|-------|
-| Branch | `feat/payment-link-reconciliation` |
-| Baseline ancestry | Verified hardening baseline (`chore: harden RecoveryOS baseline`, `chore: establish verified RecoveryOS baseline`) + temporal runtime `3debc27` |
-| Backend tests | 292 passed (hermetic, `sqlite://` temp DB, external network and Redis denied) |
+| Branch | `feat/adaptive-recovery-policy` |
+| Baseline ancestry | Verified hardening baseline + temporal runtime `3debc27` + provider reconciliation `1a980d6` |
+| Backend tests | 329 passed (hermetic, `sqlite://` temp DB, external network and Redis denied) |
 | Frontend `npm run build` | PASS |
 | Frontend `npm run lint` (`oxlint`) | PASS |
-| Database | PostgreSQL (required); SQLite for tests/CI |
+| Database | PostgreSQL (required); SQLite for tests/CI — head `a1b2c3d4e5f6` |
 | Redis/RQ | Implemented as reconstructable action transport; PostgreSQL remains authoritative |
-| Model artifact | `backend/app/ml/artifacts/model.joblib` — gitignored, reproduced via `python -m app.ml.train` |
+| Model artifact | `backend/app/ml/artifacts/model.joblib` + `manifest.json` — gitignored, reproduced via `python -m app.ml.train` (recovery-v1, 75e9cfd6, Brier 0.1597) |
 
 > Do not hardcode a commit hash here. The branch name is the stable reference. If a specific hash must be cited for a report, add it locally and do not commit it.
 
 ### How this branch was verified
 
-- `python -m pytest -q` -> 292 passed with socket-denial guard, fake credentials, and `TASK_QUEUE_ENABLED=false` (`conftest.py`).
+- `python -m pytest -q` -> 329 passed with socket-denial guard, fake credentials, and `TASK_QUEUE_ENABLED=false` (`conftest.py`).
 - `npm run build` and `npm run lint` pass on Node 22 / Vite 8.
-- `alembic upgrade head` applies cleanly on SQLite (`ci.yml`) and on local PostgreSQL 16 at revision `8d6e24f91a73` (no new migration — existing Action fields suffice for reconciliation).
+- `alembic upgrade head` applies cleanly on SQLite (`ci.yml`) and on local PostgreSQL 16 at revision `a1b2c3d4e5f6` (adds `Decision` provenance columns).
 - A real Redis/RQ smoke test verified an ID-only `WAIT` job through `app.worker.WindowsWorker`; the default RQ worker is not Windows-compatible.
 - Manual Razorpay TEST MODE path verified independently: `payment.failed` (`card_expired`) → `INVALID_INSTRUMENT` → `CREATE_PAYMENT_LINK` → `plink_*` via `https://api.razorpay.com/v1/payment_links` → `rzp.io` short URL, with `Action.result.simulated == false` and `reference_id == Action.id` when `RAZORPAY_API_ENABLED=true` and `rzp_test_*` credentials are present. Provider reconciliation via `list_payment_links?reference_id=<Action.id>` validated against official docs and mocked tests — genuine `plink_*` found without a second create.
+- Adaptive policy verified: `RECOVERY_POLICY=baseline` (default), `shadow` (baseline executes + `shadow_adaptive_recommendation` audit, no second Action), `adaptive` (friction-aware `P*amount - cost - weight*friction`, provenance, fallback to baseline on model failure). Model manifest `recovery-v1` `75e9cfd6` with Brier 0.1597 is loaded via cached `scorer.get_model_info()` and exposed at `GET /health` and `GET /cases/{id}`.
 
 ---
 
@@ -54,12 +55,15 @@
 | Promise-to-Pay scheduling + follow-up processor | **IMPLEMENTED / VERIFIED** | `app/services/orchestrator.py`, `app/services/ptp_followup.py`, `tests/test_temporal_runtime.py` | Follow-up is linked to one promise and scheduled after the configured merchant-local promise day; no messaging transport exists |
 | Customer message drafting (templated / Anthropic) | **SIMULATED** (default) · **TEST_MODE** when enabled | `app/services/llm_client.py:91`, `app/services/action_executor.py:100` | Stores `CustomerMessage(direction=outbound)` with `channel=simulated|llm`; no SMS/email/WhatsApp transport exists |
 | Customer-reply ingestion (`POST /cases/{id}/customer-reply`) | **IMPLEMENTED / VERIFIED** | `app/routers/cases.py:160`, `tests/test_customer_reply.py` | Handles `promise_to_pay` / `dispute` / `unclear`; respects `REPLYABLE_STATES`; `PROMISE_TO_PAY` → `AWAITING_OUTCOME` + scheduled `FOLLOW_UP_PTP` |
-| Adaptive ML policy (HistGradientBoostingClassifier, expected-value scorer) | **IMPLEMENTED · SYNTHETIC_ONLY · NOT LIVE** | `app/ml/train.py:59`, `app/ml/scorer.py:99`, `app/services/ml_policy.py:49` | Trained on synthetic data from `ground_truth.py`; evaluated offline only; **not called by `orchestrator.handle_event`** (which calls `policy_engine.decide`) |
-| Synthetic training data generator | **IMPLEMENTED / SYNTHETIC_ONLY** | `app/ml/synthetic_history.py:45` | Uniform action sampling to expose all (category, action) pairs to the model |
-| Offline experiment runner (baseline vs adaptive, common-random-numbers) | **IMPLEMENTED / VERIFIED** | `app/services/experiment_runner.py:47`, `tests/test_experiments.py` | Deterministic per `(seed, model)`; up to 5,000 cases per API call |
-| Experiment persistence / API / CSV export | **IMPLEMENTED / VERIFIED** | `app/routers/experiments.py:22`, `tests/test_experiments.py:91` | `ExperimentCase` rows keyed by `run_id`; `GET /experiments/{id}/export.csv` returns header + `count*2` rows |
-| React merchant dashboard | **IMPLEMENTED / PARTIAL** | `frontend/src/App.tsx`, `frontend/src/ExperimentPanel.tsx` | Lists cases + health + experiment runner; `GET /cases/{id}` exists but has **no rendered detail view** |
-| PostgreSQL as authoritative state | **IMPLEMENTED / VERIFIED** | migration `8d6e24f91a73`, `app/models.py`, `app/services/temporal_runtime.py` | `Action` owns schedule, status, claim lease, attempts, and queue metadata; Redis loss is repaired by reconciliation |
+| Live adaptive policy (HistGradientBoostingClassifier, friction-aware utility) | **IMPLEMENTED / VERIFIED** | `app/ml/train.py` + `manifest.json`, `app/ml/scorer.py` (manifest + fingerprint), `app/ml/features.py` (canonical), `app/ml/friction.py`, `app/services/ml_policy.py`, `app/services/policy_dispatcher.py`, `tests/test_adaptive_policy.py` | `RECOVERY_POLICY=baseline` (default), `shadow` (baseline+audited recommendation), `adaptive` (balanced profile `weight 18`); `P*amount - cost - weight*friction` where friction `WAIT 0 … COLLECT 60`; model `recovery-v1` `75e9cfd6` Brier 0.1597; synthetic-only training/evaluation retained |
+| Policy dispatcher + safe fallback | **IMPLEMENTED / VERIFIED** | `app/services/policy_dispatcher.py`, `app/services/ml_policy.py:184`, `tests/test_adaptive_policy.py` | Stopping rule + guardrails remain authoritative; adaptive failure → `adaptive_fallback` audit + baseline `Decision` (never stranded `DIAGNOSED`); incompatible manifest → fallback |
+| Model provenance & fingerprint | **IMPLEMENTED / VERIFIED** | `app/ml/manifest.py`, `app/ml/train.py`, `app/ml/scorer.py:get_model_info`, `app/models.py:Decision` provenance columns, `a1b2c3d4e5f6` | `manifest.json` (`model_version recovery-v1`, `feature_schema v1`, `fingerprint` sha256, `metrics` incl. Brier, `synthetic_data_notice`); `Decision.policy_mode/model_version/fingerprint/friction_*` + `alternatives[_provenance]` + `AuditEvent(adaptive_decision)` + `/health` + `/cases/{id}` |
+| One canonical feature pipeline | **IMPLEMENTED / VERIFIED** | `app/ml/features.py`, `app/ml/scorer.py`, `app/ml/train.py`, `tests/test_adaptive_policy.py::test_train_serve_parity` | Same `FEATURE_COLUMNS` + `validate_feature_row` for train, offline eval, live scoring; hour/day_of_week from decision clock; `LIVE_AVAILABLE` only, no leakage |
+| Synthetic training data generator | **IMPLEMENTED / SYNTHETIC_ONLY** | `app/ml/synthetic_history.py:45` | Uniform action sampling to expose all (category, action) pairs to the model; still synthetic — see `ML_AND_EVALUATION.md` |
+| Friction-aware experiment runner | **IMPLEMENTED / VERIFIED** | `app/services/experiment_runner.py:47`, `tests/test_experiments.py`, `scripts/evaluate_policies.py` | Baseline vs balanced adaptive with `common-random` scenarios; per-arm `friction_score`, `contact_rate`, `recovered_per_contact`, `utility`, `waits`/`payment_links`/`ptps` breakdown |
+| Experiment persistence / API / CSV export | **IMPLEMENTED / VERIFIED** | `app/routers/experiments.py:22`, `tests/test_experiments.py:91` | `ExperimentCase` rows keyed by `run_id`; `GET /experiments/{id}/export.csv` returns header + `count*2` rows; summary now includes `friction_score`/`utility` per arm |
+| React merchant dashboard | **IMPLEMENTED / PARTIAL** | `frontend/src/App.tsx` (policy/model in header), `frontend/src/ExperimentPanel.tsx` (friction/recovered-per-contact), `frontend/src/api.ts` | Health shows `policy`/`model`/`fingerprint`; experiment cards show `contact_rate`, `friction_score`, `recovered_per_contact`; `GET /cases/{id}` provenance still not rendered as dedicated timeline |
+| PostgreSQL as authoritative state | **IMPLEMENTED / VERIFIED** | migration `a1b2c3d4e5f6`, `app/models.py:Decision` provenance, `app/services/temporal_runtime.py` | `Action` owns schedule/claim/attempts; `Decision` owns `policy_mode`/`model_version`/`fingerprint`/`friction_*`; Redis loss is repaired by reconciliation |
 | Redis/RQ delayed-action runtime | **IMPLEMENTED / VERIFIED** | `app/services/task_queue.py`, `app/jobs.py`, `app/worker.py`, `scripts/reconcile_actions.py` | Worker process and `--with-scheduler` must be running; Windows requires `app.worker.WindowsWorker` |
 | Real inbound Razorpay webhooks (production live-money) | **NOT IMPLEMENTED** — `TEST_MODE_ONLY` verified, production explicitly rejected | `app/services/razorpay_client.py:72` rejects non-`rzp_test_*` keys | Webhook verification is provider-shape-agnostic, but the only live API path validated is Test Mode Payment Links |
 | Deployment (public URL, prod DB, secrets rotation) | **PLANNED** | — | No Dockerfile for app, no CI deploy job, no auth on API |
@@ -98,9 +102,7 @@ The request transaction commits `PaymentEvent`, case, decision, and action befor
 
 ## Next planned subsystem
 
-> **LIVE ADAPTIVE POLICY + FRICTION-AWARE DECISIONING — PLANNED, not implemented.**
->
-> With provider-side reconciliation complete, the next major stage wires the offline adaptive ML scorer into real runtime decisions behind a feature flag, retains deterministic baseline fallback, exposes model provenance, redesigns expected utility to penalize customer friction, and improves evaluation methodology. See `docs/DECISIONS.md` and `docs/ML_AND_EVALUATION.md` for the retained limitation (`adaptive synthetic recovery improves but contacts increase substantially`) that this next stage will address.
+No next subsystem is committed. Likely follow-ups are **runtime LLM + customer communication adapter** (turn drafted `CustomerMessage` into real delivery-aware logic with idempotent sends and richer `CustomerMessage` provenance) or **observability / explainability UI** (promote `GET /cases/{id}` `policy_mode`/`friction`/`utility` and `shadow_adaptive_recommendation` audit into a polished timeline). The choice depends on whether the team prioritizes closing the communication loop or making the newly live friction-aware adaptive transparent to merchants. See `docs/DECISIONS.md` and `docs/ML_AND_EVALUATION.md` for the remaining synthetic-evaluation and real-outcome learning gaps that either path must keep honest.
 
 ---
 

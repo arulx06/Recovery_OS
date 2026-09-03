@@ -112,6 +112,11 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
                 "alternatives": d.alternatives,
                 "guardrails_applied": d.guardrails_applied,
                 "explanation": d.explanation,
+                "policy_mode": getattr(d, "policy_mode", None),
+                "model_version": getattr(d, "model_version", None),
+                "model_fingerprint": getattr(d, "model_fingerprint", None),
+                "friction_profile": getattr(d, "friction_profile", None),
+                "friction_weight": float(d.friction_weight) if getattr(d, "friction_weight", None) is not None else None,
                 "created_at": d.created_at.isoformat() if d.created_at else None,
             }
             for d in decisions

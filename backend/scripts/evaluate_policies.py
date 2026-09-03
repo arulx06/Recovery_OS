@@ -31,6 +31,7 @@ no live Razorpay credentials needed. Requires a trained model
 (`python -m app.ml.train` first, if you haven't already).
 """
 import argparse
+import hashlib
 import os
 import random
 import sys
@@ -38,6 +39,11 @@ from collections import Counter
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+
+
+def _deterministic_uniform(seed: int, scenario_idx: int, action: str) -> float:
+    h = hashlib.sha256(f"{seed}:{scenario_idx}:{action}".encode()).hexdigest()
+    return int(h[:8], 16) / 0xFFFFFFFF
 
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -79,29 +85,27 @@ def run(count: int, seed: int):
 
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
-    rng = random.Random(seed)
+    scenario_rng = random.Random(seed)
 
     results = {"baseline": Counter(), "ml": Counter()}
     revenue = {"baseline": {"at_risk": 0.0, "recovered": 0.0}, "ml": {"at_risk": 0.0, "recovered": 0.0}}
     contacts = {"baseline": 0, "ml": 0}
     escalations = {"baseline": 0, "ml": 0}
     action_costs = {"baseline": 0.0, "ml": 0.0}
+    friction_scores = {"baseline": 0.0, "ml": 0.0}
     evaluation_time = datetime(2026, 1, 7, 12, 0, 0)
 
     CONTACT_ACTIONS = policy_engine.CONTACT_ACTIONS
+    from app.ml.friction import BASE_FRICTION
 
     for i in range(count):
-        profile = weighted_profile(rng)
+        profile = weighted_profile(scenario_rng)
         category = profile["failure_category"]
         subscription_linked = "subscription_id" in profile
-        amount = Decimal(rng.choice(AMOUNTS))
+        amount = Decimal(scenario_rng.choice(AMOUNTS))
 
-        # Common random numbers: if both policies choose the SAME action for
-        # this scenario, they must get the SAME sampled outcome — it's the
-        # same underlying case. Without this, two arms picking an identical
-        # action can still show a "difference" that's pure sampling noise,
-        # not a real policy disagreement. Only cases where the policies
-        # actually chose different actions should be able to diverge.
+        # Deterministic outcome — same (seed, scenario_idx, action) always gives same uniform,
+        # so later scenarios are not perturbed by earlier policy choices.
         outcome_cache: dict[str, bool] = {}
         chosen_actions: dict[str, str] = {}
 
@@ -123,11 +127,13 @@ def run(count: int, seed: int):
             chosen_actions[arm] = action
 
             if action not in outcome_cache:
-                outcome_cache[action] = ground_truth.sample_outcome(
+                p = ground_truth.true_probability(
                     category, action, float(amount),
                     days_overdue=0, previous_contacts=0,
-                    subscription_linked=subscription_linked, rng=rng,
+                    subscription_linked=subscription_linked,
                 )
+                uniform = _deterministic_uniform(seed, i, action)
+                outcome_cache[action] = uniform < p
             recovered = outcome_cache[action]
 
             revenue[arm]["at_risk"] += float(amount)
@@ -135,6 +141,7 @@ def run(count: int, seed: int):
                 revenue[arm]["recovered"] += float(amount)
             results[arm][action] += 1
             action_costs[arm] += ACTION_COST[action]
+            friction_scores[arm] += BASE_FRICTION.get(action, 0)
             if action in CONTACT_ACTIONS:
                 contacts[arm] += 1
             if action == "ESCALATE":
@@ -146,6 +153,10 @@ def run(count: int, seed: int):
 
     print(f"Ran {count} matched scenarios per policy (seed={seed})")
     print("SYNTHETIC SIMULATION BENCHMARK - not production Razorpay lift.\n")
+    # Evaluation friction weight is the live balanced weight for display
+    from app.core.config import settings as _settings
+    from app.ml.friction import get_friction_weight as _get_weight
+    _, eval_weight = _get_weight(_settings.ADAPTIVE_POLICY_PROFILE, _settings.ADAPTIVE_FRICTION_WEIGHT)
 
     print(f"{'Metric':<28}{'Baseline':>14}{'ML / Adaptive':>16}")
     print("-" * 58)
@@ -162,9 +173,13 @@ def run(count: int, seed: int):
     row("Revenue recovered (INR)", rec_b, rec_m)
     row("Recovery rate", rec_b / at_risk_b * 100 if at_risk_b else 0, rec_m / at_risk_m * 100 if at_risk_m else 0, fmt="{:.1f}%")
     row("Contact actions selected", contacts["baseline"], contacts["ml"], fmt="{:d}")
+    row("Contact rate", contacts["baseline"]/count*100 if count else 0, contacts["ml"]/count*100 if count else 0, fmt="{:.1f}%")
+    row("Friction score", friction_scores["baseline"], friction_scores["ml"], fmt="{:,.0f}")
     row("Escalations", escalations["baseline"], escalations["ml"], fmt="{:d}")
     row("Action cost proxy (INR)", action_costs["baseline"], action_costs["ml"])
     row("Realized net value (INR)", rec_b - action_costs["baseline"], rec_m - action_costs["ml"])
+    row("Realized policy utility", rec_b - action_costs["baseline"] - eval_weight*friction_scores["baseline"], rec_m - action_costs["ml"] - eval_weight*friction_scores["ml"])
+    row("Recovered / contact (INR)", rec_b / contacts["baseline"] if contacts["baseline"] else 0, rec_m / contacts["ml"] if contacts["ml"] else 0)
 
     incremental = rec_m - rec_b
     print("-" * 58)

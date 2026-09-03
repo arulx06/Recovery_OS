@@ -4,6 +4,16 @@ export type HealthResponse = {
   status: string;
   service: string;
   database: string;
+  redis?: string;
+  queue?: string;
+  adaptive_policy?: {
+    configured_mode: string;
+    model_available: boolean;
+    model_version: string | null;
+    fingerprint: string | null;
+    fingerprint_short: string | null;
+    feature_schema_compatible: boolean;
+  };
 };
 
 export type RevenueCase = {
@@ -24,8 +34,17 @@ export type ArmSummary = {
   amount_recovered: number;
   recovery_rate: number;
   contacts: number;
+  contact_rate?: number;
+  contacts_per_100?: number;
   escalations: number;
+  waits?: number;
+  native_retry_waits?: number;
+  payment_links?: number;
+  ptps?: number;
   action_cost_proxy: number;
+  friction_score?: number;
+  utility?: number;
+  recovered_per_contact?: number;
   realized_net_value: number;
   action_distribution: Record<string, number>;
 };
