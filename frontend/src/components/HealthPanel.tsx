@@ -1,16 +1,19 @@
 import type { DashboardSummary, HealthResponse } from "../api";
-import { Badge, Card, SectionTitle } from "./ui";
+import { Badge, Card, humanize } from "./ui";
 
-function readiness(pill: string) {
-  if (pill === "connected" || pill === "ok") return "READY";
-  if (pill === "disabled") return "DISABLED";
-  return "DEGRADED";
+function statusTone(status: string | undefined) {
+  if (["ok", "connected", "ready", "recoveryos"].includes((status ?? "").toLowerCase())) return "success" as const;
+  if (["disabled", "unavailable"].includes((status ?? "").toLowerCase())) return "muted" as const;
+  return "warning" as const;
 }
 
-function toneFor(status: string) {
-  if (status === "connected" || status === "ok" || status === "READY") return "success" as const;
-  if (status === "disabled") return "muted" as const;
-  return "warning" as const;
+function RuntimeRow({ name, status, detail }: { name: string; status: string; detail: string }) {
+  return (
+    <div className="flex items-center justify-between gap-4 border-b border-[#242d3b] py-3 last:border-0 last:pb-0 first:pt-0">
+      <div><div className="text-sm font-semibold text-slate-200">{name}</div><div className="mt-0.5 text-xs text-slate-500">{detail}</div></div>
+      <Badge tone={statusTone(status)}>{humanize(status)}</Badge>
+    </div>
+  );
 }
 
 export function HealthPanel({
@@ -23,100 +26,53 @@ export function HealthPanel({
   healthError: boolean;
 }) {
   if (healthError) {
-    return (
-      <Card>
-        <SectionTitle>System health</SectionTitle>
-        <div className="text-sm text-red-300">Backend unreachable — check that uvicorn is running on {":8000"} and DATABASE_URL is valid.</div>
-      </Card>
-    );
+    return <Card><h2 className="text-xl font-semibold">Runtime unavailable</h2><p className="mt-2 text-sm text-rose-300">The frontend cannot reach the RecoveryOS API.</p></Card>;
   }
-  if (!health && !dashboard) {
-    return (
-      <Card>
-        <SectionTitle>System health</SectionTitle>
-        <div className="text-sm text-gray-500">Loading health…</div>
-      </Card>
-    );
-  }
-  const db = health?.database ?? dashboard?.database ?? "—";
-  const redis = health?.redis ?? dashboard?.queue.status ?? "—";
-  const queue = health?.queue ?? dashboard?.queue.name ?? "—";
-  const policy = health?.adaptive_policy ?? (dashboard ? { configured_mode: dashboard.policy_mode, model_available: dashboard.model.available, model_version: dashboard.model.version, fingerprint: dashboard.model.fingerprint, fingerprint_short: dashboard.model.fingerprint_short, feature_schema_compatible: dashboard.model.feature_schema_compatible } : undefined);
+  if (!health && !dashboard) return <Card><div className="text-sm text-slate-500">Loading runtime state…</div></Card>;
+
+  const policy = health?.adaptive_policy;
   const llm = health?.llm ?? dashboard?.llm;
-  const razorpay = dashboard?.razorpay;
-
+  const queueStatus = dashboard?.queue.enabled ? dashboard.queue.status : "disabled";
   return (
-    <Card>
-      <SectionTitle subtitle="PostgreSQL is authoritative; Redis/RQ is reconstructable transport">System health & readiness</SectionTitle>
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        {[
-          { label: "Backend", value: health?.status ?? "unknown", sub: health?.service ?? "recoveryos-backend" },
-          { label: "Database", value: readiness(db), sub: db },
-          { label: "Redis", value: readiness(redis), sub: redis },
-          { label: "Queue", value: dashboard?.queue.enabled ? queue : "disabled", sub: dashboard?.queue.enabled ? "enabled" : "TASK_QUEUE_ENABLED=false" },
-        ].map((r) => (
-          <div key={r.label} className="rounded-lg border border-white/10 bg-black/20 p-3">
-            <div className="text-[11px] uppercase tracking-wide text-gray-500">{r.label}</div>
-            <div className="mt-1 flex items-center gap-2">
-              <Badge tone={toneFor(r.value)} size="sm">{r.value}</Badge>
-            </div>
-            <div className="mt-1 text-[11px] text-gray-500 truncate">{r.sub}</div>
-          </div>
-        ))}
+    <div className="space-y-5" data-testid="system-page">
+      <div>
+        <p className="text-sm font-semibold uppercase tracking-[0.16em] text-blue-300">System</p>
+        <h1 className="mt-2 text-3xl font-semibold tracking-tight text-white">Operational state and authority</h1>
+        <p className="mt-2 text-sm text-slate-400">Detailed infrastructure, policy, and integration metadata lives here, away from the recovery workflow.</p>
       </div>
 
-      <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
-        <div className="rounded-lg border border-white/10 bg-black/20 p-3">
-          <div className="text-xs font-medium text-gray-300">Adaptive policy</div>
-          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-            <Badge tone="info">{policy?.configured_mode ?? "baseline"}</Badge>
-            {policy?.model_available ? (
-              <Badge tone="success">model ready</Badge>
-            ) : (
-              <Badge tone="muted">model unavailable → baseline fallback</Badge>
-            )}
-          </div>
-          <div className="mt-2 text-[11px] text-gray-500">
-            model: {policy?.model_version ?? "none"} {policy?.fingerprint_short ? `· ${policy?.fingerprint_short}` : ""}
-          </div>
-          {dashboard?.friction && (
-            <div className="mt-1 text-[11px] text-gray-500">
-              friction: {dashboard.friction.profile} × {dashboard.friction.weight}
-            </div>
-          )}
-          <div className="mt-1 text-[11px] text-gray-600">fingerprint identifies exact trained artifact</div>
-        </div>
+      <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-4">
+        <Card>
+          <div className="mb-5"><div className="text-sm font-semibold uppercase tracking-[0.12em] text-slate-500">Runtime</div><h2 className="mt-1 text-xl font-semibold text-white">Core services</h2></div>
+          <RuntimeRow name="API" status={health?.status ?? "unknown"} detail={health?.service ?? "RecoveryOS backend"} />
+          <RuntimeRow name="PostgreSQL" status={health?.database ?? dashboard?.database ?? "unknown"} detail="Application source of truth" />
+          <RuntimeRow name="Redis" status={health?.redis ?? "unknown"} detail="Reconstructable transport" />
+          <RuntimeRow name="Worker queue" status={queueStatus ?? "unknown"} detail={health?.queue ?? dashboard?.queue.name ?? "recoveryos"} />
+        </Card>
 
-        <div className="rounded-lg border border-white/10 bg-black/20 p-3">
-          <div className="text-xs font-medium text-gray-300">Razorpay integration</div>
-          <div className="mt-2">
-            <Badge tone={razorpay?.mode_label?.includes("TEST MODE") ? "success" : razorpay?.simulated ? "muted" : "warning"}>{razorpay?.mode_label ?? "unavailable"}</Badge>
-          </div>
-          <div className="mt-2 text-[11px] text-gray-500">
-            {razorpay?.simulated ? "SIMULATED LINK — https://rzp.io/simulated/plink_sim_* — not live money" : razorpay?.is_test_mode ? "Razorpay Test Mode — genuine plink_* + rzp.io URL — TEST MODE ≠ production" : "—"}
-          </div>
-          <div className="mt-1 text-[11px] text-gray-600">Provider truth via Razorpay webhooks</div>
-        </div>
+        <Card>
+          <div className="mb-5"><div className="text-sm font-semibold uppercase tracking-[0.12em] text-slate-500">Decision system</div><h2 className="mt-1 text-xl font-semibold text-white">Policy and scoring</h2></div>
+          <RuntimeRow name="Policy mode" status={dashboard?.policy_mode ?? policy?.configured_mode ?? "baseline"} detail="Baseline, shadow, or adaptive" />
+          <RuntimeRow name="Recovery model" status={policy?.model_available ?? dashboard?.model.available ? "ready" : "unavailable"} detail={`${policy?.model_version ?? dashboard?.model.version ?? "No model"} · ${policy?.fingerprint_short ?? dashboard?.model.fingerprint_short ?? "no fingerprint"}`} />
+          <RuntimeRow name="Friction profile" status="ready" detail={`${dashboard?.friction.profile ?? "—"} · weight ${dashboard?.friction.weight ?? "—"}`} />
+        </Card>
 
-        <div className="rounded-lg border border-white/10 bg-black/20 p-3">
-          <div className="text-xs font-medium text-gray-300">Customer intelligence (LLM)</div>
-          <div className="mt-2 flex flex-wrap gap-1.5">
-            {llm?.enabled ? (
-              <>
-                <Badge tone="success">{llm.provider}/{llm.model ?? "—"}</Badge>
-                <Badge tone={llm.message_drafting === "available" ? "success" : llm.message_drafting === "disabled" ? "muted" : "warning"}>draft: {llm.message_drafting}</Badge>
-                <Badge tone={llm.ptp_extraction === "available" ? "success" : llm.ptp_extraction === "disabled" ? "muted" : "warning"}>PTP: {llm.ptp_extraction}</Badge>
-              </>
-            ) : (
-              <Badge tone="muted">disabled — deterministic fallback</Badge>
-            )}
+        <Card>
+          <div className="mb-5"><div className="text-sm font-semibold uppercase tracking-[0.12em] text-slate-500">External integrations</div><h2 className="mt-1 text-xl font-semibold text-white">Provider boundaries</h2></div>
+          <RuntimeRow name="Razorpay" status={dashboard?.razorpay.is_test_mode ? "ready" : dashboard?.razorpay.simulated ? "disabled" : "unavailable"} detail={dashboard?.razorpay.mode_label ?? "Unavailable"} />
+          <RuntimeRow name="Language model" status={llm?.enabled ? "ready" : "disabled"} detail={llm?.enabled ? `${llm.provider} · ${llm.model ?? "model"}` : "Deterministic fallback active"} />
+          <div className="mt-4 rounded-lg bg-slate-800/50 px-3 py-3 text-xs leading-relaxed text-slate-400">Razorpay events establish payment truth. The optional LLM assists language only.</div>
+        </Card>
+
+        <Card>
+          <div className="mb-5"><div className="text-sm font-semibold uppercase tracking-[0.12em] text-slate-500">Safety</div><h2 className="mt-1 text-xl font-semibold text-white">Demo boundaries</h2></div>
+          <div className="space-y-3">
+            {["Razorpay Test Mode only", "Messages remain DRAFT / NOT SENT", "Synthetic evaluation data", "Deterministic guardrails are authoritative"].map((item) => (
+              <div key={item} className="flex items-start gap-3 text-sm text-slate-300"><span className="mt-0.5 text-emerald-300">✓</span><span>{item}</span></div>
+            ))}
           </div>
-          <div className="mt-2 text-[11px] text-gray-500">
-            drafts: DRAFT / NOT SENT — manual only · prompt: {llm?.prompt_versions.message_draft ?? "message-v1"} / {llm?.prompt_versions.ptp_extraction ?? "ptp-v1"}
-          </div>
-          <div className="mt-1 text-[11px] text-gray-600">LLM never controls money moves</div>
-        </div>
+        </Card>
       </div>
-    </Card>
+    </div>
   );
 }

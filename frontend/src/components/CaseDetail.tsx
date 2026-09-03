@@ -1,16 +1,26 @@
 import { useState } from "react";
-import type { CaseDetail } from "../api";
-import { Badge, Card, SectionTitle, EmptyState, formatRupees, formatDate } from "./ui";
+import type { CandidateScore, CaseDetail, DecisionInspector, TimelineEvent } from "../api";
+import {
+  Badge,
+  Card,
+  EmptyState,
+  actionLabel,
+  failureLabel,
+  formatDate,
+  formatRupees,
+  humanize,
+  stateLabel,
+  stateTone,
+} from "./ui";
 
-function StateBadge({ state }: { state: string }) {
-  const tone = state === "RECOVERED" ? "success" : state === "HUMAN_REVIEW" ? "warning" : state === "DISPUTED" || state === "STOPPED" ? "danger" : state === "WAITING" ? "info" : "neutral";
-  return <Badge tone={tone as never}>{state}</Badge>;
-}
-
-function ActionBadge({ action }: { action: string | null }) {
-  if (!action) return <span className="text-gray-600">—</span>;
-  return <Badge tone="info">{action}</Badge>;
-}
+type GuardrailValue = {
+  limit?: number;
+  used?: number;
+  pass?: boolean;
+  hours?: number;
+  amount?: number;
+  next_allowed_at?: string | null;
+};
 
 function CopyId({ id }: { id: string }) {
   const [copied, setCopied] = useState(false);
@@ -19,426 +29,357 @@ function CopyId({ id }: { id: string }) {
       onClick={() => {
         navigator.clipboard.writeText(id);
         setCopied(true);
-        setTimeout(() => setCopied(false), 1200);
+        window.setTimeout(() => setCopied(false), 1200);
       }}
-      className="font-mono text-[11px] text-gray-500 hover:text-gray-300"
+      className="text-xs font-medium text-slate-500 hover:text-slate-200"
       title="Copy full ID"
     >
-      {id.slice(0, 8)}… {copied ? "copied" : ""}
+      {copied ? "Copied" : `Case ${id.slice(0, 8)}`}
     </button>
   );
 }
 
-export function CaseDetailView({ detail }: { detail: CaseDetail | null }) {
-  const [showRaw, setShowRaw] = useState(false);
-  if (!detail) {
-    return (
-      <Card>
-        <EmptyState title="Select a case to inspect" description="Click any row in the case list to open the decision inspector, timeline, and provider truth." />
-      </Card>
-    );
-  }
+function actionReason(action: string | null, detail: CaseDetail): string {
+  if (detail.human_review_reason) return "An untrusted customer reply failed deterministic validation. Recovery is paused for human review, and no payment state was changed.";
+  if (action === "WAIT") return "This looks temporary. Waiting avoids an unnecessary customer interruption while keeping a durable recovery schedule.";
+  if (action === "WAIT_FOR_NATIVE_RETRY") return "Razorpay already has a native retry path, so RecoveryOS waits instead of creating duplicate customer work.";
+  if (action === "CREATE_PAYMENT_LINK" && detail.failure_category === "INVALID_INSTRUMENT") return "The current payment instrument is no longer valid. A fresh payment path is the best allowed intervention.";
+  if (action === "CREATE_PAYMENT_LINK") return "Another direct retry may fail again. A Payment Link offers a recoverable path with less friction than contacting the customer.";
+  if (action === "CONTACT_CUSTOMER") return "The customer can resolve this authentication failure, and contact is within the configured safety limits.";
+  if (action === "COLLECT_PROMISE_TO_PAY") return "A structured payment commitment is more useful than another blind retry.";
+  if (action === "ESCALATE") return "Automation cannot safely resolve this case, so RecoveryOS routes it to an operator.";
+  if (action === "STOP") return "Stopping is safer than another low-value or disallowed recovery attempt.";
+  return detail.failure_explanation.category_meaning;
+}
 
-  const latestInspector = detail.decision_inspectors[detail.decision_inspectors.length - 1] ?? null;
-  const hasAdaptive = detail.decision_inspectors.some((d) => d.is_adaptive);
-  const sumRecovered = detail.state === "RECOVERED";
+function blockedReasonLabel(reason: string | null): string {
+  if (!reason) return "Guardrail restriction";
+  if (/semantic|infeasible|failure/i.test(reason)) return "Not compatible with this failure";
+  if (/cooldown/i.test(reason)) return "Contact cooldown active";
+  if (/amount/i.test(reason)) return "Above automation amount limit";
+  if (/contact/i.test(reason)) return "Contact limit reached";
+  if (/attempt/i.test(reason)) return "Attempt budget exhausted";
+  return humanize(reason);
+}
 
+function CaseHero({ detail, inspector }: { detail: CaseDetail; inspector: DecisionInspector | null }) {
+  const chosenAction = inspector?.chosen_action ?? detail.decisions.at(-1)?.chosen_action ?? null;
   return (
-    <div className="space-y-4">
-      {/* Header overview */}
-      <Card>
-        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-          <div>
-            <div className="flex items-center gap-2">
-              <h2 className="text-lg font-semibold tracking-tight">Case {detail.id.slice(0, 8)}</h2>
-              <CopyId id={detail.id} />
-              <Badge tone={detail.source === "razorpay" ? "neutral" : "muted"} size="sm">{detail.source}</Badge>
-            </div>
-            <div className="mt-2 flex flex-wrap items-center gap-2">
-              <StateBadge state={detail.state} />
-              <Badge tone="muted" size="sm">{detail.failure_category ?? "UNKNOWN"}</Badge>
-              <ActionBadge action={latestInspector?.chosen_action ?? detail.decisions[detail.decisions.length - 1]?.chosen_action ?? null} />
-              {detail.provider_truth.mode_label && <Badge tone={detail.provider_truth.simulated ? "muted" : "success"} size="sm">{detail.provider_truth.mode_label}</Badge>}
-              {sumRecovered && <Badge tone="success">RECOVERED — provider truth</Badge>}
-            </div>
-            <div className="mt-2 text-xs text-gray-500">
-              created {formatDate(detail.created_at)} · updated {formatDate(detail.updated_at)} · razorpay payment <span className="font-mono text-gray-400">{detail.razorpay_payment_id ?? "—"}</span>
-              {detail.razorpay_subscription_id && <span> · subscription <span className="font-mono">{detail.razorpay_subscription_id}</span></span>}
-            </div>
+    <Card padding="p-0" className="overflow-hidden" data-testid="case-hero">
+      <div className="grid lg:grid-cols-[1.15fr_0.85fr]">
+        <div className="px-7 py-6 lg:px-8">
+          <div className="flex items-center gap-3">
+            <CopyId id={detail.id} />
+            <span className="h-1 w-1 rounded-full bg-slate-600" />
+            <span className="text-xs text-slate-500">Updated {formatDate(detail.updated_at)}</span>
           </div>
-          <div className="rounded-lg border border-white/10 bg-black/20 p-3 text-right">
-            <div className="text-[11px] uppercase tracking-wide text-gray-500">Amount</div>
-            <div className="text-xl font-semibold">{formatRupees(detail.amount)} <span className="text-sm font-normal text-gray-500">{detail.currency}</span></div>
-            <div className="mt-1 text-xs text-gray-500">
-              policy <span className="font-mono text-gray-300">{latestInspector?.policy_mode ?? "baseline"}</span>
-              {latestInspector?.is_adaptive && latestInspector.model_provenance.model_version ? ` · ${latestInspector.model_provenance.model_version} ${latestInspector.model_provenance.model_fingerprint?.slice(0, 8) ?? ""}` : ""}
-            </div>
-            {detail.adaptive_fallback && <div className="mt-1 text-xs text-amber-300">Adaptive fallback → baseline</div>}
+          <div className="mt-5 flex flex-wrap items-end gap-x-5 gap-y-2">
+            <div className="text-4xl font-semibold tracking-tight text-white">{formatRupees(detail.amount)}</div>
+            <div className="pb-1 text-base text-slate-400">revenue at risk</div>
+          </div>
+          <div className="mt-5">
+            <div className="text-sm font-semibold uppercase tracking-[0.12em] text-slate-500">What failed</div>
+            <h1 className="mt-1 text-2xl font-semibold text-slate-100">{failureLabel(detail.failure_category)}</h1>
+            <p className="mt-2 max-w-3xl text-sm leading-relaxed text-slate-400">{detail.failure_explanation.category_meaning}</p>
           </div>
         </div>
 
-        {detail.human_review_reason && (
-          <div className="mt-3 rounded-lg border border-amber-900/30 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80">
-            <span className="font-medium">Human review:</span> {detail.human_review_reason.event} —{" "}
-            <span className="font-mono text-[11px]">{JSON.stringify(detail.human_review_reason.detail).slice(0, 300)}</span>
-          </div>
-        )}
-      </Card>
-
-      {/* Why payment failed */}
-      <Card>
-        <SectionTitle subtitle="Raw normalized signal → failure category → human meaning (deterministic, no LLM)">Why the payment failed</SectionTitle>
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-          <div className="rounded-lg border border-white/10 bg-black/20 p-3">
-            <div className="text-[11px] uppercase tracking-wide text-gray-500">Raw normalized signal</div>
-            <div className="mt-2 space-y-1 font-mono text-xs">
-              <div>source: <span className="text-gray-300">{detail.failure_explanation.raw_signal.error_source ?? "—"}</span></div>
-              <div>step: <span className="text-gray-300">{detail.failure_explanation.raw_signal.error_step ?? "—"}</span></div>
-              <div>reason: <span className="text-gray-300">{detail.failure_explanation.raw_signal.error_reason ?? "—"}</span></div>
+        <div className="border-t border-[#273244] bg-blue-500/[0.075] px-7 py-6 lg:border-l lg:border-t-0 lg:px-8">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <div className="text-sm font-semibold uppercase tracking-[0.12em] text-blue-300">RecoveryOS chose</div>
+              <div className="mt-2 text-3xl font-semibold tracking-tight text-white">{actionLabel(chosenAction)}</div>
             </div>
-            {Object.keys(detail.failure_explanation.raw_signal_present).length === 0 && <div className="mt-2 text-xs text-gray-600">No specific signal — falls through to UNKNOWN</div>}
+            <Badge tone={stateTone(detail.state)}>{stateLabel(detail.state)}</Badge>
           </div>
-          <div className="rounded-lg border border-sky-900/30 bg-sky-950/20 p-3">
-            <div className="text-[11px] uppercase tracking-wide text-sky-400">Failure category</div>
-            <div className="mt-2">
-              <Badge tone="info">{detail.failure_explanation.failure_category}</Badge>
-              <div className="mt-1 text-xs font-medium text-sky-200">{detail.failure_explanation.category_label}</div>
-            </div>
-            <div className="mt-1 text-[11px] text-gray-500">examples: {detail.failure_explanation.raw_examples}</div>
-          </div>
-          <div className="rounded-lg border border-white/10 bg-black/20 p-3">
-            <div className="text-[11px] uppercase tracking-wide text-gray-500">Human meaning</div>
-            <div className="mt-2 text-sm text-gray-200">{detail.failure_explanation.category_meaning}</div>
-            <div className="mt-2 text-[11px] text-gray-500">Deterministic taxonomy — 8 categories</div>
+          <p className="mt-5 text-base leading-relaxed text-slate-300">{actionReason(chosenAction, detail)}</p>
+          <div className="mt-5 flex flex-wrap items-center gap-3 text-xs text-slate-500">
+            <span>{inspector?.policy_mode ? humanize(inspector.policy_mode) : "Baseline"} policy</span>
+            {inspector?.is_adaptive && <><span>·</span><span>Friction-aware ranking</span></>}
+            {detail.provider_truth.has_payment_link && <><span>·</span><span>Provider reference persisted</span></>}
           </div>
         </div>
-        <div className="mt-3 flex items-center gap-2 text-center text-xs text-gray-500">
-          <span className="flex-1 rounded bg-white/5 py-1">signal</span>
-          <span>→</span>
-          <span className="flex-1 rounded bg-sky-950/30 py-1 text-sky-300">category</span>
-          <span>→</span>
-          <span className="flex-1 rounded bg-white/5 py-1">meaning</span>
+      </div>
+    </Card>
+  );
+}
+
+function candidateRecovery(candidate: CandidateScore): string {
+  if (candidate.allowed === false) return "Blocked";
+  if (candidate.p_recovery == null) return "Not scored";
+  return `${(candidate.p_recovery * 100).toFixed(1)}%`;
+}
+
+function DecisionComparison({ inspector }: { inspector: DecisionInspector | null }) {
+  if (!inspector) {
+    return <Card><EmptyState title="No decision recorded yet" description="This case has been detected but no recovery action has been selected." /></Card>;
+  }
+  return (
+    <Card padding="p-0" className="overflow-hidden" data-testid="decision-comparison">
+      <div className="flex flex-col gap-2 border-b border-[#242d3b] px-6 py-5 md:flex-row md:items-end md:justify-between">
+        <div>
+          <p className="text-sm font-semibold uppercase tracking-[0.14em] text-blue-300">Why this action?</p>
+          <h2 className="mt-1 text-xl font-semibold text-white">Recovery alternatives, compared</h2>
         </div>
-      </Card>
+        <div className="text-xs text-slate-500">Persisted at decision time · {formatDate(inspector.created_at)}</div>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[840px] text-left text-sm">
+          <thead className="bg-[#0e131b] text-xs uppercase tracking-wide text-slate-500">
+            <tr>
+              <th className="px-6 py-3 font-medium">Intervention</th>
+              <th className="px-4 py-3 font-medium">Eligibility</th>
+              <th className="px-4 py-3 font-medium">Recovery chance</th>
+              <th className="px-4 py-3 font-medium">Customer friction</th>
+              <th className="px-4 py-3 font-medium">Net utility</th>
+              <th className="px-6 py-3 text-right font-medium">Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            {inspector.candidates.map((candidate) => (
+              <tr key={candidate.action} className={`border-t border-[#202735] ${candidate.selected ? "bg-blue-500/[0.09] shadow-[inset_3px_0_0_#6c91ff]" : ""}`}>
+                <td className="px-6 py-3.5">
+                  <div className={`font-semibold ${candidate.selected ? "text-white" : "text-slate-200"}`}>{actionLabel(candidate.action)}</div>
+                  {candidate.expected_recovered_value != null && <div className="mt-0.5 text-xs text-slate-500">{formatRupees(candidate.expected_recovered_value)} expected recovery</div>}
+                </td>
+                <td className="px-4 py-3.5">
+                  {candidate.allowed === false ? (
+                    <div><Badge tone="danger" size="sm">Blocked</Badge><div className="mt-1 max-w-48 text-xs text-rose-200/70">{blockedReasonLabel(candidate.blocked_reason)}</div></div>
+                  ) : candidate.allowed === true ? <span className="font-medium text-emerald-300">Eligible</span> : <span className="text-slate-500">Unavailable</span>}
+                </td>
+                <td className="px-4 py-3.5 font-semibold text-slate-200">{candidateRecovery(candidate)}</td>
+                <td className="px-4 py-3.5">
+                  {candidate.friction_score != null ? <><span className="font-semibold text-slate-200">{candidate.friction_score.toFixed(0)}</span>{candidate.friction_penalty != null && <div className="mt-0.5 text-xs text-slate-500">{formatRupees(candidate.friction_penalty)} penalty</div>}</> : <span className="text-slate-500">—</span>}
+                </td>
+                <td className="px-4 py-3.5 font-semibold text-slate-100">{candidate.utility != null ? formatRupees(candidate.utility) : "—"}</td>
+                <td className="px-6 py-3.5 text-right">{candidate.selected ? <Badge tone="info">Selected</Badge> : <span className="text-slate-600">—</span>}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="flex flex-col gap-2 border-t border-[#242d3b] bg-[#0e131b] px-6 py-3 text-xs text-slate-500 md:flex-row md:items-center md:justify-between">
+        <span>{inspector.is_adaptive ? "Net utility = expected recovered value − action cost − customer friction penalty." : "Baseline decisions show eligibility and ordering; model probabilities are intentionally unavailable."}</span>
+        {inspector.explanation && <span className="max-w-2xl text-slate-400">{inspector.explanation}</span>}
+      </div>
+    </Card>
+  );
+}
 
-      {/* Decision Inspector — central feature */}
-      <Card>
-        <SectionTitle subtitle="What RecoveryOS considered — allowed vs blocked — with P(recovery), expected value, friction, utility. Only persisted facts; missing fields show unavailable.">
-          Decision Inspector — central
-        </SectionTitle>
-        {detail.decision_inspectors.length === 0 && <div className="text-sm text-gray-500">No decisions yet — case may be newly detected</div>}
-        {detail.decision_inspectors.map((ins, idx) => (
-          <div key={ins.decision_id} className="mb-4 rounded-lg border border-white/10 bg-black/20 p-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-medium text-gray-300">Decision {idx + 1}</span>
-                <Badge tone={ins.is_adaptive ? "success" : "neutral"} size="sm">{ins.policy_mode ?? "baseline"}</Badge>
-                {ins.is_adaptive && ins.model_provenance.model_version && <span className="text-[11px] font-mono text-gray-500">{ins.model_provenance.model_version} · {ins.model_provenance.model_fingerprint?.slice(0, 8) ?? "—"}</span>}
-                <span className="text-[11px] text-gray-600">{formatDate(ins.created_at)}</span>
-              </div>
-              <ActionBadge action={ins.chosen_action} />
+function GuardrailChecklist({ detail }: { detail: CaseDetail }) {
+  const guardrails = detail.guardrails as Record<string, GuardrailValue | string[]>;
+  const definitions: Array<{ key: string; label: string; value: (item: GuardrailValue) => string }> = [
+    { key: "max_contacts_per_case", label: "Contact limit", value: (item) => `${item.used ?? 0} of ${item.limit ?? "—"} used` },
+    { key: "max_contacts_per_7_days", label: "Seven-day contact cap", value: (item) => `${item.used ?? 0} of ${item.limit ?? "—"} used` },
+    { key: "cooldown", label: "Contact cooldown", value: (item) => item.pass === false ? `${item.hours ?? "—"}-hour window active` : "No active cooldown" },
+    { key: "max_automated_amount", label: "Automation amount", value: (item) => `${formatRupees(item.amount ?? detail.amount)} of ${formatRupees(item.limit)}` },
+    { key: "max_total_attempts", label: "Attempt budget", value: (item) => `${item.used ?? 0} of ${item.limit ?? "—"} used` },
+  ];
+  const rows = definitions.flatMap((definition) => {
+    const item = guardrails[definition.key];
+    return item && !Array.isArray(item) ? [{ ...definition, item }] : [];
+  });
+  return (
+    <Card data-testid="guardrail-checklist">
+      <p className="text-sm font-semibold uppercase tracking-[0.14em] text-slate-500">Safety checks</p>
+      <h2 className="mt-1 text-xl font-semibold text-white">Rules before ranking</h2>
+      <p className="mt-2 text-sm leading-relaxed text-slate-400">Deterministic guardrails decide what the policy is allowed to compare.</p>
+      <div className="mt-5 divide-y divide-[#242d3b]">
+        {rows.map((row) => (
+          <div key={row.key} className="flex items-start gap-3 py-3 first:pt-0 last:pb-0">
+            <span className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-xs font-bold ${row.item.pass === false ? "bg-rose-500/15 text-rose-300" : "bg-emerald-500/15 text-emerald-300"}`} aria-label={row.item.pass === false ? "Blocked" : "Passed"}>{row.item.pass === false ? "!" : "✓"}</span>
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-slate-200">{row.label}</div>
+              <div className="mt-0.5 text-xs text-slate-500">{row.value(row.item)}</div>
             </div>
-            {ins.explanation && <div className="mt-2 text-xs leading-relaxed text-gray-400">“{ins.explanation}”</div>}
-            {ins.fallback && <div className="mt-1 text-xs text-amber-300">{ins.fallback}</div>}
-
-            {/* Candidate table */}
-            <div className="mt-3 overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead className="text-[11px] uppercase text-gray-500">
-                  <tr>
-                    <th className="px-2 py-1">Action</th>
-                    <th className="px-2 py-1">Allowed?</th>
-                    <th className="px-2 py-1">P(recovery)</th>
-                    <th className="px-2 py-1">Exp. value</th>
-                    <th className="px-2 py-1">Cost</th>
-                    <th className="px-2 py-1">Friction</th>
-                    <th className="px-2 py-1">Penalty</th>
-                    <th className="px-2 py-1">Utility</th>
-                    <th className="px-2 py-1">Selected?</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {ins.candidates.map((c) => (
-                    <tr key={c.action} className={`border-t border-white/5 ${c.selected ? "bg-sky-950/20" : ""}`}>
-                      <td className="px-2 py-1.5">
-                        <span className={`rounded px-1.5 py-0.5 font-mono text-[11px] ${c.selected ? "bg-sky-800 text-sky-100" : "bg-white/10 text-gray-300"}`}>{c.action}</span>
-                      </td>
-                      <td className="px-2 py-1.5">
-                        {c.allowed === true ? <Badge tone="success" size="sm">allowed</Badge> : c.allowed === false ? <Badge tone="danger" size="sm">blocked</Badge> : <span className="text-gray-600">unavailable</span>}
-                        {c.blocked_reason && <div className="text-[11px] text-gray-500 max-w-[160px] truncate" title={c.blocked_reason}>{c.blocked_reason}</div>}
-                      </td>
-                      <td className="px-2 py-1.5 font-mono">{c.p_recovery != null ? c.p_recovery.toFixed(3) : <span className="text-gray-600">unavailable</span> as unknown as string}</td>
-                      <td className="px-2 py-1.5 font-mono">{c.expected_recovered_value != null ? formatRupees(c.expected_recovered_value) : c.expected_value != null ? formatRupees(c.expected_value) : <span className="text-gray-600">—</span> as unknown as string}</td>
-                      <td className="px-2 py-1.5 font-mono">{c.cost != null ? formatRupees(c.cost) : <span className="text-gray-600">—</span> as unknown as string}</td>
-                      <td className="px-2 py-1.5 font-mono">{c.friction_score != null ? c.friction_score.toFixed(1) : <span className="text-gray-600">—</span> as unknown as string}</td>
-                      <td className="px-2 py-1.5 font-mono">{c.friction_penalty != null ? formatRupees(c.friction_penalty) : <span className="text-gray-600">—</span> as unknown as string}</td>
-                      <td className="px-2 py-1.5 font-mono font-semibold">{c.utility != null ? formatRupees(c.utility) : <span className="text-gray-600 font-normal">—</span> as unknown as string}</td>
-                      <td className="px-2 py-1.5">{c.selected ? <Badge tone="success" size="sm">✓ selected</Badge> : <span className="text-gray-600">—</span>}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            {!hasAdaptive && <div className="mt-2 text-[11px] text-gray-600">Baseline has no ML probabilities — this is correct. Baseline picks highest-ranked allowed action for this category.</div>}
-            {ins.is_adaptive && (
-              <div className="mt-2 rounded bg-white/5 px-2 py-1.5 text-[11px] leading-relaxed text-gray-500">
-                utility = expected recovered amount − action cost − friction penalty. Selected action has highest utility among allowed. Weight:{" "}
-                <span className="font-mono text-gray-300">{ins.model_provenance.friction_weight ?? "—"} INR/point</span> · profile{" "}
-                <span className="font-mono text-gray-300">{ins.model_provenance.friction_profile ?? "—"}</span>
-              </div>
-            )}
-            {/* Guardrails for this decision */}
-            <div className="mt-2 text-[11px] text-gray-600">Guardrails: {ins.guardrails ? JSON.stringify(ins.guardrails).slice(0, 180) : "—"}</div>
           </div>
         ))}
+        {rows.length === 0 && <div className="text-sm text-slate-500">Safety status is not available for this case.</div>}
+      </div>
+    </Card>
+  );
+}
 
-        {/* Shadow mode visibility */}
-        {detail.shadow && (
-          <div className="rounded-lg border border-amber-900/30 bg-amber-950/20 p-3">
-            <div className="text-xs font-medium text-amber-200">Shadow mode — executed vs recommended</div>
-            <div className="mt-2 grid grid-cols-2 gap-3 text-xs">
-              <div className="rounded bg-black/30 p-2">
-                <div className="text-[11px] uppercase text-gray-500">Executed (baseline)</div>
-                <div className="mt-1"><Badge tone="neutral">{detail.shadow.baseline_chosen ?? "—"}</Badge></div>
-              </div>
-              <div className="rounded bg-amber-900/20 p-2 border border-amber-800/30">
-                <div className="text-[11px] uppercase text-amber-400">Shadow recommendation (adaptive)</div>
-                <div className="mt-1"><Badge tone="warning">{detail.shadow.adaptive_suggested ?? "—"}</Badge></div>
-                {detail.shadow.disagreement && <div className="mt-1 text-[11px] text-amber-300">Adaptive would have selected {detail.shadow.adaptive_suggested} instead of {detail.shadow.baseline_chosen}.</div>}
-              </div>
-            </div>
-            <div className="mt-2 text-[11px] text-gray-500">Shadow emits audit only — no second Action, queue job, or provider call. Candidates: {detail.shadow.candidates ? Object.keys(detail.shadow.candidates).length + " ranked" : "unavailable"}</div>
+function ProviderTruth({ detail, environmentMode }: { detail: CaseDetail; environmentMode?: string }) {
+  if (!detail.provider_truth.has_payment_link) return null;
+  const mode = detail.provider_truth.mode_label && detail.provider_truth.mode_label !== "unavailable" ? detail.provider_truth.mode_label : environmentMode;
+  return (
+    <Card data-testid="provider-truth">
+      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-sm font-semibold uppercase tracking-[0.14em] text-emerald-300">Provider truth</p>
+            {mode && <Badge tone="success">{mode}</Badge>}
           </div>
-        )}
-      </Card>
+          <h2 className="mt-2 text-xl font-semibold text-white">Razorpay Payment Link</h2>
+          <p className="mt-2 max-w-3xl text-sm leading-relaxed text-slate-400">The durable Action ID is the provider reference. RecoveryOS validates the provider response before adoption; only provider evidence can mark the case recovered.</p>
+        </div>
+        <div className="min-w-72 rounded-lg bg-[#0b1017] px-4 py-3">
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-xs text-slate-500">Action status</span>
+            <Badge tone={detail.provider_truth.status === "EXECUTED" ? "success" : "neutral"}>{stateLabel(detail.provider_truth.status)}</Badge>
+          </div>
+          {detail.provider_truth.short_url && <a href={detail.provider_truth.short_url} target="_blank" rel="noreferrer" className="mt-3 block truncate text-sm font-medium text-blue-300 underline decoration-blue-400/40 underline-offset-4">{detail.provider_truth.short_url}</a>}
+          {detail.state === "RECOVERED" && <div className="mt-3 text-sm font-semibold text-emerald-300">Payment confirmed by Razorpay</div>}
+        </div>
+      </div>
+    </Card>
+  );
+}
 
-      {/* Guardrail visibility + Friction */}
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-        <Card>
-          <SectionTitle subtitle="Computed from current case/contact state at read time — AI cannot bypass">Current guardrail status</SectionTitle>
-          {(() => {
-            const g = detail.guardrails as Record<string, { limit?: number; used?: number; pass?: boolean; next_allowed_at?: string | null; hours?: number }>;
-            if (!g || Object.keys(g).length === 0) return <div className="text-xs text-gray-500">unavailable for this case</div>;
-            const rows: Array<[string, { limit?: unknown; used?: unknown; pass?: boolean; next_allowed_at?: string | null; hours?: number }]> = Object.entries(g);
+function CustomerConversation({ detail }: { detail: CaseDetail }) {
+  if (detail.messages.length === 0 && detail.promises_to_pay.length === 0 && !detail.human_review_reason) return null;
+  return (
+    <Card padding="p-0" className="overflow-hidden" data-testid="customer-conversation">
+      <div className="border-b border-[#242d3b] px-6 py-5">
+        <p className="text-sm font-semibold uppercase tracking-[0.14em] text-blue-300">Customer interaction</p>
+        <h2 className="mt-1 text-xl font-semibold text-white">Conversation and Promise to Pay</h2>
+        <p className="mt-1 text-sm text-slate-400">Language can assist interpretation. Deterministic validation decides what becomes workflow state.</p>
+      </div>
+      {detail.human_review_reason && (
+        <div className="border-b border-amber-500/20 bg-amber-500/[0.07] px-6 py-3 text-sm text-amber-100">
+          <span className="font-semibold">Safety intervention:</span> untrusted instructions were rejected and the case was routed to human review. No promise or payment outcome was created.
+        </div>
+      )}
+      <div className="grid gap-0 lg:grid-cols-[1.08fr_0.92fr]">
+        <div className="space-y-4 px-6 py-5 lg:border-r lg:border-[#242d3b]">
+          {detail.messages.map((message) => {
+            const outbound = message.direction === "outbound";
             return (
-              <div className="space-y-2">
-                {rows.map(([k, v]) => (
-                  <div key={k} className="flex items-center justify-between rounded border border-white/10 bg-black/20 px-2 py-1.5 text-xs">
-                    <span className="text-gray-400">{k.replaceAll("_", " ")}</span>
-                    <span className="flex items-center gap-2">
-                      {v.pass === true ? <Badge tone="success" size="sm">PASS</Badge> : v.pass === false ? <Badge tone="danger" size="sm">BLOCKED</Badge> : <Badge tone="muted" size="sm">—</Badge>}
-                      <span className="font-mono text-[11px] text-gray-500">
-                        {v.used !== undefined && v.limit !== undefined ? `${v.used} / ${v.limit}` : v.limit !== undefined ? `limit ${v.limit}` : ""}
-                        {v.hours ? ` · ${v.hours}h cooldown` : ""}
-                      </span>
-                    </span>
+              <div key={message.id} className={`flex ${outbound ? "justify-start" : "justify-end"}`}>
+                <div className={`max-w-[85%] ${outbound ? "" : "text-right"}`}>
+                  <div className="mb-1.5 flex items-center gap-2 text-xs text-slate-500">
+                    <span className="font-semibold text-slate-300">{outbound ? "RecoveryOS" : "Customer"}</span>
+                    {message.status && <Badge tone={message.status === "DRAFT" ? "warning" : "success"} size="sm">{message.status === "DRAFT" ? "Draft · not sent" : stateLabel(message.status)}</Badge>}
                   </div>
-                ))}
-                <div className="text-[11px] text-gray-600">Current eligibility, not a reconstruction of prior decisions. Decision-time guardrails remain in each persisted Decision Inspector above.</div>
+                  <div className={`rounded-lg px-4 py-3 text-left text-sm leading-relaxed ${outbound ? "bg-slate-800/80 text-slate-200" : "bg-blue-500/15 text-blue-50"}`}>{message.body}</div>
+                </div>
               </div>
             );
-          })()}
-        </Card>
-
-        <Card>
-          <SectionTitle subtitle="Current contact state applied to the fixed friction formula">Current friction surface</SectionTitle>
-          <div className="text-xs text-gray-400">Profile: <span className="font-mono text-gray-200">{detail.friction.profile}</span> {detail.friction.weight != null ? `· weight ${detail.friction.weight}` : "· unavailable"}</div>
-          {detail.friction.weight == null && <div className="mt-1 text-[11px] text-gray-600">Baseline has no friction weighting — this is correct.</div>}
-          <div className="mt-2 space-y-1">
-            {detail.friction.components
-              .sort((a, b) => a.total_friction - b.total_friction)
-              .slice(0, 6)
-              .map((c) => (
-                <div key={c.action} className="flex items-center justify-between rounded bg-white/[0.03] px-2 py-1 text-xs">
-                  <span className="font-mono text-[11px] text-gray-300">{c.action}</span>
-                  <span className="font-mono text-[11px] text-gray-500">
-                    base {c.base} {c.previous_contacts ? `+ ${c.previous_contacts}×${c.contact_increment}` : ""} = {c.total_friction} {c.friction_penalty != null ? `· penalty ${formatRupees(c.friction_penalty)}` : ""}
-                  </span>
-                </div>
-              ))}
-          </div>
-          {detail.friction.chosen_action_actual && (
-            <div className="mt-2 rounded bg-sky-950/20 px-2 py-1.5 text-[11px] text-sky-200">
-              Chosen {String((detail.friction.chosen_action_actual as Record<string, unknown>).action ?? "")} — friction {String((detail.friction.chosen_action_actual as Record<string, unknown>).friction_score ?? "—")} × {String(latestInspector?.model_provenance.friction_weight ?? "—")} → penalty{" "}
-              {formatRupees(((detail.friction.chosen_action_actual as Record<string, unknown>).friction_penalty as number) ?? null)} · utility{" "}
-              {formatRupees(((detail.friction.chosen_action_actual as Record<string, unknown>).utility as number) ?? null)}
-            </div>
-          )}
-          <div className="mt-2 text-[11px] leading-relaxed text-gray-500">This surface is recomputed at read time, not historical decision-time evidence. Persisted candidate friction and utility remain in the Decision Inspector. WAIT has low friction — doing nothing can be valuable.</div>
-        </Card>
-      </div>
-
-      {/* Timeline */}
-      <Card>
-        <SectionTitle subtitle="Chronological journey — derived from PaymentEvent, Decision, Action, CustomerMessage, PromiseToPay, AuditEvent. No fabricated events.">Recovery timeline</SectionTitle>
-        {detail.timeline.length === 0 ? (
-          <div className="text-xs text-gray-500">No timeline events yet</div>
-        ) : (
-          <div className="relative pl-6">
-            <div className="absolute left-2 top-0 bottom-0 w-px bg-white/10" />
-            <div className="space-y-3">
-              {detail.timeline.slice(0, 60).map((ev, i) => (
-                <div key={i} className="relative">
-                  <div className={`absolute left-[-22px] top-1 h-2 w-2 rounded-full ${ev.severity === "success" ? "bg-emerald-500" : ev.severity === "warning" ? "bg-amber-500" : ev.severity === "error" ? "bg-red-500" : "bg-gray-500"}`} />
-                  <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
-                    <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <div className="text-xs font-medium text-gray-200">{ev.title}</div>
-                        <div className="mt-0.5 text-xs text-gray-500">{ev.description}</div>
-                      </div>
-                      <span className="whitespace-nowrap text-[11px] text-gray-600">{ev.timestamp ? formatDate(ev.timestamp) : ""}</span>
-                    </div>
-                    <div className="mt-1 flex gap-1">
-                      <Badge tone="muted" size="sm">{ev.type}</Badge>
-                      <Badge tone="muted" size="sm">{ev.category}</Badge>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-            {detail.timeline.length > 60 && <div className="mt-2 text-xs text-gray-600">+{detail.timeline.length - 60} more events — see audit trail</div>}
-          </div>
-        )}
-      </Card>
-
-      {/* Temporal runtime + Provider truth + Customer intelligence in grid */}
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-        <Card>
-          <SectionTitle subtitle="SCHEDULED → EXECUTING → EXECUTED · bounded retries · reconciliation">Temporal runtime</SectionTitle>
-          {detail.actions.length === 0 ? (
-            <div className="text-xs text-gray-500">No actions yet</div>
-          ) : (
-            <div className="space-y-2">
-              {detail.actions.map((a) => (
-                <div key={a.id} className="rounded border border-white/10 bg-black/20 p-2">
-                  <div className="flex items-center justify-between">
-                    <span className="font-mono text-xs text-gray-200">{a.action_type}</span>
-                    <Badge tone={a.status === "EXECUTED" ? "success" : a.status === "FAILED" ? "danger" : a.status === "SCHEDULED" ? "info" : a.status === "CANCELLED" ? "muted" : "neutral"} size="sm">{a.status}</Badge>
-                  </div>
-                  <div className="mt-1 grid grid-cols-2 gap-1 text-[11px] text-gray-500">
-                    <span>scheduled: {a.scheduled_for ? formatDate(a.scheduled_for) : "—"}</span>
-                    <span>executed: {a.executed_at ? formatDate(a.executed_at) : "—"}</span>
-                    <span>attempts: {a.attempt_count}/{a.max_attempts}</span>
-                    <span>queue: {a.queue_job_id ? a.queue_job_id.slice(0, 16) + "…" : "—"}</span>
-                  </div>
-                  {a.last_error && <div className="mt-1 text-[11px] text-amber-300">last error: {a.last_error.slice(0, 180)}</div>}
-                  {a.result && <div className="mt-1 text-[11px] font-mono text-gray-600 truncate">{JSON.stringify(a.result).slice(0, 180)}</div>}
-                </div>
-              ))}
-            </div>
-          )}
-        </Card>
-
-        <Card>
-          <SectionTitle subtitle="Razorpay is provider-authoritative truth">Razorpay / Provider truth</SectionTitle>
-          {!detail.provider_truth.has_payment_link ? (
-            <div className="text-xs text-gray-500">No Payment Link for this case</div>
-          ) : (
-            <div className="space-y-2 text-xs">
-              <div className="flex items-center gap-2">
-                <Badge tone={detail.provider_truth.simulated ? "muted" : "success"}>{detail.provider_truth.mode_label ?? "unavailable"}</Badge>
-                {detail.provider_truth.reconciled && <Badge tone="info" size="sm">reconciled</Badge>}
-                <Badge tone={detail.provider_truth.status === "EXECUTED" ? "success" : "neutral"} size="sm">{detail.provider_truth.status}</Badge>
-              </div>
-              <div className="rounded bg-black/20 p-2 font-mono text-[11px] leading-relaxed">
-                <div>link id: <span className="text-sky-300">{detail.provider_truth.payment_link_id ?? "—"}</span></div>
-                <div>reference_id: <span className="text-gray-300">{String(detail.provider_truth.reference_id ?? "—").slice(0, 20)}</span></div>
-                <div>short_url: {detail.provider_truth.short_url ? <a href={detail.provider_truth.short_url} target="_blank" rel="noreferrer" className="text-sky-400 underline">{detail.provider_truth.short_url}</a> : <span className="text-gray-500">unavailable</span>}</div>
-                <div>amount: {detail.provider_truth.result?.amount != null ? `${String(detail.provider_truth.result.amount)} paise` : "—"} · currency {String(detail.provider_truth.result?.currency ?? "—")}</div>
-              </div>
-              <div className="text-[11px] text-gray-500">Provider reconciliation via <span className="font-mono">GET ?reference_id=Action.id</span> — validated before adoption. Only <span className="font-mono">payment_link.paid</span> webhook moves to RECOVERED.</div>
-              {detail.state === "RECOVERED" && <div className="rounded bg-emerald-950/30 px-2 py-1 text-emerald-300">Recovered at {formatDate(detail.updated_at)} — provider truth</div>}
-            </div>
-          )}
-        </Card>
-      </div>
-
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-        <Card>
-          <SectionTitle subtitle="Outbound drafts are DRAFT / NOT SENT — manual only · LLM never invents amount/link">Customer intelligence</SectionTitle>
-          {detail.messages.length === 0 ? (
-            <div className="text-xs text-gray-500">No customer messages yet</div>
-          ) : (
-            <div className="space-y-2">
-              {detail.messages.map((m) => (
-                <div key={m.id} className="rounded border border-white/10 bg-black/20 p-2">
-                  <div className="flex items-center gap-2">
-                    <Badge tone={m.direction === "outbound" ? "info" : "neutral"} size="sm">{m.direction}</Badge>
-                    <Badge tone={m.status === "DRAFT" ? "warning" : m.status === "RECEIVED" ? "success" : "muted"} size="sm">{m.status ?? m.direction}</Badge>
-                    <span className="text-[11px] text-gray-500">{m.generation_method ?? "—"} {m.llm_provider ? `· ${m.llm_provider}/${m.llm_model ?? ""}` : ""} · {m.prompt_version ?? ""}</span>
-                  </div>
-                  <div className="mt-1 rounded bg-white/5 p-2 text-sm leading-relaxed text-gray-200 whitespace-pre-wrap break-words">{m.body}</div>
-                  {m.extracted && <div className="mt-1 font-mono text-[11px] text-gray-500">extracted: {JSON.stringify(m.extracted).slice(0, 220)}</div>}
-                  <div className="mt-1 text-[11px] text-gray-600">{formatDate(m.created_at)} · channel {m.channel ?? "—"}</div>
-                </div>
-              ))}
-            </div>
-          )}
-        </Card>
-
-        <Card>
-          <SectionTitle subtitle="PENDING → KEPT / BROKEN / SUPERSEDED — linked follow-up after merchant-local day">Promise-to-Pay</SectionTitle>
-          {detail.promises_to_pay.length === 0 ? (
-            <div className="text-xs text-gray-500">No promises yet</div>
-          ) : (
-            <div className="space-y-2">
-              {detail.promises_to_pay.map((p) => (
-                <div key={p.id} className="rounded border border-white/10 bg-black/20 p-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm font-medium">{formatRupees(p.promised_amount)} <span className="text-xs font-normal text-gray-500">by {p.promised_date ? formatDate(p.promised_date) : "—"}</span></span>
-                    <Badge tone={p.status === "PENDING" ? "info" : p.status === "KEPT" ? "success" : p.status === "BROKEN" ? "danger" : "muted"}>{p.status}</Badge>
-                  </div>
-                  <div className="mt-1 text-[11px] text-gray-500">
-                    {p.extraction_method ?? "—"} · {p.llm_provider ?? "deterministic"} {p.llm_model ? `· ${p.llm_model}` : ""} · prompt {p.prompt_version ?? "ptp-v1"} · amount method {p.amount_method ?? "—"} · conf {p.confidence ?? "—"} · {p.reasoning_code ?? ""}
-                  </div>
-                  {p.source_message_id && <div className="mt-1 font-mono text-[11px] text-gray-600">source message {p.source_message_id.slice(0, 8)}</div>}
-                  {(() => {
-                    const linkedAction = detail.actions.find((a) => a.promise_to_pay_id === p.id);
-                    return linkedAction ? <div className="mt-1 text-[11px] text-gray-500">linked {linkedAction.action_type} {linkedAction.status} scheduled {linkedAction.scheduled_for ? formatDate(linkedAction.scheduled_for) : "—"}</div> : null;
-                  })()}
-                </div>
-              ))}
-            </div>
-          )}
-          <div className="mt-2 text-[11px] leading-relaxed text-gray-500">
-            Customer &quot;I&apos;ll pay 8000 Friday&quot; → parsed ₹8,000 · Friday (merchant IST) → PENDING → follow-up scheduled after promised day exclusive end-of-day UTC.
-          </div>
-        </Card>
-      </div>
-
-      {/* Audit / Provenance */}
-      <Card>
-        <SectionTitle subtitle="First-class provenance for auditability">Audit / Provenance</SectionTitle>
-        <div className="grid grid-cols-1 gap-2 md:grid-cols-2 text-xs">
-          <div className="rounded bg-black/20 p-2">
-            <div className="text-[11px] uppercase text-gray-500">Recovery policy</div>
-            <div className="mt-1 font-mono text-gray-300">{latestInspector?.policy_mode ?? "baseline"} {latestInspector?.is_adaptive ? "· friction " + String(latestInspector.model_provenance.friction_profile ?? "") : ""}</div>
-          </div>
-          <div className="rounded bg-black/20 p-2">
-            <div className="text-[11px] uppercase text-gray-500">Model</div>
-            <div className="mt-1 font-mono text-gray-300">{latestInspector?.model_provenance.model_version ?? "none"} {latestInspector?.model_provenance.model_fingerprint ? `· ${latestInspector?.model_provenance.model_fingerprint.slice(0, 8)}` : ""}</div>
-          </div>
-          <div className="rounded bg-black/20 p-2">
-            <div className="text-[11px] uppercase text-gray-500">Customer-intelligence method</div>
-            <div className="mt-1 text-gray-300">{detail.messages.find((m) => m.direction === "outbound")?.generation_method ?? "deterministic"} · prompt message-v1 / ptp-v1</div>
-          </div>
-          <div className="rounded bg-black/20 p-2">
-            <div className="text-[11px] uppercase text-gray-500">Payment truth</div>
-            <div className="mt-1 text-gray-300">Razorpay webhook — payment.captured / payment_link.paid</div>
-          </div>
+          })}
+          {detail.messages.length === 0 && <div className="text-sm text-slate-500">No customer messages for this case.</div>}
         </div>
-
-        <div className="mt-3">
-          <button onClick={() => setShowRaw((v) => !v)} className="text-xs text-gray-500 underline hover:text-gray-300">
-            {showRaw ? "Hide technical details (raw JSON)" : "Show technical details (raw audit + alternatives)"}
-          </button>
-          {showRaw && (
-            <pre className="mt-2 max-h-[320px] overflow-auto rounded bg-black/40 p-3 text-[11px] leading-relaxed text-gray-400 whitespace-pre-wrap break-words">
-              {JSON.stringify({ decisions: detail.decisions, audit_trail: detail.audit_trail.slice(0, 20), payment_events: detail.payment_events }, null, 2)}
-            </pre>
+        <div className="bg-[#0e131b] px-6 py-5">
+          {detail.promises_to_pay.length > 0 ? detail.promises_to_pay.map((promise) => {
+            const followUp = detail.actions.find((action) => action.promise_to_pay_id === promise.id);
+            return (
+              <div key={promise.id}>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm font-semibold text-slate-400">RecoveryOS extraction</div>
+                  <Badge tone={promise.status === "PENDING" ? "info" : promise.status === "KEPT" ? "success" : promise.status === "BROKEN" ? "danger" : "muted"}>{stateLabel(promise.status)}</Badge>
+                </div>
+                <div className="mt-5 text-sm font-semibold uppercase tracking-[0.12em] text-blue-300">Promise to Pay</div>
+                <div className="mt-2 text-3xl font-semibold tracking-tight text-white">{formatRupees(promise.promised_amount)}</div>
+                <div className="mt-1 text-sm text-slate-400">Promised by {formatDate(promise.promised_date)}</div>
+                <div className="mt-5 grid grid-cols-2 gap-3">
+                  <div className="rounded-lg bg-slate-800/60 p-3"><div className="text-xs text-slate-500">Confidence</div><div className="mt-1 text-lg font-semibold text-white">{promise.confidence != null ? `${Math.round(promise.confidence * 100)}%` : "—"}</div></div>
+                  <div className="rounded-lg bg-slate-800/60 p-3"><div className="text-xs text-slate-500">Validation</div><div className="mt-1 text-sm font-semibold text-white">{promise.llm_provider ? "LLM + rules" : "Deterministic"}</div></div>
+                </div>
+                {followUp && <div className="mt-4 flex items-center gap-2 rounded-lg border border-blue-500/20 bg-blue-500/[0.07] px-3 py-2 text-sm text-blue-100"><span className="text-blue-300">✓</span><span>Follow-up scheduled for {formatDate(followUp.scheduled_for)}</span></div>}
+              </div>
+            );
+          }) : (
+            <div className="flex min-h-48 flex-col items-center justify-center text-center">
+              <div className="text-sm font-semibold text-slate-300">No Promise to Pay created</div>
+              <div className="mt-1 max-w-sm text-sm text-slate-500">Customer text cannot create recovery state unless deterministic validation succeeds.</div>
+            </div>
           )}
         </div>
-      </Card>
+      </div>
+    </Card>
+  );
+}
+
+function importantTimeline(events: TimelineEvent[]): TimelineEvent[] {
+  const productEvents = events.filter((event) =>
+    ["payment_event", "decision", "action", "customer_message", "promise_to_pay"].includes(event.type) ||
+    /recover|diagnos|promise|decision|payment failed/i.test(event.title),
+  );
+  const source = productEvents.length > 0 ? productEvents : events;
+  if (source.length <= 6) return source;
+  return [...source.slice(0, 2), ...source.slice(-4)];
+}
+
+function timelineTitle(event: TimelineEvent): string {
+  const value = `${event.type} ${event.title}`.toLowerCase();
+  if (value.includes("payment.failed") || value.includes("payment failed")) return "Payment failed";
+  if (value.includes("diagnos")) return "Failure diagnosed";
+  if (value.includes("decision")) return "Recovery action selected";
+  if (value.includes("customer replied")) return "Customer replied";
+  if (value.includes("promise") && value.includes("record")) return "Promise recorded";
+  if (value.includes("promise") && value.includes("pending")) return "Promise validated";
+  if (value.includes("follow-up") || value.includes("follow_up")) return "Follow-up scheduled";
+  if (value.includes("recover")) return "Recovery confirmed";
+  if (value.includes("execut")) return "Action executed";
+  if (value.includes("schedul")) return "Action scheduled";
+  return event.title;
+}
+
+function RecoveryTimeline({ detail }: { detail: CaseDetail }) {
+  const visible = importantTimeline(detail.timeline);
+  return (
+    <Card data-testid="recovery-timeline">
+      <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+        <div>
+          <p className="text-sm font-semibold uppercase tracking-[0.14em] text-slate-500">Recovery timeline</p>
+          <h2 className="mt-1 text-xl font-semibold text-white">Important events</h2>
+        </div>
+        <span className="text-xs text-slate-500">{detail.timeline.length} total audit events retained</span>
+      </div>
+      <div className="mt-5 grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+        {visible.map((event, index) => (
+          <div key={`${event.timestamp}-${index}`} className="relative border-l border-slate-700 pl-3">
+            <div className="text-xs font-semibold text-blue-300">{String(index + 1).padStart(2, "0")}</div>
+            <div className="mt-1 text-sm font-semibold text-slate-200">{timelineTitle(event)}</div>
+            <div className="mt-1 text-xs text-slate-500">{formatDate(event.timestamp)}</div>
+          </div>
+        ))}
+      </div>
+      <details className="mt-5 border-t border-[#242d3b] pt-4">
+        <summary className="cursor-pointer text-sm font-semibold text-slate-300 hover:text-white">View full audit trail</summary>
+        <div className="mt-4 max-h-96 space-y-2 overflow-auto pr-2">
+          {detail.timeline.map((event, index) => (
+            <div key={`${event.timestamp}-${index}`} className="flex gap-4 rounded-md bg-[#0b1017] px-3 py-2.5">
+              <div className="w-36 shrink-0 text-xs text-slate-500">{formatDate(event.timestamp)}</div>
+              <div><div className="text-sm font-medium text-slate-200">{event.title}</div><div className="mt-0.5 text-xs text-slate-500">{event.description}</div></div>
+            </div>
+          ))}
+        </div>
+      </details>
+    </Card>
+  );
+}
+
+function TechnicalDetails({ detail, inspector }: { detail: CaseDetail; inspector: DecisionInspector | null }) {
+  return (
+    <details className="rounded-xl border border-[#242d3b] bg-[#0e131b]">
+      <summary className="cursor-pointer px-5 py-4 text-sm font-semibold text-slate-300 hover:text-white">Technical details</summary>
+      <div className="border-t border-[#242d3b] px-5 py-5">
+        <div className="grid gap-4 md:grid-cols-3">
+          <div><div className="text-xs uppercase tracking-wide text-slate-500">Provider IDs</div><div className="mt-2 space-y-1 break-all font-mono text-xs text-slate-400"><div>{detail.razorpay_payment_id ?? "—"}</div><div>{detail.razorpay_payment_link_id ?? "—"}</div><div>{detail.razorpay_subscription_id ?? "—"}</div></div></div>
+          <div><div className="text-xs uppercase tracking-wide text-slate-500">Model provenance</div><div className="mt-2 space-y-1 font-mono text-xs text-slate-400"><div>{inspector?.model_provenance.model_version ?? "No model"}</div><div>{inspector?.model_provenance.model_fingerprint?.slice(0, 16) ?? "—"}</div><div>{inspector?.model_provenance.friction_profile ?? "—"}</div></div></div>
+          <div><div className="text-xs uppercase tracking-wide text-slate-500">Normalized signal</div><div className="mt-2 space-y-1 font-mono text-xs text-slate-400"><div>source: {detail.error_source ?? "—"}</div><div>step: {detail.error_step ?? "—"}</div><div>reason: {detail.error_reason ?? "—"}</div></div></div>
+        </div>
+        <pre className="mt-5 max-h-80 overflow-auto rounded-lg bg-black/30 p-4 text-xs leading-relaxed text-slate-500">{JSON.stringify({ actions: detail.actions, decisions: detail.decisions, provider_truth: detail.provider_truth, payment_events: detail.payment_events, audit_trail: detail.audit_trail }, null, 2)}</pre>
+      </div>
+    </details>
+  );
+}
+
+export function CaseDetailView({ detail, environmentMode }: { detail: CaseDetail | null; environmentMode?: string }) {
+  if (!detail) return <Card><EmptyState title="Select a case to inspect" description="Open any case to see the selected intervention and why it won." /></Card>;
+  const inspector = detail.decision_inspectors.at(-1) ?? null;
+  return (
+    <div className="space-y-5 pb-56" data-testid="case-detail-page">
+      <CaseHero detail={detail} inspector={inspector} />
+      <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_340px]">
+        <DecisionComparison inspector={inspector} />
+        <GuardrailChecklist detail={detail} />
+      </div>
+      <ProviderTruth detail={detail} environmentMode={environmentMode} />
+      <div id="customer"><CustomerConversation detail={detail} /></div>
+      <RecoveryTimeline detail={detail} />
+      <TechnicalDetails detail={detail} inspector={inspector} />
     </div>
   );
 }

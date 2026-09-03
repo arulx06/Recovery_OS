@@ -19,5 +19,14 @@ dist/
 # OS
 .DS_Store
 
+# Submission video work — large/binary, not staged (keep scripts, ignore outputs/node_modules)
+submission/video_work/*.mp4
+submission/video_work/*.wav
+submission/video_work/*.webm
+submission/video_work/*.mkv
+submission/video_work/*.mov
+submission/video_work/node_modules/
+submission/video_work/package-lock.json
+
 # Local coding-agent transcripts
 session-ses_*.md

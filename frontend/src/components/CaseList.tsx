@@ -1,20 +1,29 @@
-import { useEffect, useState, useCallback } from "react";
+import { useCallback, useEffect, useDeferredValue, useState } from "react";
 import { api } from "../api";
-import type { RevenueCase, CaseFilters } from "../api";
-import { Badge, Card, SectionTitle, EmptyState, Loading, ErrorState, formatRupees, formatDate } from "./ui";
+import type { RevenueCase } from "../api";
+import {
+  Badge,
+  Card,
+  EmptyState,
+  ErrorState,
+  Loading,
+  actionLabel,
+  failureLabel,
+  formatDate,
+  formatRupees,
+  stateLabel,
+  stateTone,
+} from "./ui";
 
 const STATE_OPTIONS = ["", "WAITING", "ACTION_SCHEDULED", "AWAITING_OUTCOME", "HUMAN_REVIEW", "RECOVERED", "STOPPED", "DISPUTED"];
-const CATEGORY_OPTIONS = ["", "TRANSIENT_INFRASTRUCTURE", "SUBSCRIPTION_PENDING_NATIVE_RETRY", "INSUFFICIENT_BALANCE", "CUSTOMER_AUTHENTICATION", "INVALID_INSTRUMENT", "MANDATE_ISSUE", "PERMANENT_HARD_FAILURE", "UNKNOWN"];
+const CATEGORY_OPTIONS = ["", "TRANSIENT_INFRASTRUCTURE", "SUBSCRIPTION_PENDING_NATIVE_RETRY", "INSUFFICIENT_BALANCE", "CUSTOMER_AUTHENTICATION", "INVALID_INSTRUMENT", "MANDATE_ISSUE", "PERMANENT_HARD_FAILURE", "UNCLASSIFIED"];
 const ACTION_OPTIONS = ["", "WAIT", "WAIT_FOR_NATIVE_RETRY", "CREATE_PAYMENT_LINK", "CONTACT_CUSTOMER", "COLLECT_PROMISE_TO_PAY", "ESCALATE", "STOP", "FOLLOW_UP_PTP"];
-const POLICY_OPTIONS = ["", "baseline", "shadow", "adaptive", "adaptive_fallback"];
 
-function stateTone(state: string) {
-  if (state === "RECOVERED") return "success" as const;
-  if (state === "HUMAN_REVIEW") return "warning" as const;
-  if (state === "DISPUTED" || state === "STOPPED") return "danger" as const;
-  if (state === "WAITING") return "info" as const;
-  if (state === "AWAITING_OUTCOME" || state === "ACTION_SCHEDULED") return "info" as const;
-  return "neutral" as const;
+function shortCaseName(item: RevenueCase): string {
+  const payment = item.razorpay_payment_id ?? "";
+  const match = payment.match(/pay_demo_([A-Z](?:_NATIVE)?)_/i);
+  if (match) return `Demo ${match[1].replace("_", " ")}`;
+  return `Case ${item.id.slice(0, 8)}`;
 }
 
 export function CaseList({
@@ -27,17 +36,19 @@ export function CaseList({
   const [cases, setCases] = useState<RevenueCase[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [filters, setFilters] = useState<CaseFilters>({ limit: 50, offset: 0 });
-  const [searchInput, setSearchInput] = useState("");
+  const [state, setState] = useState("");
+  const [category, setCategory] = useState("");
+  const [action, setAction] = useState("");
+  const [search, setSearch] = useState("");
+  const deferredSearch = useDeferredValue(search.trim().toLowerCase());
 
-  const fetchCases = useCallback(async (f: CaseFilters) => {
+  const fetchCases = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const data = await api.cases(f);
-      setCases(data);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "failed to load cases");
+      setCases(await api.cases({ limit: 200, offset: 0 }));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Failed to load recovery cases");
       setCases([]);
     } finally {
       setLoading(false);
@@ -45,169 +56,126 @@ export function CaseList({
   }, []);
 
   useEffect(() => {
-    fetchCases(filters);
-  }, [fetchCases, filters]);
+    fetchCases();
+  }, [fetchCases]);
 
-  const applySearch = () => {
-    setFilters((p) => ({ ...p, search: searchInput.trim() || undefined, offset: 0 }));
-  };
-
-  const updateFilter = (key: keyof CaseFilters, value: string) => {
-    setFilters((p) => ({ ...p, [key]: value || undefined, offset: 0 }));
-  };
+  const filtered = (cases ?? []).filter((item) => {
+    if (state && item.state !== state) return false;
+    if (category && item.failure_category !== category) return false;
+    if (action && item.chosen_action !== action) return false;
+    if (!deferredSearch) return true;
+    return [item.id, item.razorpay_payment_id, item.razorpay_payment_link_id]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(deferredSearch));
+  });
 
   const clearFilters = () => {
-    setSearchInput("");
-    setFilters({ limit: 50, offset: 0 });
+    setState("");
+    setCategory("");
+    setAction("");
+    setSearch("");
   };
 
   return (
-    <Card>
-      <div className="flex flex-col gap-3 border-b border-white/10 pb-3 md:flex-row md:items-center md:justify-between">
-        <SectionTitle subtitle="Operational recovery cases — PostgreSQL is source of truth">Recovery cases</SectionTitle>
-        <div className="flex items-center gap-2 text-xs">
-          <span className="text-gray-500">{cases ? `${cases.length} shown` : "—"}</span>
-          <button onClick={() => fetchCases(filters)} className="rounded border border-white/10 px-2 py-1 text-gray-300 hover:bg-white/10">Refresh</button>
+    <div className="space-y-5" data-testid="case-list-page">
+      <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+        <div>
+          <p className="text-sm font-semibold uppercase tracking-[0.16em] text-blue-300">Recovery cases</p>
+          <h1 className="mt-2 text-3xl font-semibold tracking-tight text-white">What failed, and what happens next?</h1>
+          <p className="mt-2 text-sm text-slate-400">Open a case to inspect diagnosis, safety checks, alternatives, and provider evidence.</p>
         </div>
+        <button onClick={fetchCases} className="self-start rounded-md border border-slate-700 px-3 py-2 text-sm font-medium text-slate-300 hover:border-slate-500 hover:bg-slate-800">
+          Refresh cases
+        </button>
       </div>
 
-      {/* Filters */}
-      <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-6">
-        <label className="text-[11px] text-gray-500">
-          state
-          <select value={filters.state ?? ""} onChange={(e) => updateFilter("state", e.target.value)} className="mt-1 w-full rounded border border-white/10 bg-black/30 px-2 py-1 text-xs text-gray-200">
-            {STATE_OPTIONS.map((o) => (
-              <option key={o} value={o}>{o || "— all —"}</option>
-            ))}
-          </select>
-        </label>
-        <label className="text-[11px] text-gray-500">
-          failure category
-          <select value={filters.failure_category ?? ""} onChange={(e) => updateFilter("failure_category", e.target.value)} className="mt-1 w-full rounded border border-white/10 bg-black/30 px-2 py-1 text-xs text-gray-200">
-            {CATEGORY_OPTIONS.map((o) => (
-              <option key={o} value={o}>{o || "— all —"}</option>
-            ))}
-          </select>
-        </label>
-        <label className="text-[11px] text-gray-500">
-          chosen action
-          <select value={filters.chosen_action ?? ""} onChange={(e) => updateFilter("chosen_action", e.target.value)} className="mt-1 w-full rounded border border-white/10 bg-black/30 px-2 py-1 text-xs text-gray-200">
-            {ACTION_OPTIONS.map((o) => (
-              <option key={o} value={o}>{o || "— all —"}</option>
-            ))}
-          </select>
-        </label>
-        <label className="text-[11px] text-gray-500">
-          policy mode
-          <select value={filters.policy_mode ?? ""} onChange={(e) => updateFilter("policy_mode", e.target.value)} className="mt-1 w-full rounded border border-white/10 bg-black/30 px-2 py-1 text-xs text-gray-200">
-            {POLICY_OPTIONS.map((o) => (
-              <option key={o} value={o}>{o || "— all —"}</option>
-            ))}
-          </select>
-        </label>
-        <label className="col-span-2 text-[11px] text-gray-500">
-          search (payment / case / link)
-          <div className="mt-1 flex gap-1">
+      <Card padding="p-0" className="overflow-hidden">
+        <div className="flex flex-col gap-3 border-b border-[#242d3b] bg-[#0e131b] px-5 py-4 lg:flex-row lg:items-end">
+          <label className="min-w-0 flex-1 text-xs font-medium text-slate-400">
+            Search cases
             <input
-              value={searchInput}
-              onChange={(e) => setSearchInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && applySearch()}
-              placeholder="pay_demo_…, plink_…, or case id"
-              className="w-full rounded border border-white/10 bg-black/30 px-2 py-1 text-xs text-gray-200 placeholder:text-gray-600"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Payment ID, link ID, or case ID"
+              className="mt-1.5 h-10 w-full rounded-md border border-slate-700 bg-[#090d13] px-3 text-sm text-slate-100 placeholder:text-slate-600"
             />
-            <button onClick={applySearch} className="rounded bg-white/10 px-2 py-1 text-xs text-gray-200 hover:bg-white/15">Search</button>
-          </div>
-        </label>
-      </div>
-      <div className="mt-2 flex items-center gap-2">
-        <button onClick={clearFilters} className="text-xs text-gray-500 hover:text-gray-300 underline">Clear filters</button>
-        <span className="text-[11px] text-gray-600">Server-side filtering — not browser-only</span>
-      </div>
+          </label>
+          <label className="text-xs font-medium text-slate-400">
+            State
+            <select value={state} onChange={(event) => setState(event.target.value)} className="mt-1.5 h-10 w-full min-w-44 rounded-md border border-slate-700 bg-[#090d13] px-3 text-sm text-slate-200">
+              {STATE_OPTIONS.map((value) => <option key={value} value={value}>{value ? stateLabel(value) : "All states"}</option>)}
+            </select>
+          </label>
+          <label className="text-xs font-medium text-slate-400">
+            Failure
+            <select value={category} onChange={(event) => setCategory(event.target.value)} className="mt-1.5 h-10 w-full min-w-52 rounded-md border border-slate-700 bg-[#090d13] px-3 text-sm text-slate-200">
+              {CATEGORY_OPTIONS.map((value) => <option key={value} value={value}>{value ? failureLabel(value) : "All failures"}</option>)}
+            </select>
+          </label>
+          <label className="text-xs font-medium text-slate-400">
+            Recovery action
+            <select value={action} onChange={(event) => setAction(event.target.value)} className="mt-1.5 h-10 w-full min-w-52 rounded-md border border-slate-700 bg-[#090d13] px-3 text-sm text-slate-200">
+              {ACTION_OPTIONS.map((value) => <option key={value} value={value}>{value ? actionLabel(value) : "All actions"}</option>)}
+            </select>
+          </label>
+          <button onClick={clearFilters} className="h-10 rounded-md px-3 text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-white">Clear</button>
+        </div>
 
-      {/* List */}
-      <div className="mt-4">
-        {loading && <Loading label="Loading cases…" />}
-        {error && <ErrorState message={error} onRetry={() => fetchCases(filters)} />}
-        {!loading && !error && cases && cases.length === 0 && (
-          <EmptyState title="No cases match filters" description="Try clearing filters or seed demo cases via backend/scripts/seed_demo.py" />
-        )}
-        {!loading && !error && cases && cases.length > 0 && (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm">
-              <thead className="text-xs uppercase text-gray-500">
+        <div className="flex items-center justify-between border-b border-[#242d3b] px-5 py-3 text-sm">
+          <span className="font-medium text-slate-200">{filtered.length} cases</span>
+          <span className="text-xs text-slate-500">Newest activity first</span>
+        </div>
+
+        {loading && <div className="p-6"><Loading label="Loading recovery cases…" /></div>}
+        {error && <div className="p-5"><ErrorState message={error} onRetry={fetchCases} /></div>}
+        {!loading && !error && filtered.length === 0 && <div className="p-5"><EmptyState title="No cases match these filters" description="Clear filters to return to all recovery cases." /></div>}
+
+        {!loading && !error && filtered.length > 0 && (
+          <div className="max-h-[calc(100vh-330px)] min-h-[420px] overflow-auto">
+            <table className="w-full min-w-[1050px] text-left">
+              <thead className="sticky top-0 z-10 bg-[#11161f] text-xs uppercase tracking-wide text-slate-500 shadow-[0_1px_0_#242d3b]">
                 <tr>
-                  <th className="px-2 py-2">Case</th>
-                  <th className="px-2 py-2">Amount</th>
-                  <th className="px-2 py-2">State</th>
-                  <th className="px-2 py-2">Failure</th>
-                  <th className="px-2 py-2">Action</th>
-                  <th className="px-2 py-2">Policy</th>
-                  <th className="px-2 py-2">Friction</th>
-                  <th className="px-2 py-2">Link / PTP</th>
-                  <th className="px-2 py-2">Updated</th>
+                  <th className="px-5 py-3 font-medium">Customer / case</th>
+                  <th className="px-4 py-3 font-medium">Amount</th>
+                  <th className="px-4 py-3 font-medium">Failure</th>
+                  <th className="px-4 py-3 font-medium">Recovery action</th>
+                  <th className="px-4 py-3 font-medium">State</th>
+                  <th className="px-5 py-3 text-right font-medium">Last activity</th>
                 </tr>
               </thead>
               <tbody>
-                {cases.map((c) => (
+                {filtered.map((item) => (
                   <tr
-                    key={c.id}
-                    onClick={() => onSelect(c.id)}
-                    className={`cursor-pointer border-t border-white/5 hover:bg-white/[0.04] ${selectedId === c.id ? "bg-sky-950/30" : ""}`}
+                    key={item.id}
+                    onClick={() => onSelect(item.id)}
+                    onKeyDown={(event) => event.key === "Enter" && onSelect(item.id)}
                     tabIndex={0}
-                    onKeyDown={(e) => e.key === "Enter" && onSelect(c.id)}
                     role="button"
-                    aria-label={`Open case ${c.id.slice(0, 8)}`}
+                    aria-label={`Open case ${item.id.slice(0, 8)}`}
+                    className={`group cursor-pointer border-b border-[#202735] text-sm hover:bg-blue-500/[0.05] ${selectedId === item.id ? "bg-blue-500/[0.08] shadow-[inset_3px_0_0_#6c91ff]" : ""}`}
                   >
-                    <td className="px-2 py-2 font-mono text-xs text-gray-400">
-                      {c.id.slice(0, 8)}
-                      <div className="text-[10px] text-gray-600 truncate max-w-[90px]">{c.razorpay_payment_id ?? ""}</div>
+                    <td className="px-5 py-3.5">
+                      <div className="font-semibold text-slate-100">{shortCaseName(item)}</div>
+                      <div className="mt-0.5 max-w-64 truncate font-mono text-xs text-slate-500">{item.razorpay_payment_id ?? item.id}</div>
                     </td>
-                    <td className="px-2 py-2 font-mono text-xs">{c.amount != null ? formatRupees(c.amount) : "—"}</td>
-                    <td className="px-2 py-2">
-                      <Badge tone={stateTone(c.state)} size="sm">{c.state}</Badge>
+                    <td className="px-4 py-3.5 text-base font-semibold text-white">{formatRupees(item.amount)}</td>
+                    <td className="px-4 py-3.5">
+                      <div className="font-medium text-slate-200">{failureLabel(item.failure_category)}</div>
+                      {item.error_reason && <div className="mt-0.5 text-xs text-slate-500">{item.error_reason.replaceAll("_", " ")}</div>}
                     </td>
-                    <td className="px-2 py-2">
-                      <span className="text-xs text-gray-300">{c.failure_category ?? "—"}</span>
-                      {c.error_reason && <div className="text-[11px] text-gray-500 truncate max-w-[140px]">{c.error_reason}</div>}
+                    <td className="px-4 py-3.5">
+                      <div className="font-medium text-blue-200">{actionLabel(item.chosen_action)}</div>
+                      {item.latest_action_status && <div className="mt-0.5 text-xs text-slate-500">{stateLabel(item.latest_action_status)}</div>}
                     </td>
-                    <td className="px-2 py-2">
-                      {c.chosen_action ? <Badge tone="info" size="sm">{c.chosen_action}</Badge> : <span className="text-gray-600 text-xs">—</span>}
-                      {c.latest_action_status && <div className="text-[11px] text-gray-500">{c.latest_action_status}</div>}
-                    </td>
-                    <td className="px-2 py-2 text-xs text-gray-400">{c.policy_mode ?? "baseline"}</td>
-                    <td className="px-2 py-2 text-xs">
-                      {c.friction_score != null ? (
-                        <span className="font-mono text-amber-300">{c.friction_score.toFixed(1)}</span>
-                      ) : (
-                        <span className="text-gray-600">—</span>
-                      )}
-                      {c.contact_count != null && <div className="text-[11px] text-gray-500">{c.contact_count} contacts</div>}
-                    </td>
-                    <td className="px-2 py-2 text-xs">
-                      {c.razorpay_payment_link_id ? (
-                        <span className="font-mono text-[11px] text-sky-300 truncate max-w-[100px] inline-block" title={c.razorpay_payment_link_id}>{c.razorpay_payment_link_id.slice(0, 14)}…</span>
-                      ) : (
-                        <span className="text-gray-600">—</span>
-                      )}
-                      {c.ptp_status && <div className="text-[11px]"><Badge tone="info" size="sm">{c.ptp_status}</Badge></div>}
-                    </td>
-                    <td className="px-2 py-2 text-[11px] text-gray-500 whitespace-nowrap">{formatDate(c.updated_at ?? c.created_at)}</td>
+                    <td className="px-4 py-3.5"><Badge tone={stateTone(item.state)}>{stateLabel(item.state)}</Badge></td>
+                    <td className="px-5 py-3.5 text-right text-xs text-slate-500">{formatDate(item.updated_at ?? item.created_at)}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         )}
-      </div>
-
-      {cases && cases.length >= (filters.limit ?? 50) && (
-        <div className="mt-3 flex items-center justify-between text-xs text-gray-500">
-          <span>Showing first {filters.limit} — use search/filters or increase limit</span>
-          <div className="flex gap-1">
-            <button onClick={() => setFilters((p) => ({ ...p, limit: Math.min(200, (p.limit ?? 50) + 50) }))} className="rounded border border-white/10 px-2 py-1 hover:bg-white/10">Load more</button>
-          </div>
-        </div>
-      )}
-    </Card>
+      </Card>
+    </div>
   );
 }

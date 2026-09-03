@@ -1,72 +1,110 @@
 import { useState, useEffect, useCallback } from "react";
 import { api } from "../api";
 import type { ArmSummary, ExperimentSummary } from "../api";
-import { Badge, Card, SectionTitle, ErrorState, formatRupees } from "./ui";
+import { Card, ErrorState, formatRupees } from "./ui";
 import { RevenueFrictionChart, ActionDistribution } from "./Charts";
 
-function ArmCard({ label, arm, tone }: { label: string; arm: ArmSummary; tone: "neutral" | "adaptive" }) {
-  const isAdaptive = tone === "adaptive";
+function formatPercent(value: number | undefined) {
+  return value === undefined ? "—" : `${value.toFixed(1)}%`;
+}
+
+function formatSignedRupees(value: number) {
+  if (value === 0) return formatRupees(0);
+  return `${value > 0 ? "+" : "−"}${formatRupees(Math.abs(value))}`;
+}
+
+function formatDelta(value: number, suffix = "") {
+  if (value === 0) return "No change";
+  return `${value > 0 ? "+" : "−"}${Math.abs(value).toFixed(1)}${suffix}`;
+}
+
+function buildComparisonStatement(result: ExperimentSummary) {
+  const { baseline, adaptive } = result.arms;
+  const recoveredDelta = result.incremental_recovered;
+  const recovery = recoveredDelta > 0
+    ? `recovered ${formatRupees(recoveredDelta)} more`
+    : recoveredDelta < 0
+      ? `recovered ${formatRupees(Math.abs(recoveredDelta))} less`
+      : "recovered the same amount";
+
+  if (baseline.friction_score === undefined || adaptive.friction_score === undefined) {
+    return `Adaptive ${recovery}; customer friction was not reported.`;
+  }
+
+  const frictionDelta = adaptive.friction_score - baseline.friction_score;
+  if (frictionDelta === 0) return `Adaptive ${recovery} with the same customer friction.`;
+
+  if (baseline.friction_score > 0) {
+    const frictionPercent = (Math.abs(frictionDelta) / baseline.friction_score) * 100;
+    return `Adaptive ${recovery} with ${frictionPercent.toFixed(1)}% ${frictionDelta < 0 ? "lower" : "higher"} customer friction.`;
+  }
+
+  return `Adaptive ${recovery} with ${Math.abs(frictionDelta).toLocaleString("en-IN")} ${frictionDelta < 0 ? "fewer" : "more"} friction points.`;
+}
+
+function ComparisonRow({
+  label,
+  baseline,
+  adaptive,
+  delta,
+  lowerIsBetter = false,
+}: {
+  label: string;
+  baseline: string;
+  adaptive: string;
+  delta: string;
+  lowerIsBetter?: boolean;
+}) {
   return (
-    <div className={`rounded-xl border p-4 ${isAdaptive ? "border-sky-800/50 bg-sky-950/20" : "border-white/10 bg-white/[0.03]"}`}>
-      <div className="mb-3 flex items-center justify-between">
-        <h3 className="text-sm font-medium">{label}</h3>
-        <span className="text-xs text-gray-500">{arm.cases} cases</span>
+    <div className="grid grid-cols-[1.2fr_1fr_1fr] items-center gap-3 border-t border-white/[0.07] px-4 py-3 text-sm first:border-t-0 sm:grid-cols-[minmax(120px,1.2fr)_minmax(100px,1fr)_minmax(100px,1fr)_minmax(90px,.8fr)]">
+      <div className="font-medium text-slate-300">
+        {label}
+        {lowerIsBetter && <span className="ml-1.5 text-xs font-normal text-slate-600">lower is better</span>}
       </div>
-      <dl className="grid grid-cols-2 gap-y-2 text-sm">
-        <dt className="text-gray-500">At risk</dt>
-        <dd className="text-right">{formatRupees(arm.amount_at_risk)}</dd>
-        <dt className="text-gray-500">Recovered</dt>
-        <dd className="text-right font-semibold">{formatRupees(arm.amount_recovered)}</dd>
-        <dt className="text-gray-500">Recovery rate</dt>
-        <dd className="text-right">{(arm.recovery_rate * 100).toFixed(1)}%</dd>
-        <dt className="text-gray-500">Contact actions</dt>
-        <dd className="text-right">{arm.contacts} ({(arm.contact_rate ?? 0).toFixed(1)}%)</dd>
-        <dt className="text-gray-500">Friction score</dt>
-        <dd className="text-right">{arm.friction_score ?? "—"}</dd>
-        <dt className="text-gray-500">Escalations</dt>
-        <dd className="text-right">{arm.escalations}</dd>
-        <dt className="text-gray-500">Action cost proxy</dt>
-        <dd className="text-right">{formatRupees(arm.action_cost_proxy)}</dd>
-        <dt className="text-gray-500">Realized net value</dt>
-        <dd className="text-right">{formatRupees(arm.realized_net_value)}</dd>
+      <div className="font-mono text-slate-300">{baseline}</div>
+      <div className="font-mono font-semibold text-cyan-200">{adaptive}</div>
+      <div className="hidden text-right font-mono text-xs text-slate-500 sm:block">{delta}</div>
+    </div>
+  );
+}
+
+function SecondaryArmMetrics({ label, arm, adaptive = false }: { label: string; arm: ArmSummary; adaptive?: boolean }) {
+  return (
+    <div className={`rounded-xl border p-4 ${adaptive ? "border-cyan-400/20 bg-cyan-400/[0.04]" : "border-white/10 bg-black/20"}`}>
+      <div className={`mb-3 text-sm font-semibold ${adaptive ? "text-cyan-200" : "text-slate-200"}`}>{label}</div>
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-[13px]">
+        <dt className="text-slate-500">Amount at risk</dt>
+        <dd className="text-right font-mono text-slate-300">{formatRupees(arm.amount_at_risk)}</dd>
+        <dt className="text-slate-500">Contact actions</dt>
+        <dd className="text-right font-mono text-slate-300">{arm.contacts.toLocaleString("en-IN")}</dd>
+        <dt className="text-slate-500">Escalations</dt>
+        <dd className="text-right font-mono text-slate-300">{arm.escalations.toLocaleString("en-IN")}</dd>
+        <dt className="text-slate-500">Action cost proxy</dt>
+        <dd className="text-right font-mono text-slate-300">{formatRupees(arm.action_cost_proxy)}</dd>
+        <dt className="text-slate-500">Realized net value</dt>
+        <dd className="text-right font-mono text-slate-300">{formatRupees(arm.realized_net_value)}</dd>
         {arm.realized_policy_utility !== undefined && (
           <>
-            <dt className="text-gray-500">Policy utility</dt>
-            <dd className="text-right font-mono text-xs">{formatRupees(arm.realized_policy_utility)}</dd>
+            <dt className="text-slate-500">Policy utility</dt>
+            <dd className="text-right font-mono text-slate-300">{formatRupees(arm.realized_policy_utility)}</dd>
           </>
         )}
         {arm.recovered_per_contact !== undefined && (
           <>
-            <dt className="text-gray-500">Recovered / contact</dt>
-            <dd className="text-right">{formatRupees(arm.recovered_per_contact ?? 0)}</dd>
+            <dt className="text-slate-500">Recovered / contact</dt>
+            <dd className="text-right font-mono text-slate-300">{formatRupees(arm.recovered_per_contact)}</dd>
           </>
         )}
       </dl>
-      <div className="mt-3 border-t border-white/10 pt-3">
-        <div className="mb-1 text-xs uppercase tracking-wide text-gray-500">Action distribution</div>
-        <div className="flex flex-wrap gap-1.5">
-          {Object.entries(arm.action_distribution)
-            .sort((a, b) => b[1] - a[1])
-            .map(([action, count]) => (
-              <span key={action} className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] text-gray-300">
-                {action} × {count}
-              </span>
-            ))}
-        </div>
-        {(arm.waits !== undefined || arm.payment_links !== undefined) && (
-          <div className="mt-2 text-[11px] text-gray-500">
-            waits {arm.waits ?? 0} · native {arm.native_retry_waits ?? 0} · links {arm.payment_links ?? 0} · ptp {arm.ptps ?? 0}
-          </div>
-        )}
-      </div>
     </div>
   );
 }
 
 export default function ExperimentPanel() {
-  const [count, setCount] = useState(500);
+  const [count, setCount] = useState(100);
   const [seed, setSeed] = useState<string>("11");
   const [running, setRunning] = useState(false);
+  const [loadingRunId, setLoadingRunId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ExperimentSummary | null>(null);
   const [recent, setRecent] = useState<Array<{ run_id: string; created_at: string | null }>>([]);
@@ -76,7 +114,7 @@ export default function ExperimentPanel() {
       const r = await api.experiments();
       setRecent(r.slice(0, 10));
     } catch {
-      /* ignore */
+      /* Recent runs are supplementary; the experiment remains usable without them. */
     }
   }, []);
 
@@ -101,123 +139,214 @@ export default function ExperimentPanel() {
   };
 
   const loadRun = async (runId: string) => {
+    setLoadingRunId(runId);
     setError(null);
     try {
-      const s = await api.experiment(runId);
-      setResult(s);
+      const summary = await api.experiment(runId);
+      setResult(summary);
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to load run");
+    } finally {
+      setLoadingRunId(null);
     }
   };
 
+  const baseline = result?.arms.baseline;
+  const adaptive = result?.arms.adaptive;
+  const hasPolicyUtility = baseline?.realized_policy_utility !== undefined && adaptive?.realized_policy_utility !== undefined;
+  const baselineScore = baseline ? (hasPolicyUtility ? (baseline.realized_policy_utility ?? baseline.realized_net_value) : baseline.realized_net_value) : 0;
+  const adaptiveScore = adaptive ? (hasPolicyUtility ? (adaptive.realized_policy_utility ?? adaptive.realized_net_value) : adaptive.realized_net_value) : 0;
+  const winner = adaptiveScore > baselineScore ? "Adaptive" : baselineScore > adaptiveScore ? "Baseline" : null;
+  const frictionDelta = baseline?.friction_score !== undefined && adaptive?.friction_score !== undefined
+    ? adaptive.friction_score - baseline.friction_score
+    : undefined;
+  const contactDelta = baseline?.contact_rate !== undefined && adaptive?.contact_rate !== undefined
+    ? adaptive.contact_rate - baseline.contact_rate
+    : undefined;
+
   return (
-    <Card>
-      <div className="flex flex-col gap-3 border-b border-white/10 pb-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <SectionTitle subtitle="Synthetic simulation benchmark — not production Razorpay lift. Policy comparison with revenue vs friction tradeoff.">
-            Baseline vs. adaptive experiment
-          </SectionTitle>
-          <div className="mt-1">
-            <Badge tone="warning" size="sm">SYNTHETIC SIMULATION · NOT PRODUCTION LIFT</Badge>
-          </div>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <label className="text-xs text-gray-500">
-            cases
-            <input
-              type="number"
-              min={1}
-              max={5000}
-              value={count}
-              onChange={(e) => setCount(Number(e.target.value))}
-              className="ml-1.5 w-20 rounded border border-white/10 bg-black/30 px-2 py-1 text-xs text-gray-200"
-            />
-          </label>
-          <label className="text-xs text-gray-500">
-            seed
-            <input
-              type="text"
-              value={seed}
-              onChange={(e) => setSeed(e.target.value)}
-              placeholder="random"
-              className="ml-1.5 w-20 rounded border border-white/10 bg-black/30 px-2 py-1 text-xs text-gray-200"
-            />
-          </label>
-          <button
-            onClick={run}
-            disabled={running}
-            className="rounded bg-sky-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-600 disabled:opacity-50"
-          >
-            {running ? "Running…" : "Run experiment"}
-          </button>
-        </div>
+    <Card padding="p-0" className="overflow-hidden border-slate-700/70 bg-[#08111f] shadow-2xl shadow-cyan-950/20">
+      <div className="border-b border-amber-300/20 bg-gradient-to-r from-amber-400/15 via-amber-300/[0.07] to-transparent px-5 py-2.5 text-center text-xs font-semibold tracking-[0.18em] text-amber-200">
+        SYNTHETIC SIMULATION / NOT PRODUCTION LIFT
       </div>
 
-      {recent.length > 0 && (
-        <div className="mt-3 flex flex-wrap items-center gap-1.5 text-[11px]">
-          <span className="text-gray-500">Recent runs:</span>
-          {recent.map((r) => (
+      <div className="border-b border-white/[0.07] px-5 py-4">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+          <div>
+            <div className="mb-1 text-xs font-medium uppercase tracking-[0.2em] text-cyan-400">Policy decision room</div>
+            <h2 className="text-xl font-semibold tracking-tight text-white">Baseline vs adaptive recovery</h2>
+            <p className="mt-1 text-sm text-slate-400">Matched scenarios. Same random outcomes. One auditable policy comparison.</p>
+          </div>
+          <div className="flex flex-wrap items-end gap-2.5">
+            <label className="text-[13px] font-medium text-slate-400">
+              <span className="mb-1 block">cases</span>
+              <input
+                type="number"
+                min={1}
+                max={5000}
+                value={count}
+                onChange={(e) => setCount(Number(e.target.value))}
+                className="w-24 rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-400/60 focus:ring-2 focus:ring-cyan-400/10"
+              />
+            </label>
+            <label className="text-[13px] font-medium text-slate-400">
+              <span className="mb-1 block">seed</span>
+              <input
+                type="text"
+                value={seed}
+                onChange={(e) => setSeed(e.target.value)}
+                placeholder="random"
+                className="w-24 rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-400/60 focus:ring-2 focus:ring-cyan-400/10"
+              />
+            </label>
             <button
-              key={r.run_id}
-              onClick={() => loadRun(r.run_id)}
-              className={`rounded border px-1.5 py-0.5 font-mono text-[11px] hover:bg-white/10 ${result?.run_id === r.run_id ? "border-sky-700 bg-sky-900/30 text-sky-200" : "border-white/10 text-gray-400"}`}
-              title={r.run_id}
+              type="button"
+              onClick={run}
+              disabled={running}
+              className="h-[38px] rounded-lg bg-cyan-400 px-4 text-sm font-semibold text-slate-950 shadow-lg shadow-cyan-950/50 transition hover:bg-cyan-300 disabled:cursor-wait disabled:opacity-60"
             >
-              {r.run_id.slice(0, 8)}
+              {running ? "Running…" : "Run experiment"}
             </button>
-          ))}
+          </div>
         </div>
-      )}
 
-      <div className="mt-4">
-        {error && <ErrorState message={error} onRetry={run} />}
+        {recent.length > 0 && (
+          <div className="mt-3 flex flex-wrap items-center gap-1.5 text-xs" aria-label="Recent experiment runs">
+            <span className="mr-1 text-slate-600">Recent runs</span>
+            {recent.map((recentRun) => {
+              const loading = loadingRunId === recentRun.run_id;
+              return (
+                <button
+                  type="button"
+                  key={recentRun.run_id}
+                  onClick={() => loadRun(recentRun.run_id)}
+                  disabled={loadingRunId !== null}
+                  className={`rounded-md border px-2 py-1 font-mono transition hover:bg-white/10 disabled:cursor-wait ${result?.run_id === recentRun.run_id ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/10 text-slate-500"}`}
+                  title={`Load run ${recentRun.run_id}`}
+                >
+                  {loading ? "Loading…" : recentRun.run_id.slice(0, 8)}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div className="p-5">
+        {error && <div className="mb-4"><ErrorState message={error} onRetry={run} /></div>}
 
         {!result && !error && (
-          <div className="py-8 text-center text-sm text-gray-500">
-            Click &quot;Run experiment&quot; to send {count} matched synthetic scenarios through both the baseline and adaptive policies and compare what each recovers.
-            <div className="mt-2 text-xs text-gray-600">Common-random numbers: same action → identical outcome. Download CSV for audit.</div>
+          <div className="rounded-xl border border-dashed border-white/10 bg-black/20 px-6 py-12 text-center">
+            <div className="text-base font-medium text-slate-200">Ready to compare both policies</div>
+            <p className="mx-auto mt-2 max-w-2xl text-sm leading-relaxed text-slate-500">
+              Run {count} matched scenarios to compare recovered revenue and customer friction. Every case is auditable in the downloadable CSV.
+            </p>
           </div>
         )}
 
-        {result && (
+        {result && baseline && adaptive && (
           <div className="space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-white/10 bg-black/20 px-3 py-2">
-              <div className="text-sm">
-                Incremental gross recovered (synthetic):{" "}
-                <span className={result.incremental_recovered >= 0 ? "font-semibold text-emerald-400" : "font-semibold text-red-400"}>
-                  {result.incremental_recovered >= 0 ? "+" : ""}
-                  {formatRupees(result.incremental_recovered)}
-                </span>
-                <span className="ml-2 text-xs text-gray-500">
-                  seed {result.resolved_seed ?? "—"} · {result.evaluation_friction_profile ?? "balanced"} × {result.evaluation_friction_weight ?? "—"} · {result.model_version ?? ""} {result.model_fingerprint ? `· ${String(result.model_fingerprint).slice(0, 8)}` : ""} · {result.scenario_count ?? result.case_count / 2} scenarios
-                </span>
+            <section aria-live="polite" className={`relative overflow-hidden rounded-2xl border px-5 py-4 ${winner === "Adaptive" ? "border-emerald-400/30 bg-emerald-400/[0.07]" : winner === "Baseline" ? "border-violet-400/30 bg-violet-400/[0.07]" : "border-slate-500/30 bg-white/[0.04]"}`}>
+              <div className="absolute inset-y-0 right-0 w-64 bg-gradient-to-l from-white/[0.04] to-transparent" aria-hidden />
+              <div className="relative flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <div className={`text-xs font-semibold uppercase tracking-[0.2em] ${winner === "Adaptive" ? "text-emerald-300" : winner === "Baseline" ? "text-violet-300" : "text-slate-400"}`}>Simulation verdict</div>
+                  <h3 className="mt-1 text-2xl font-semibold tracking-tight text-white">
+                    {winner ? `${winner} policy won this run` : "The policies tied this run"}
+                  </h3>
+                  <p className="mt-1.5 text-[15px] text-slate-300">{buildComparisonStatement(result)}</p>
+                </div>
+                <div className="shrink-0 rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-right">
+                  <div className="text-xs uppercase tracking-wider text-slate-500">Adaptive recovered delta</div>
+                  <div className={`mt-1 font-mono text-2xl font-semibold ${result.incremental_recovered >= 0 ? "text-emerald-300" : "text-rose-300"}`}>
+                    {formatSignedRupees(result.incremental_recovered)}
+                  </div>
+                  <div className="mt-0.5 text-xs text-slate-500">Winner by {hasPolicyUtility ? "realized policy utility" : "realized net value"}</div>
+                </div>
+              </div>
+            </section>
+
+            <div className="grid grid-cols-1 gap-4 xl:grid-cols-[1.05fr_.95fr]">
+              <section className="overflow-hidden rounded-2xl border border-white/10 bg-black/20" aria-labelledby="primary-comparison-title">
+                <div className="grid grid-cols-[1.2fr_1fr_1fr] gap-3 border-b border-white/10 bg-white/[0.03] px-4 py-3 text-xs font-semibold uppercase tracking-wider text-slate-500 sm:grid-cols-[minmax(120px,1.2fr)_minmax(100px,1fr)_minmax(100px,1fr)_minmax(90px,.8fr)]">
+                  <h3 id="primary-comparison-title">Primary outcome</h3>
+                  <div>Baseline</div>
+                  <div className="text-cyan-300">Adaptive</div>
+                  <div className="hidden text-right sm:block">Adaptive Δ</div>
+                </div>
+                <ComparisonRow
+                  label="Revenue recovered"
+                  baseline={formatRupees(baseline.amount_recovered)}
+                  adaptive={formatRupees(adaptive.amount_recovered)}
+                  delta={formatSignedRupees(result.incremental_recovered)}
+                />
+                <ComparisonRow
+                  label="Recovery rate"
+                  baseline={formatPercent(baseline.recovery_rate * 100)}
+                  adaptive={formatPercent(adaptive.recovery_rate * 100)}
+                  delta={formatDelta((adaptive.recovery_rate - baseline.recovery_rate) * 100, " pp")}
+                />
+                <ComparisonRow
+                  label="Contact rate"
+                  baseline={formatPercent(baseline.contact_rate)}
+                  adaptive={formatPercent(adaptive.contact_rate)}
+                  delta={contactDelta === undefined ? "—" : formatDelta(contactDelta, " pp")}
+                  lowerIsBetter
+                />
+                <ComparisonRow
+                  label="Customer friction"
+                  baseline={baseline.friction_score?.toLocaleString("en-IN") ?? "—"}
+                  adaptive={adaptive.friction_score?.toLocaleString("en-IN") ?? "—"}
+                  delta={frictionDelta === undefined ? "—" : frictionDelta === 0 ? "No change" : `${frictionDelta > 0 ? "+" : "−"}${Math.abs(frictionDelta).toLocaleString("en-IN")}`}
+                  lowerIsBetter
+                />
+              </section>
+
+              <RevenueFrictionChart baseline={baseline} adaptive={adaptive} />
+            </div>
+
+            <details className="group rounded-xl border border-white/[0.08] bg-black/15">
+              <summary className="flex cursor-pointer list-none items-center justify-between px-4 py-3 text-sm font-medium text-slate-400 transition hover:text-slate-200">
+                <span>Secondary metrics</span>
+                <span className="text-lg font-light text-slate-600 transition group-open:rotate-45" aria-hidden>+</span>
+              </summary>
+              <div className="grid grid-cols-1 gap-3 border-t border-white/[0.07] p-4 md:grid-cols-2">
+                <SecondaryArmMetrics label="Baseline · fixed policy" arm={baseline} />
+                <SecondaryArmMetrics label="Adaptive · ML policy" arm={adaptive} adaptive />
+              </div>
+            </details>
+
+            <details className="group rounded-xl border border-white/[0.08] bg-black/15">
+              <summary className="flex cursor-pointer list-none items-center justify-between px-4 py-3 text-sm font-medium text-slate-400 transition hover:text-slate-200">
+                <span>Action distribution</span>
+                <span className="text-lg font-light text-slate-600 transition group-open:rotate-45" aria-hidden>+</span>
+              </summary>
+              <div className="border-t border-white/[0.07] p-4">
+                <ActionDistribution baseline={baseline} adaptive={adaptive} />
+              </div>
+            </details>
+
+            <div className="flex flex-col gap-3 rounded-xl border border-white/[0.07] bg-white/[0.02] px-4 py-3 text-xs text-slate-500 md:flex-row md:items-center md:justify-between">
+              <div className="leading-relaxed">
+                <span className="text-slate-400">Run {result.run_id.slice(0, 8)}</span>
+                {` · seed ${result.resolved_seed ?? "—"} · ${result.scenario_count ?? result.case_count / 2} scenarios`}
+                {result.evaluation_friction_profile ? ` · ${result.evaluation_friction_profile} profile` : ""}
+                {result.model_version ? ` · model ${result.model_version}` : ""}
+                {result.model_fingerprint ? `/${String(result.model_fingerprint).slice(0, 8)}` : ""}
+                {result.created_at ? ` · ${new Date(result.created_at).toLocaleString()}` : ""}
               </div>
               <button
+                type="button"
                 onClick={() => api.downloadExperimentCsv(result.run_id).catch((e) => setError(e instanceof Error ? e.message : "CSV download failed"))}
-                className="rounded border border-white/10 px-3 py-1.5 text-xs text-gray-300 hover:bg-white/10"
+                className="shrink-0 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-[13px] font-medium text-slate-300 transition hover:border-cyan-400/30 hover:bg-cyan-400/[0.06] hover:text-cyan-200"
               >
                 Download audit CSV
               </button>
             </div>
 
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              <ArmCard label="Baseline (fixed policy)" arm={result.arms.baseline} tone="neutral" />
-              <ArmCard label="Adaptive (ML policy)" arm={result.arms.adaptive} tone="adaptive" />
-            </div>
-
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              <RevenueFrictionChart baseline={result.arms.baseline} adaptive={result.arms.adaptive} />
-              <ActionDistribution baseline={result.arms.baseline} adaptive={result.arms.adaptive} />
-            </div>
-
-            <div className="flex items-center justify-between text-[11px] text-gray-600">
-              <span>run_id: <span className="font-mono">{result.run_id}</span></span>
-              <span>{result.created_at ? new Date(result.created_at).toLocaleString() : ""} · synthetic simulation</span>
-            </div>
-
-            <div className="rounded-lg border border-amber-900/30 bg-amber-950/20 p-3 text-xs leading-relaxed text-amber-200/80">
-              RecoveryOS trades revenue vs customer friction explicitly. Adaptive&apos;s utility = <span className="font-mono">P×amount − cost − weight×friction</span>. Higher weight tolerates less contact. This evaluation is synthetic — not production Razorpay lift — but validates code and utility ordering.
-            </div>
+            <p className="px-1 text-xs leading-relaxed text-slate-600">
+              Policy utility prices recovery, action cost, and customer friction together. This benchmark validates simulator behavior and utility ordering; controlled production measurement is required to establish lift.
+            </p>
           </div>
         )}
       </div>
