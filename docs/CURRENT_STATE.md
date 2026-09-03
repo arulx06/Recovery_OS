@@ -10,12 +10,12 @@
 
 | Property | Value |
 |----------|-------|
-| Branch | `feat/llm-customer-intelligence` |
-| Baseline ancestry | Verified hardening baseline + temporal runtime `3debc27` + provider reconciliation `1a980d6` + adaptive policy `a624341` |
-| Backend tests | 402 passed (hermetic, `sqlite://` temp DB, external network and Redis denied) |
+| Branch | `feat/observability-demo-ux` |
+| Baseline ancestry | Verified baseline `3debc27` + reconciliation `1a980d6` + adaptive `a624341` + LLM intelligence `4e64c1c` |
+| Backend tests | 434 passed (hermetic, `sqlite://` temp DB, external network and Redis denied) |
 | Frontend `npm run build` | PASS |
-| Frontend `npm run lint` (`oxlint`) | PASS |
-| Database | PostgreSQL (required); SQLite for tests/CI — head `c9d0e1f2a3b4` (adds LLM provenance) |
+| Frontend `npm run lint` (`oxlint`) | PASS (warnings only) |
+| Database | PostgreSQL (required); SQLite for tests/CI — head `c9d0e1f2a3b4` (LLM provenance) — observability adds read-only view models, no migration |
 | Redis/RQ | Implemented as reconstructable action transport; PostgreSQL remains authoritative |
 | Model artifact | `backend/app/ml/artifacts/model.joblib` + `manifest.json` — gitignored, reproduced via `python -m app.ml.train` (recovery-v1, 75e9cfd6, Brier 0.1597) |
 
@@ -23,13 +23,14 @@
 
 ### How this branch was verified
 
-- `python -m pytest -q` -> 402 passed with socket-denial guard, fake credentials, and `TASK_QUEUE_ENABLED=false` (`conftest.py`); LLM suites cover typed errors, placeholder safety, PTP validation, drafting fallback, controller isolation, DB boundary, provenance, plus 8 demo scenario tests.
-- `npm run build` and `npm run lint` pass on Node 22 / Vite 8.
-- `alembic upgrade head` applies cleanly on SQLite (`ci.yml`) and on local PostgreSQL 16 at revision `c9d0e1f2a3b4` (adds LLM provenance: `PromiseToPay.extraction_method/llm_provider/llm_model/prompt_version/amount_method` and `CustomerMessage.generation_method/status`); downgrade/re-upgrade and fresh migration verified.
+- `python -m pytest -q` -> 434 passed (hermetic, `sqlite://` temp DB, external network and Redis denied, 32 observability/corrective tests); LLM suites cover typed errors, placeholder safety, PTP validation, drafting fallback, controller isolation, DB boundary, provenance; observability covers dashboard, latest-Decision filtering, exact-Action reconciliation, timeline, explainability, and the real demo CLI.
+- `npm run build` and `npm run lint` pass on Node 22 / Vite 8 (observability console build: 24 modules, 263kB).
+- `alembic upgrade head` clean at `c9d0e1f2a3b4` — observability adds **no migration** (read-only view models derived from PostgreSQL).
 - A real Redis/RQ smoke test verified an ID-only `WAIT` job through `app.worker.WindowsWorker`; the default RQ worker is not Windows-compatible.
 - Manual Razorpay TEST MODE path verified independently: `payment.failed` (`card_expired`) → `INVALID_INSTRUMENT` → `CREATE_PAYMENT_LINK` → `plink_*` via `https://api.razorpay.com/v1/payment_links` → `rzp.io` short URL, with `Action.result.simulated == false` and `reference_id == Action.id` when `RAZORPAY_API_ENABLED=true` and `rzp_test_*` credentials are present. Provider reconciliation via `list_payment_links?reference_id=<Action.id>` validated against official docs and mocked tests — genuine `plink_*` found without a second create.
-- Adaptive policy verified: `RECOVERY_POLICY=baseline` (default), `shadow` (baseline executes + `shadow_adaptive_recommendation` audit, no second Action), `adaptive` (friction-aware `P*amount - cost - weight*friction`, provenance, fallback to baseline on model failure). Model manifest `recovery-v1` `75e9cfd6` with Brier 0.1597 is loaded via cached `scorer.get_model_info()` and exposed at `GET /health` and `GET /cases/{id}`.
-- LLM-assisted intelligence verified: `LLM_API_ENABLED=false` (default) → deterministic templates + regex extraction; `LLM_API_ENABLED=true` with mocked Anthropic → structured PTP extraction `{intent, promised_amount, promised_date, confidence, reasoning_code}` + draft with `[[PAYMENT_LINK]]` placeholder substituted deterministically with authoritative `short_url`; prompt versions `ptp-v1`/`message-v1` and provenance stored; provider failure or malformed response → deterministic fallback (no HTTP 500, no stuck case, no false `llm` provenance, no invented amount/link/discount); injection inputs are downgraded regardless of proposed amount or intent; `/health` reports sanitized `llm` section without secrets.
+- Adaptive policy verified: `RECOVERY_POLICY=baseline` (default), `shadow` (baseline executes + `shadow_adaptive_recommendation` audit, no second Action), `adaptive` (friction-aware `P*amount - cost - weight*friction`, provenance, fallback to baseline on model failure). Model manifest `recovery-v1` `75e9cfd6` with Brier 0.1597 is loaded via cached `scorer.get_model_info()` and exposed at `GET /health` and `GET /cases/{id}` and `GET /dashboard/summary`.
+- LLM-assisted intelligence verified: `LLM_API_ENABLED=false` (default) → deterministic templates + regex extraction; `LLM_API_ENABLED=true` with mocked Anthropic → structured PTP extraction `{intent, promised_amount, promised_date, confidence, reasoning_code}` + draft with `[[PAYMENT_LINK]]` placeholder substituted deterministically with authoritative `short_url`; prompt versions `ptp-v1`/`message-v1` and provenance stored; provider failure or malformed response → deterministic fallback; injection downgraded; `/health` sanitized.
+- Observability verified: `GET /dashboard/summary` computes revenue at risk/recovered, state/case counts, PTP, policy/model, queue, Razorpay, LLM without inventing values; `GET /cases` supports state/category/latest-action/latest-policy/search + pagination in SQL without a candidate cap; `GET /cases/{id}` enriches with failure explanation, persisted decision-time inspectors, explicitly current guardrail/friction surfaces, chronological timeline, and exact-Action provider reconciliation truth; `scripts/seed_demo.py` always creates five core rows and adds genuine adaptive/shadow D/F rows only when a trained model is available; frontend passes strict build with Revenue-vs-friction Pareto and action distribution; no secret/CoT exposure.
 
 ---
 
@@ -72,10 +73,18 @@
 | Synthetic training data generator | **IMPLEMENTED / SYNTHETIC_ONLY** | `app/ml/synthetic_history.py:45` | Uniform action sampling to expose all (category, action) pairs to the model; still synthetic — see `ML_AND_EVALUATION.md` |
 | Friction-aware experiment runner | **IMPLEMENTED / VERIFIED** | `app/services/experiment_runner.py:47`, `tests/test_experiments.py`, `scripts/evaluate_policies.py` | Baseline vs balanced adaptive with `common-random` scenarios; per-arm `friction_score`, `contact_rate`, `recovered_per_contact`, `utility`, `waits`/`payment_links`/`ptps` breakdown |
 | Experiment persistence / API / CSV export | **IMPLEMENTED / VERIFIED** | `app/routers/experiments.py:22`, `tests/test_experiments.py:91` | `ExperimentCase` rows keyed by `run_id`; `GET /experiments/{id}/export.csv` returns header + `count*2` rows; summary now includes `friction_score`/`utility` per arm |
-| React merchant dashboard | **IMPLEMENTED / PARTIAL** | `frontend/src/App.tsx` (policy/model in header), `frontend/src/ExperimentPanel.tsx` (friction/recovered-per-contact), `frontend/src/api.ts` | Health shows `policy`/`model`/`fingerprint`; experiment cards show `contact_rate`, `friction_score`, `recovered_per_contact`; `GET /cases/{id}` provenance still not rendered as dedicated timeline |
+| React merchant console (observability) | **IMPLEMENTED / VERIFIED** | `frontend/src/App.tsx` (Overview/Cases/Experiments/System), `frontend/src/components/**`, `backend/app/services/explainability.py`, `backend/app/routers/dashboard.py`, `backend/app/routers/cases.py` (enriched), `tests/test_observability.py` | Dashboard summary (revenue at risk/recovered, state/case counts, PTP, policy/model), filterable case list (state/category/action/policy/search + pagination), full case detail (failure → guardrails → Decision Inspector with P/EV/friction/utility → timeline → provider truth → drafts → PTP → provenance), Revenue-vs-friction Pareto & action distribution, deep-link `?case=<id>`, loading/error/empty states, responsive; `GET /dashboard/summary` + enriched `GET /cases/{id}` (timeline, decision_inspectors, provider_truth) |
+| Dashboard summary read-model | **IMPLEMENTED / VERIFIED** | `app/routers/dashboard.py`, `app/services/explainability.py`, `tests/test_observability.py` | `GET /dashboard/summary` derives revenue at risk (open), recovered (RECOVERED), by_state/by_category, active PTPs, policy/model/fingerprint, friction, queue, Razorpay (SIMULATED vs TEST MODE), LLM — PostgreSQL is truth, no invented values |
+| Case list operational view | **IMPLEMENTED / VERIFIED** | `app/routers/cases.py`, `frontend/src/components/CaseList.tsx` | Server-side filters (state, failure_category, chosen_action, policy_mode, search by payment/case/link, limit/offset) with enriched columns (amount/state/failure/action/policy/friction/latest Action/Link/PTP/updated) — no browser mass filtering |
+| Decision explainability | **IMPLEMENTED / VERIFIED** | `app/services/explainability.py:normalize_decision`, `app/routers/cases.py`, `frontend/src/components/CaseDetail.tsx` | Candidate comparison per Decision (allowed, guardrail reason, P, EV, cost, friction, penalty, utility, selected) — missing adaptive fields show “unavailable”/“Not recorded”, never fabricated; baseline shows no ML probabilities (correct) |
+| Guardrail visibility | **IMPLEMENTED / VERIFIED** | `app/services/explainability.py:guardrail_visibility`, `frontend/src/components/CaseDetail.tsx` | Current contact limits, 7-day cap, cooldown, amount cap, attempt limit are recomputed at read time and labeled current; persisted `Decision.guardrails_applied` remains decision-time evidence |
+| Friction visibility | **IMPLEMENTED / VERIFIED** | `app/services/explainability.py:friction_breakdown`, `frontend/src/components/CaseDetail.tsx` | Current base friction + current contact increment is labeled a read-time surface; persisted candidate friction/utility remains decision-time evidence in Decision Inspector |
+| Recovery timeline | **IMPLEMENTED / VERIFIED** | `app/services/explainability.py:build_timeline`, `frontend/src/components/CaseDetail.tsx` | Chronological from PaymentEvent+Decision+Action+Message+PTP+AuditEvent (not persisted duplicate), ordered, with audit fallbacks; no fake events |
+| Payment Link / provider truth | **IMPLEMENTED / VERIFIED** | `app/services/explainability.py:provider_truth_summary`, `frontend/src/components/CaseDetail.tsx` | SIMULATED LINK vs RAZORPAY TEST MODE, plink_* id, reference_id, short_url (safe), exact-Action `action_reconciled` evidence, status — never claims LIVE production |
 | PostgreSQL as authoritative state | **IMPLEMENTED / VERIFIED** | migration `a1b2c3d4e5f6`, `app/models.py:Decision` provenance, `app/services/temporal_runtime.py` | `Action` owns schedule/claim/attempts; `Decision` owns `policy_mode`/`model_version`/`fingerprint`/`friction_*`; Redis loss is repaired by reconciliation |
 | Redis/RQ delayed-action runtime | **IMPLEMENTED / VERIFIED** | `app/services/task_queue.py`, `app/jobs.py`, `app/worker.py`, `scripts/reconcile_actions.py` | Worker process and `--with-scheduler` must be running; Windows requires `app.worker.WindowsWorker` |
 | Real inbound Razorpay webhooks (production live-money) | **NOT IMPLEMENTED** — `TEST_MODE_ONLY` verified, production explicitly rejected | `app/services/razorpay_client.py:72` rejects non-`rzp_test_*` keys | Webhook verification is provider-shape-agnostic, but the only live API path validated is Test Mode Payment Links |
+| Demo seed & scenarios | **IMPLEMENTED / VERIFIED** | `scripts/seed_demo.py`, `tests/test_observability.py` | Five core rows always: A contact→PTP, B link→AWAITING_OUTCOME, C WAIT + C_NATIVE, E injection→HUMAN_REVIEW. With a trained local model, D persists `policy_mode=adaptive` and F persists `policy_mode=shadow` (seven rows across A-F). Idempotent, demo-only reset, no external API by default |
 | Deployment (public URL, prod DB, secrets rotation) | **PLANNED** | — | No Dockerfile for app, no CI deploy job, no auth on API |
 
 ---
@@ -106,19 +115,21 @@ The request transaction commits `PaymentEvent`, case, decision, and action befor
 6. **Database timestamps remain naive UTC** - merchant-local conversion is explicit only for PTP business dates.
 7. **Model artifact is gitignored** - a fresh clone must run `python -m app.ml.train` for experiments.
 8. **No API authentication** - webhook authenticity relies on signature and event ID; other routes are unauthenticated.
-9. **Frontend has no case-detail renderer** - the API exposes temporal metadata (`provider_ambiguous` / `reconciled` / `reference_id`) but the dashboard does not render the new `action_reconciled` / `payment_link_reconciliation_*` audit trail distinctly.
+9. **Case-detail renderer was built in this stage** — prior debt resolved: `frontend/src/components/CaseDetail.tsx` now renders `action_reconciled` / `payment_link_reconciliation_*`, shadow, fallback, and provider truth distinctly; remaining debt is pre-existing (see below).
 
 ---
 
 ## Next planned subsystem
 
-**OBSERVABILITY / EXPLAINABILITY / DEMO UX** — the next subsystem after this LLM stage.
+**DEPLOYMENT + RELIABILITY + SUBMISSION PACKAGING** — the likely next subsystem after this observability stage.
 
-Not another backend AI subsystem. It should make it easy for a judge to see:
+Observability is now **IMPLEMENTED**: `Decision explainability`, `Case timeline`, `Friction visualization`, `System readiness`, `Demo workflow` are live and verified. The stage made it easy for a judge to see:
 
     payment failure → diagnosis → baseline/adaptive reasoning → friction-adjusted candidate comparison → selected Action → temporal execution → Razorpay reconciliation → customer draft / PTP → recovered revenue
 
-This stage's LLM work is complete and optional; the following observability pass will polish the dashboard timeline, provenance visibility, and demo flows without adding new model/provider complexity. See `docs/DECISIONS.md` and `docs/ML_AND_EVALUATION.md` for the remaining synthetic-evaluation and real-outcome learning gaps that either path must keep honest.
+with guardrails, shadow/fallback, and provider truth visible. See `docs/DECISIONS.md` and `docs/ML_AND_EVALUATION.md` for remaining synthetic-evaluation and real-outcome learning gaps.
+
+Remaining deployment gaps (not implemented here): public demo deployment, webhook reachability, startup/recovery reliability, demo video script, architecture diagram, submission README cleanup, security/deployment disclaimers.
 
 ---
 

@@ -517,7 +517,7 @@ flowchart TB
 ## Frontend boundary
 
 - Routes: `GET /health`, `GET /cases`, `GET /cases/{id}`, `POST /cases/{id}/customer-reply`, `POST/GET /experiments`, `GET /experiments/{id}/export.csv` (`app/main.py:12` + `app/routers/*`).
-- Dashboard shows: backend health, case list (state / failure category / chosen action), and the persisted experiment runner (side-by-side baseline vs adaptive, incremental ₹, action distribution, CSV audit). `GET /cases/{id}` detail (`decisions`/`actions`/`audit_trail`/`promises_to_pay`/`messages`) exists but is **not rendered** by the current frontend (`frontend/src/App.tsx:113` only lists cases).
+- Dashboard is a credible fintech control center: Overview (revenue at risk/recovered, open/recovered/waiting/human-review, PTP, policy/model, queue), filterable case list (state/category/action/policy/search), and full case detail (failure explanation, Decision Inspector with candidate P/EV/friction/utility, guardrails, friction, chronological timeline, temporal runtime, Razorpay TEST MODE/SIMULATED provider truth, customer drafts DRAFT/NOT SENT, PTP lifecycle, provenance) — all derived read-only from PostgreSQL via `explainability.py` and `GET /dashboard/summary` / `GET /cases/{id}`. `?case=<id>` deep-linking.
 - No authentication, no per-merchant routing, no real-time polling/websocket.
 
 ---
@@ -535,11 +535,30 @@ flowchart TB
 
 ---
 
+## Frontend observability read-model (observability stage — IMPLEMENTED)
+
+```
+PostgreSQL truth (cases, decisions, actions, audit, messages, PTP)
+      ↓
+read-model / explainability builder (backend/app/services/explainability.py)
+  - failure_explanation (deterministic taxonomy → human meaning)
+  - normalize_decision (candidate comparison: allowed, P, EV, friction, utility, selected)
+  - guardrail_visibility / friction_breakdown (deterministic, no invention)
+  - timeline builder (derived from PaymentEvent+Decision+Action+Message+PTP+AuditEvent)
+  - provider_truth_summary (SIMULATED vs TEST MODE, reconciled)
+      ↓
+React merchant console (frontend/src/** — Overview/Cases/Experiments/System)
+  - Dashboard summary (GET /dashboard/summary)
+  - Case list (GET /cases?state=&failure_category=&chosen_action=&policy_mode=&search=)
+  - Case detail (GET /cases/{id} — enriched)
+```
+
+The dashboard is not the decision-maker. All business semantics (taxonomy, guardrails, policy, temporal, reconciliation, PTP, LLM boundary) remain in orchestrator/policy/temporal. The read-model only explains persisted truth; missing fields render as unavailable, never fabricated.
+
 ## Future components
 
 - **Production Razorpay live-money path [PLANNED]:** Separate credentials, environment gate, and hardened HMAC/secret management.
 - **Message delivery transport [PLANNED]:** Actual SMS/email/WhatsApp dispatch for drafted `CONTACT_CUSTOMER` messages.
-- **Observability / explainability UI [PLANNED]:** Promote the minimal `GET /cases/{id}` provenance + `/health` adaptive readout into a polished dashboard (policy mode, fingerprint, friction vs revenue Pareto).
 
 ---
 

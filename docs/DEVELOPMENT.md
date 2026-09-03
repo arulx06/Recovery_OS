@@ -266,7 +266,14 @@ npm run build   # tsc -b && vite build → dist/
 npm run dev     # Vite dev server on 5173; expects backend on 8000
 ```
 
-API client: `src/api.ts` — typed `HealthResponse`, `RevenueCase`, `ArmSummary`, `ExperimentSummary`. `ExperimentPanel.tsx` drives `POST /experiments` + CSV export; `App.tsx` renders health + case list (no `GET /cases/{id}` detail view yet).
+API client: `src/api.ts` — typed `HealthResponse`, `DashboardSummary`, `RevenueCase`, `CaseDetail`, `DecisionInspector`, `TimelineEvent`, `ArmSummary`, `ExperimentSummary`. `frontend/src/components/**` drives Overview / Cases / Experiments / System with `GET /dashboard/summary`, `GET /cases` (filtered), `GET /cases/{id}` (enriched with timeline/decision_inspectors/provider_truth), and `?case=<id>` deep-linking. `ExperimentPanel.tsx` shows revenue-vs-friction Pareto & action distribution.
+
+### Observability / read-model invariants (this stage)
+
+- **PostgreSQL remains truth.** `explainability.py` only derives from `RevenueCase`+`Decision`+`Action`+`AuditEvent`+`CustomerMessage`+`PromiseToPay`+`PaymentEvent`. No second timeline table. Historical missing provenance renders `null`/`unavailable`, never fabricated (frontend never invents controller scores).
+- **Frontend never invents financial truth.** Revenue at risk/recovered, state counts, friction, utility, provider truth come from backend read-model or deterministic computation; synthetic metrics remain labeled `SYNTHETIC SIMULATION`.
+- **Customer drafts never shown as delivered.** All outbound `CustomerMessage` are `status=DRAFT` / `MANUAL_ONLY` until a real transport exists; dashboard shows `DRAFT / NOT SENT`.
+- **No LLM-generated controller explanation.** All human-readable explanations of controller behavior are deterministic from persisted fields (`CATEGORY_ACTION_PREFERENCE`, `alternatives`, `decision.explanation`, guardrail config). LLM is downstream support only (draft / PTP extraction with placeholder safety and deterministic validation). No new AI, no RAG, no agent — this stage only exposes existing intelligence.
 
 ---
 

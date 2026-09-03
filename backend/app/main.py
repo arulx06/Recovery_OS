@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.routers import health, cases, webhooks, experiments
+from app.routers import health, cases, webhooks, experiments, dashboard
 
 # Schema is now owned by Alembic (backend/alembic/versions/). Run
 # `alembic upgrade head` before starting the app — see README.md
@@ -28,6 +28,7 @@ app.include_router(health.router)
 app.include_router(cases.router)
 app.include_router(webhooks.router)
 app.include_router(experiments.router)
+app.include_router(dashboard.router)
 
 
 @app.get("/")

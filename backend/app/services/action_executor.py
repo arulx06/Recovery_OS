@@ -101,6 +101,7 @@ def apply_success(db: Session, case: RevenueCase, action: Action, result: dict) 
     if action.action_type == "CREATE_PAYMENT_LINK":
         case.razorpay_payment_link_id = persist_result.get("id")
         audit_detail = {
+            "action_id": action.id,
             "action_type": action.action_type,
             "razorpay_payment_link_id": persist_result.get("id"),
             "short_url": persist_result.get("short_url"),

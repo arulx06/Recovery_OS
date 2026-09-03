@@ -13,7 +13,7 @@
 | Docker Desktop | any recent | `docker --version` |
 | Git | any recent | `git --version` |
 
-This runbook assumes the repository root is `D:\Razorpay` (or wherever you cloned to) and that you are on branch `feat/payment-link-reconciliation` (`git branch --show-current`).
+This runbook assumes the repository root is `D:\Razorpay` (or wherever you cloned to) and that you are on branch `feat/observability-demo-ux` (`git branch --show-current`).
 
 ---
 
@@ -236,7 +236,7 @@ Working directory: **`backend/`** with the venv activated.
 
 ```bash
 python -m pytest -q
-# 292 passed
+# 434 passed
 ```
 
 What "hermetic" means here (`tests/conftest.py`):
@@ -639,12 +639,58 @@ See `docs/SYSTEM_FLOWS.md` flow 8 and `app/routers/experiments.py`:
 
 ---
 
-## 11. Working-directory rules
+## 11. Observability & demo — copy-pasteable PowerShell
+
+**PowerShell (all from `backend/` unless noted, with venv activated):**
+
+```powershell
+# 1. Start backend + worker + frontend (see sections 1-3 above), then seed demo cases:
+python scripts/seed_demo.py
+# always creates 5 core rows: A CONTACT→PTP, B link→AWAITING_OUTCOME,
+# C WAIT + C_NATIVE, E injection→HUMAN_REVIEW. If a trained model is available,
+# also creates D with persisted policy_mode=adaptive and F with policy_mode=shadow
+# (7 rows across scenarios A-F). Idempotent — safe to re-run.
+# Only deletes demo rows with --reset-demo, never non-demo.
+python scripts/seed_demo.py --check          # verify without modifying
+python scripts/seed_demo.py --reset-demo     # delete only demo rows, then reseed
+python scripts/seed_demo.py --reset-only     # delete demo rows and exit
+
+# 2. Open case detail via deep-link (stable URL):
+# After seeding, copy a case id:
+$caseId = (Invoke-RestMethod http://localhost:8000/cases | Where-Object razorpay_payment_id -eq "pay_demo_A_auth_001").id
+Start-Process "http://localhost:5173/?case=$caseId"
+# Or open frontend, switch to Cases tab, click any row — inspector shows
+# failure → guardrails → friction-aware candidates → temporal → reconciliation → drafts → PTP.
+# Seed B awaits a real/simulated payment_link.paid webhook; the seed does not fabricate recovery.
+
+# 3. Run experiment (synthetic — not production lift):
+curl -X POST http://localhost:8000/experiments -H "Content-Type: application/json" -d '{"count": 500, "seed": 11}'
+curl http://localhost:8000/experiments/<run_id> | python -m json.tool
+curl http://localhost:8000/experiments/<run_id>/export.csv -o audit.csv
+
+# 4. Dashboard summary (read-only, no invented values):
+curl http://localhost:8000/dashboard/summary | python -m json.tool
+curl http://localhost:8000/health | python -m json.tool
+curl "http://localhost:8000/cases?state=RECOVERED&limit=10" | python -m json.tool
+curl http://localhost:8000/cases/<case_id> | python -m json.tool  # enriched with timeline/decision_inspectors/provider_truth
+```
+
+**CMD equivalents (note `set` vs `$env:`):**
+```cmd
+set RAZORPAY_WEBHOOK_SECRET=change_me_local_secret
+python scripts\seed_demo.py
+python scripts\seed_demo.py --check
+curl http://localhost:8000/dashboard/summary
+```
+
+## 12. Working-directory rules
 
 | Command | Must run from |
 |---------|--------------|
 | `python -m app.ml.train` | `backend/` |
 | `python scripts/send_test_webhook.py …` | `backend/` (or absolute `backend/scripts/send_test_webhook.py`) |
+| `python scripts/seed_demo.py` | `backend/` |
+| `python scripts/seed_demo.py --check` | `backend/` |
 | `python scripts/evaluate_policies.py …` | `backend/` |
 | `python scripts/process_followups.py` | `backend/` |
 | `python scripts/reconcile_actions.py` | `backend/` |
@@ -660,7 +706,7 @@ Running `python -m app.ml.train` from the **repository root** raises `ModuleNotF
 
 ---
 
-## 12. Shutdown / restart
+## 13. Shutdown / restart
 
 ```bash
 # stop backend: Ctrl+C in the uvicorn terminal
@@ -674,7 +720,7 @@ After a restart: start Compose, run `alembic upgrade head`, run `python scripts/
 
 ---
 
-## 13. Troubleshooting (only issues still relevant as of this branch)
+## 14. Troubleshooting (only issues still relevant as of this branch)
 
 | Symptom | Fix |
 |---------|-----|

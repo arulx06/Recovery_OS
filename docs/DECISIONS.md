@@ -283,6 +283,20 @@
 
 ---
 
+## ADR-21 — Observability is a derived read model, not a second source of truth
+
+| Field | Value |
+|-------|-------|
+| **Status** | Accepted and implemented |
+| **Date** | 2026-09-06 |
+| **Context** | Judges need to see failure → diagnosis → guardrails → friction-aware candidate comparison → temporal → reconciliation → PTP → recovered, but the system already has 6 persisted tables with provenance. Adding a second timeline table or letting the frontend compute financial truth would create drift and fake values. |
+| **Decision** | Build `app/services/explainability.py` as a deterministic, read-only derivation layer: `failure_explanation` (taxonomy → human meaning), `normalize_decision` (allowed/blocked + P/EV/friction/utility, missing → null/unavailable), `guardrail_visibility`, `friction_breakdown`, `build_timeline` (chronological merge of PaymentEvent+Decision+Action+Message+PTP+AuditEvent, no duplicate table), `provider_truth_summary` (SIMULATED vs TEST MODE). Backend exposes `GET /dashboard/summary` and enriches `GET /cases` / `GET /cases/{id}`; frontend in `frontend/src/components/**` (Overview/Cases/Experiments/System with `?case=<id>` deep-link) only renders what the read-model returns, never invents scores. |
+| **Why** | Keeps PostgreSQL authoritative; avoids GraphQL/analytics duplication; timeline built at read time stays consistent with audit trail; historical Decisions without adaptive fields render “Not recorded” instead of fabricated values; synthetic metrics stay labeled `SYNTHETIC SIMULATION`; no LLM-generated controller explanation. Alternative of persisting a duplicate timeline or letting frontend derive `P*amount` would break auditability and risk inventing lift. |
+| **Consequences** | Positive: single coherent `GET /cases/{id}` with timeline/decision_inspectors/provider_truth, server-side filtered case list, revenue-vs-friction Pareto and action distribution without heavy charting; `scripts/seed_demo.py` demos are idempotent and source-scoped; corrective tests cover the real CLI, FK deletion order, latest-Decision SQL filtering, and exact-Action reconciliation. Negative: timeline and current friction surface are computed per request (acceptable for hackathon scale; no Redis caching added); no new migration — reads only. |
+| **Reference** | `app/services/explainability.py`, `app/routers/dashboard.py`, `app/routers/cases.py`, `frontend/src/App.tsx` + `frontend/src/components/**`, `scripts/seed_demo.py`, `tests/test_observability.py`, `docs/CURRENT_STATE.md` capability rows, `ARCHITECTURE.md` read-model diagram, `docs/SYSTEM_FLOWS.md` flows 23–29 |
+
+---
+
 ## Proposed template for future ADRs
 
 ```markdown

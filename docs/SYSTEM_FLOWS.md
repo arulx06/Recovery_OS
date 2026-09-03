@@ -304,10 +304,89 @@ Same as flow 10 — linked `PROMISE_TO_PAY_ID`, `scheduled_for = end_of_local_da
 
 ---
 
+## 23. Case observability (dashboard summary)
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | `GET /dashboard/summary` (`app/routers/dashboard.py:17`) — read-only, derived from PostgreSQL; no Redis/Razorpay/Anthropic call |
+| **Persisted** | None — derives from `RevenueCase` (source=razorpay) + `PromiseToPay` + `Decision` provenance + `scorer.get_model_info()` + `health` primitives |
+| **Returned** | `revenue_at_risk` (sum open), `revenue_recovered` (sum RECOVERED), `total/open/recovered/waiting/human_review/stopped/disputed`, `active_ptps`, `by_state`, `by_category`, `policy_mode`, `model {available,version,fingerprint}`, `friction {profile,weight}`, `queue {status,enabled}`, `razorpay {mode_label SIMULATED vs TEST MODE}`, `llm`, `database` |
+| **Current limitation** | Revenue is `SUM(amount)`; no separate recovered-amount ledger — acceptable for demo but not settlement-accurate |
+
+Verification: `tests/test_observability.py::test_dashboard_summary_empty`, `test_dashboard_summary_counts_and_revenue`
+
+## 24. Case list operational view
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | `GET /cases?state=&failure_category=&chosen_action=&policy_mode=&search=&limit=&offset=` (`app/routers/cases.py:27`) |
+| **Persisted** | Reads `RevenueCase` (source=razorpay) + latest `Decision` + latest `Action` + PTP + contacts — server-side filtering, not browser |
+| **Returned** | Enriched case row: `amount/currency/state/failure_category/chosen_action/policy_mode/friction_score/latest Action status/payment link state/PTP/contact_count/ids/timestamps` — progressive disclosure, not squeezed |
+| **Filtering** | `chosen_action` and `policy_mode` use a correlated latest-Decision subquery before offset/limit; legacy null mode is treated as baseline. There is no arbitrary candidate window. |
+
+Verification: `tests/test_observability.py::test_case_list_filters_and_search`
+
+## 25. Case detail — enriched read model
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | `GET /cases/{id}` (`app/routers/cases.py:112`) — single coherent response preferred over `/timeline` etc. |
+| **Persisted** | `RevenueCase` + `Decision`+`Action`+`CustomerMessage`+`PromiseToPay`+`AuditEvent`+`PaymentEvent` (7 tables) — no second timeline table |
+| **Derived (read-time)** | `failure_explanation`; `decision_inspectors` from persisted decision-time alternatives/guardrails; `guardrails` and `friction` explicitly scoped as current-case recomputations; chronological `timeline`; `provider_truth` using exact-Action durable reconciliation audit evidence; `shadow`, `adaptive_fallback`, `human_review_reason`, `latest_action` |
+| **Current limitation** | Timeline is audit-event heavy (up to 60 shown) — raw JSON remains in expandable “Technical details” |
+
+Verification: `tests/test_observability.py::test_case_detail_has_failure_explanation_and_derived`, `test_timeline_ordering_and_derivation`
+
+## 26. Decision Inspector — baseline vs adaptive
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | `CaseDetailView` renders `decision_inspectors` per Decision (`app/services/explainability.py:normalize_decision`) |
+| **Baseline** | Shows ranked `CATEGORY_ACTION_PREFERENCE`, `allowed/blocked` via guardrails, `chosen_action` highest valid — no ML probabilities (correctly “unavailable”) |
+| **Adaptive** | Ranks guardrail-allowed set via `scorer.rank_actions_with_friction` → `utility = P*amount - cost - weight*friction`; shows `p_recovery`, `expected_recovered_value`, `cost`, `friction_score`, `friction_penalty`, `utility` per candidate, selected = highest utility; provenance `model_version/fingerprint/friction_profile/weight` |
+| **Shadow** | `shadow_adaptive_recommendation` audit renders side-by-side: `Executed: Baseline` vs `Shadow Recommendation: Adaptive` with disagreement flag; no second Action/queue/provider call |
+| **Fallback** | `adaptive_fallback` audit → `Decision(policy_mode=adaptive_fallback)` with baseline `alternatives`; banner “Adaptive unavailable → baseline fallback” |
+
+Verification: `tests/test_observability.py::test_baseline_decision_representation`, `test_adaptive_decision_representation`, `test_shadow_recommendation_representation`, `test_adaptive_fallback_representation`, `test_older_decision_missing_adaptive_fields`
+
+## 27. Timeline construction
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | `GET /cases/{id}` calls `explainability.build_timeline(case, decisions, actions, messages, promises, audit_events, payment_events)` |
+| **Derived only from** | `PaymentEvent`, `Decision`, `Action`, `CustomerMessage`, `PromiseToPay`, `AuditEvent` — never a duplicate persisted timeline |
+| **Events** | Payment failed/diagnosed/decision made/action scheduled/claimed/link created or reconciled/draft generated/customer replied/PTP recorded/follow-up scheduled/reconciliation/recovered/human review/disputed/failed-retried — each with timestamp, title, description, severity, metadata, optional technical expansion |
+| **Ordering** | Deterministic ISO sort; `__provenance` and duplicate `decision_made` kept as audit entries, not collapsed |
+
+Verification: `tests/test_observability.py::test_timeline_ordering_and_derivation`
+
+## 28. Experiment comparison — revenue vs friction
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | `POST /experiments` + `GET /experiments/{id}` / `export.csv` (`app/routers/experiments.py`) — upgraded `frontend/src/components/ExperimentPanel.tsx` |
+| **Returned** | Per-arm `amount_at_risk/recovered`, `recovery_rate`, `contacts/contact_rate`, `friction_score`, `escalations`, `action_cost_proxy`, `realized_net_value`, `realized_policy_utility`, `recovered_per_contact`, `action_distribution`, `waits/payment_links/ptps` — plus `incremental_recovered`, `resolved_seed`, `evaluation_friction_weight/profile`, `model_version/fingerprint` |
+| **Visualization** | `RevenueFrictionChart` (recovery rate vs contact rate vs friction vs recovered — B vs A side-by-side bars, no heavy dependency) and `ActionDistribution` (grouped WAIT/CREATE/CONTACT/ESCALATE) — makes tradeoff explicit: more intervention can recover more but RecoveryOS prices friction |
+| **Label** | Every synthetic surface labeled `SYNTHETIC SIMULATION · NOT PRODUCTION LIFT` — banner + run header + CSV |
+
+Verification: `tests/test_observability.py::test_synthetic_experiment_label`
+
+## 29. Demo scenarios — idempotent seed
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | `python scripts/seed_demo.py` (`backend/scripts/seed_demo.py:162`) — local/demo use only, no secrets, no external API by default, repeatable |
+| **Cases** | Core: A (contact→draft→PTP→FOLLOW_UP_PTP), B (CREATE→simulated/Test Mode link→AWAITING_OUTCOME; no fake paid webhook), C (WAIT), C_NATIVE (WAIT_FOR_NATIVE_RETRY), E (injection→HUMAN_REVIEW). If the trained local model is available, the script temporarily selects and then restores policy settings to create D with persisted `policy_mode=adaptive` and F with persisted `policy_mode=shadow`; shadow recommendation remains audit-only. This is seven rows across scenarios A-F. |
+| **Safety** | Deterministic IDs, source-scoped exact case selection, FK-safe dependent deletion, tolerates existing rows, and preserves non-demo rows; `--reset-only` / `--check` variants; no illegal state mutations; uses `orchestrator` + `temporal_runtime` pathways |
+
+Verification: `tests/test_observability.py::test_demo_seed_script_idempotent`, `test_seed_demo_no_external_network`
+
+---
+
 ## Cross-cutting guarantees
 
 - **Idempotency:** Webhook event IDs are unique. Action jobs contain only `action_id`; atomic `SCHEDULED -> EXECUTING` updates ensure only one worker claims a generation. Deterministic job IDs use `(action_id, attempt_count)`.
 - **Audit trail:** Every mutation is recorded as an `AuditEvent` (`case_detected`, `case_diagnosed`, `decision_made`, `action_executed`/`action_reconciled`, `adaptive_decision`/`adaptive_fallback`/`shadow_adaptive_recommendation`, `payment_link_reconciliation_*`, `case_recovered_silently`, …). Payloads live in `detail` JSON; `Decision` carries first-class `policy_mode/model_version/fingerprint/friction_*` plus `alternatives[_provenance]` with per-candidate `p_recovery`, `expected_value`, `utility`, `friction_score`.
-- **No external network from tests:** tests force provider and queue gates off, use a temp SQLite DB, point `REDIS_URL` at an inert local port, deny external sockets, and mock `httpx` — 329 tests pass with fake `rzp_test`/`sk-ant` keys.
+- **No external network from tests:** tests force provider and queue gates off, use a temp SQLite DB, point `REDIS_URL` at an inert local port, deny external sockets, and mock `httpx` — 434 tests pass with fake test credentials.
 - **Failure isolation:** expected provider failures retry with bounded exponential delay and sanitized persisted errors. Lease expiry is repaired by reconciliation; exhausted attempts become `FAILED + HUMAN_REVIEW`. Adaptive model failure never strands a case — `adaptive_fallback` → baseline `Decision` in same transaction.
 - **Transaction boundary:** no Redis, Razorpay, or Anthropic call is made while a production request/worker DB transaction remains open; adaptive scoring is `scorer.rank_actions_with_friction` batched (one `predict_proba` per decision), provenance is flushed after `record_decision`.
