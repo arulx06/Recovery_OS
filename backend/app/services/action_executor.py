@@ -33,7 +33,7 @@ def snapshot_case(case: RevenueCase) -> CaseSnapshot:
     )
 
 
-def perform(action_id: str, action_type: str, case: CaseSnapshot) -> dict:
+def perform(action_id: str, action_type: str, case: CaseSnapshot, _inject: str | None = None, **_kwargs) -> dict:
     """Perform the external operation without an open database transaction.
 
     - Razorpay Payment Links are created outside transaction.
@@ -41,14 +41,30 @@ def perform(action_id: str, action_type: str, case: CaseSnapshot) -> dict:
     - Never holds DB lock during network.
     """
     if action_type == "CREATE_PAYMENT_LINK":
+        # Failure injection check — dev/test only
+        if _inject and "worker_execution_failure" in _inject and __import__("app.core.config", fromlist=["settings"]).settings.FAILURE_INJECTION_ENABLED:
+            from app.services import razorpay_client as _rc
+
+            raise _rc.RazorpayAmbiguousError("injected worker execution failure")
         # First, create authoritative Payment Link (provider truth)
-        link = razorpay_client.create_payment_link(
-            amount_rupees=case.amount,
-            currency=case.currency,
-            description=f"Recovery for case {case.id} ({case.failure_category or 'unclassified'})",
-            reference_id=action_id,
-            notes={"recoveryos_case_id": case.id, "recoveryos_action_id": action_id},
-        )
+        try:
+            link = razorpay_client.create_payment_link(
+                amount_rupees=case.amount,
+                currency=case.currency,
+                description=f"Recovery for case {case.id} ({case.failure_category or 'unclassified'})",
+                reference_id=action_id,
+                notes={"recoveryos_case_id": case.id, "recoveryos_action_id": action_id},
+                _inject=_inject,
+            )
+        except TypeError:
+            # Back-compat with test monkeypatch that doesn't accept _inject
+            link = razorpay_client.create_payment_link(
+                amount_rupees=case.amount,
+                currency=case.currency,
+                description=f"Recovery for case {case.id} ({case.failure_category or 'unclassified'})",
+                reference_id=action_id,
+                notes={"recoveryos_case_id": case.id, "recoveryos_action_id": action_id},
+            )
         # Then, optional message draft using placeholder substitution.
         # The authoritative short_url is substituted deterministically; LLM never invents URL.
         authoritative_url = link.get("short_url")

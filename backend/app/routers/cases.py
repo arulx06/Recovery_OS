@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.config import settings
+from app.core.demo_auth import require_demo_admin
 from app.core.time import utc_now, utc_to_local
 from app.models import RevenueCase, Decision, Action, AuditEvent, PromiseToPay, CustomerMessage, PaymentEvent
 from app.services import llm_client, orchestrator, task_queue
@@ -23,6 +24,15 @@ router = APIRouter(prefix="/cases", tags=["cases"])
 class CustomerReplyRequest(BaseModel):
     body: str
 
+    @field_validator("body")
+    @classmethod
+    def _validate_body(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("body must be non-empty")
+        if len(v) > 2000:
+            raise ValueError("body too long — max 2000 chars")
+        return v.strip()
+
 
 def _latest_decision(db: Session, case_id: str) -> Decision | None:
     return (
@@ -35,6 +45,7 @@ def _latest_decision(db: Session, case_id: str) -> Decision | None:
 
 @router.get("")
 def list_cases(
+    _auth: bool = Depends(require_demo_admin),
     db: Session = Depends(get_db),
     state: str | None = Query(default=None, description="Filter by case state"),
     failure_category: str | None = Query(default=None, description="Filter by failure category"),
@@ -157,7 +168,7 @@ def list_cases(
 
 
 @router.get("/{case_id}")
-def get_case(case_id: str, db: Session = Depends(get_db)):
+def get_case(case_id: str, db: Session = Depends(get_db), _auth: bool = Depends(require_demo_admin)):
     """
     Full detail for one case: every decision made (with alternatives and
     the guardrails applied), every action scheduled/executed, and the
@@ -383,7 +394,7 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{case_id}/customer-reply")
-def customer_reply(case_id: str, body: CustomerReplyRequest, db: Session = Depends(get_db)):
+def customer_reply(case_id: str, body: CustomerReplyRequest, request: Request, db: Session = Depends(get_db), _auth: bool = Depends(require_demo_admin)):
     """
     Phase 6: simulates receiving an inbound customer reply (SMS/WhatsApp/
     email — whichever channel eventually sends this in production isn't

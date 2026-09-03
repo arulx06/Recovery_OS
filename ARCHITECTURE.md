@@ -516,9 +516,9 @@ flowchart TB
 
 ## Frontend boundary
 
-- Routes: `GET /health`, `GET /cases`, `GET /cases/{id}`, `POST /cases/{id}/customer-reply`, `POST/GET /experiments`, `GET /experiments/{id}/export.csv` (`app/main.py:12` + `app/routers/*`).
+- Routes: `GET /health` (liveness, sanitized), `GET /ready` (readiness gated), `GET /live` (pure up), `GET /dashboard/summary`, `GET /cases` (filtered), `GET /cases/{id}` (enriched), `POST /cases/{id}/customer-reply` (optionally `DEMO_ADMIN_TOKEN`), `POST/GET /experiments` (optionally gated, bounded by `EXPERIMENT_MAX_COUNT`), `GET /experiments/{id}/export.csv`, `POST /admin/demo-reset` (gated) (`app/main.py:12` + `app/routers/*`).
 - Dashboard is a credible fintech control center: Overview (revenue at risk/recovered, open/recovered/waiting/human-review, PTP, policy/model, queue), filterable case list (state/category/action/policy/search), and full case detail (failure explanation, Decision Inspector with candidate P/EV/friction/utility, guardrails, friction, chronological timeline, temporal runtime, Razorpay TEST MODE/SIMULATED provider truth, customer drafts DRAFT/NOT SENT, PTP lifecycle, provenance) — all derived read-only from PostgreSQL via `explainability.py` and `GET /dashboard/summary` / `GET /cases/{id}`. `?case=<id>` deep-linking.
-- No authentication, no per-merchant routing, no real-time polling/websocket.
+- No production IAM; public-demo mode uses optional `DEMO_ADMIN_TOKEN` (header `X-Demo-Admin-Token`, stored `sessionStorage`, never baked) — webhook remains HMAC-only. Polling is bounded: 30s health/dashboard, 10s active case detail (no WebSocket hammering).
 
 ---
 
@@ -555,9 +555,18 @@ React merchant console (frontend/src/** — Overview/Cases/Experiments/System)
 
 The dashboard is not the decision-maker. All business semantics (taxonomy, guardrails, policy, temporal, reconciliation, PTP, LLM boundary) remain in orchestrator/policy/temporal. The read-model only explains persisted truth; missing fields render as unavailable, never fabricated.
 
+## Hardening (release-hardening-e2e — IMPLEMENTED)
+
+- **Liveness vs readiness:** `/health` sanitized liveness, `/ready` gated readiness (DB+Redis required, LLM/Razorpay optional never degrades), `/live` pure up. `X-Request-ID` on every response, structured JSON logs (`app/core/logging_config.py`, `app/core/middleware.py`) redacting secrets.
+- **Public-demo safety:** Optional `DEMO_ADMIN_TOKEN_ENABLED` gates sensitive reads (`GET /cases*`, `/dashboard/summary`, `/experiments*`) and operator mutations with `X-Demo-Admin-Token`; root/health/readiness remain public and webhook remains HMAC-only; token entered at runtime via `sessionStorage` (never baked).
+- **Startup validation:** `app/core/config.py:validate_startup_config` fails fast for incomplete test-mode creds, live-key accident, unknown `RECOVERY_POLICY`, empty demo token when enabled.
+- **CORS:** `FRONTEND_ORIGIN` comma-split; wildcard alone disables credentials, and wildcard mixed with explicit origins fails startup validation.
+- **Failure injection:** `app/services/failure_injection.py` gated by `FAILURE_INJECTION_ENABLED`, header `X-Failure-Inject` with bounded cases (razorpay_timeout/500, rq_enqueue_failure, worker failure, etc.) — never silently active.
+- **Deployment:** `backend/Dockerfile` + `frontend/Dockerfile` + `docker-compose.prod.yml` (API+worker share image, migrate as one-time release step). `.dockerignore` excludes local configuration and host artifacts; the backend image deterministically runs `python -m app.ml.train` and fails its build unless `scorer.get_model_info().available` is true.
+
 ## Future components
 
-- **Production Razorpay live-money path [PLANNED]:** Separate credentials, environment gate, and hardened HMAC/secret management.
+- **Production Razorpay live-money path [PLANNED]:** Separate credentials, environment gate, and hardened HMAC/secret management — today's Test Mode gate is `ENFORCE_TEST_MODE_ONLY`.
 - **Message delivery transport [PLANNED]:** Actual SMS/email/WhatsApp dispatch for drafted `CONTACT_CUSTOMER` messages.
 
 ---

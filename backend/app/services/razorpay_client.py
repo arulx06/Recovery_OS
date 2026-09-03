@@ -81,6 +81,8 @@ def create_payment_link(
     reference_id: str,
     notes: Optional[dict] = None,
     timeout_seconds: float = 10.0,
+    _inject: str | None = None,
+    **_kwargs,
 ) -> dict:
     """
     Creates a Razorpay Payment Link (test mode, once real credentials are
@@ -91,6 +93,14 @@ def create_payment_link(
     Returns the Razorpay API response dict (or the simulated equivalent).
     Raises RazorpayAPIError on a live call that fails.
     """
+    # Failure injection — dev only
+    from app.services.failure_injection import should_inject
+
+    if should_inject("razorpay_timeout", _inject):
+        raise RazorpayAmbiguousError("injected razorpay timeout")
+    if should_inject("razorpay_500", _inject):
+        raise RazorpayAmbiguousError("injected razorpay 500")
+
     if not settings.RAZORPAY_API_ENABLED:
         return _simulated_payment_link(amount_rupees, currency, description, reference_id)
 

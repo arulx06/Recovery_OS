@@ -94,8 +94,8 @@ def validate_feature_row(row: dict): ...
     "holdout_n": 6000,
     "metrics": {"roc_auc": 0.7756, "log_loss": 0.4715, "brier_score": 0.1597, "accuracy": 0.7510, "base_rate": 0.37},
     "model_class": "HistGradientBoostingClassifier",
-    "fingerprint": "75e9cfd6... (sha256 of joblib)",
-    "fingerprint_short": "75e9cfd6",
+    "fingerprint": "<sha256 of this generated joblib>",
+    "fingerprint_short": "<first 8 hex characters>",
     "synthetic_data_notice": "synthetic simulation benchmark — not production lift",
     "library_versions": {"scikit-learn": "1.5.2", ...}
   }
@@ -115,7 +115,7 @@ Trained on 24000 rows, evaluated on 6000 holdout rows (base recovery rate: 37%)
   Log loss:  0.4715
   Brier:     0.1597
   Accuracy:  0.7510 (at 0.5)
-  Fingerprint: 75e9cfd6  (model recovery-v1, schema v1)
+  Fingerprint: <build-specific SHA-256 prefix>  (model recovery-v1, schema v1)
 ```
 
 - **Brier** `0.1597` indicates reasonable calibration for a histogram GBDT on synthetic data; no Platt/isotonic calibration applied. Synthetic holdout (6k) and GBDT's native isotonic-ish boosting make explicit calibration unnecessary for utility ordering at this scale. If holdout grew or real data showed miscalibration (reliability diagram, ECE), sigmoid/isotonic would be considered — but not before.
@@ -185,7 +185,7 @@ scorer.rank_actions_with_friction(context, allowed, friction_scores, weight)
 }
 ```
 
-`Decision.expected_value` stores classic `EV` (for backward compat); `Decision.alternatives["_provenance"]` stores `{policy_mode:"adaptive", model_version:"recovery-v1", fingerprint:"75e9cfd6", friction_profile:"balanced", friction_weight:18, top_utility, top_expected_value}` plus `Decision.policy_mode/model_version/fingerprint/friction_*` first-class columns. `AuditEvent(adaptive_decision)` mirrors it.
+`Decision.expected_value` stores classic `EV` (for backward compat); `Decision.alternatives["_provenance"]` stores `{policy_mode:"adaptive", model_version:"recovery-v1", fingerprint:"<current artifact SHA-256>", friction_profile:"balanced", friction_weight:18, top_utility, top_expected_value}` plus `Decision.policy_mode/model_version/fingerprint/friction_*` first-class columns. `AuditEvent(adaptive_decision)` mirrors it.
 
 ---
 

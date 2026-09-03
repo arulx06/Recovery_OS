@@ -6,6 +6,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
+from app.core.demo_auth import require_demo_admin
 from app.core.database import get_db
 from app.models import ExperimentCase
 from app.services import experiment_runner
@@ -15,21 +17,23 @@ router = APIRouter(prefix="/experiments", tags=["experiments"])
 
 
 class RunExperimentRequest(BaseModel):
-    count: int = 500
+    count: int = 100
     seed: int | None = None
 
 
 @router.post("")
-def run_experiment(body: RunExperimentRequest, db: Session = Depends(get_db)):
+def run_experiment(body: RunExperimentRequest, db: Session = Depends(get_db), _auth: bool = Depends(require_demo_admin)):
     """
-    Phase 7 exit criteria: one click, 500+ synthetic cases, reproducible
-    (pass the same seed back to get the same run again), summarized
-    immediately. Same baseline-vs-adaptive comparison as
-    scripts/evaluate_policies.py, but persisted so it shows up in the
-    dashboard and can be downloaded afterward.
+    Synthetic experiment (SYNTHETIC SIMULATION — NOT PRODUCTION LIFT).
+    Guarded: max count is EXPERIMENT_MAX_COUNT (default 1000) to avoid demo freeze.
+    Dashboard default is 100. Count >1000 requires explicit server config.
     """
-    if body.count < 1 or body.count > 5000:
-        raise HTTPException(status_code=400, detail="count must be between 1 and 5000")
+    max_count = int(getattr(settings, "EXPERIMENT_MAX_COUNT", 1000))
+    if body.count < 1 or body.count > max_count:
+        raise HTTPException(status_code=400, detail=f"count must be between 1 and {max_count} (EXPERIMENT_MAX_COUNT)")
+    if body.count > 500:
+        # Warn for large runs — still allowed up to max but expensive
+        pass
 
     try:
         run_id = experiment_runner.run_experiment(db, count=body.count, seed=body.seed)
@@ -39,7 +43,7 @@ def run_experiment(body: RunExperimentRequest, db: Session = Depends(get_db)):
 
 
 @router.get("")
-def list_experiments(db: Session = Depends(get_db)):
+def list_experiments(db: Session = Depends(get_db), _auth: bool = Depends(require_demo_admin)):
     """Recent runs, most recent first — lets the dashboard offer a history, not just the latest."""
     rows = (
         db.query(ExperimentCase.run_id, ExperimentCase.created_at)
@@ -58,7 +62,7 @@ def list_experiments(db: Session = Depends(get_db)):
 
 
 @router.get("/{run_id}")
-def get_experiment(run_id: str, db: Session = Depends(get_db)):
+def get_experiment(run_id: str, db: Session = Depends(get_db), _auth: bool = Depends(require_demo_admin)):
     summary = experiment_runner.summarize_run(db, run_id)
     if not summary["found"]:
         raise HTTPException(status_code=404, detail="experiment run not found")
@@ -66,7 +70,7 @@ def get_experiment(run_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/{run_id}/export.csv")
-def export_experiment_csv(run_id: str, db: Session = Depends(get_db)):
+def export_experiment_csv(run_id: str, db: Session = Depends(get_db), _auth: bool = Depends(require_demo_admin)):
     """
     Phase 7 exit criteria: downloadable audit. One row per synthetic case
     per arm — exactly what a judge (or a skeptical teammate) would want to

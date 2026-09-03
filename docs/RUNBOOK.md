@@ -165,7 +165,7 @@ Expected: `Uvicorn running on http://127.0.0.1:8000`.
 **PowerShell / CMD / macOS / Linux:**
 
 ```bash
-curl http://localhost:8000/health
+python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/health').read().decode())"
 # {"status":"ok","service":"recoveryos-backend","database":"connected"}
 ```
 
@@ -174,7 +174,7 @@ If `database` is `unreachable`, check `docker compose ps` and that `backend/.env
 **Root endpoint:**
 
 ```bash
-curl http://localhost:8000/
+python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/').read().decode())"
 # {"service":"RecoveryOS","phase":"7 - measurement + explainability dashboard"}
 ```
 
@@ -236,7 +236,7 @@ Working directory: **`backend/`** with the venv activated.
 
 ```bash
 python -m pytest -q
-# 434 passed
+# 471 passed
 ```
 
 What "hermetic" means here (`tests/conftest.py`):
@@ -267,7 +267,7 @@ Set `RAZORPAY_WEBHOOK_SECRET` in `backend/.env` to any non-empty string, restart
 $env:RAZORPAY_WEBHOOK_SECRET="change_me_local_secret"
 python scripts/send_test_webhook.py payment.failed --payment-id pay_demo_1 --amount 4999 --error-reason card_expired
 python scripts/send_test_webhook.py payment.captured --payment-id pay_demo_1 --amount 4999
-curl http://localhost:8000/cases
+curl.exe http://localhost:8000/cases
 # the pay_demo_1 case should show state RECOVERED
 ```
 
@@ -316,11 +316,12 @@ $env:RAZORPAY_WEBHOOK_SECRET="<same as backend/.env>"
 python scripts/send_test_webhook.py payment.failed --payment-id pay_demo_2 --amount 1800 --error-reason card_expired
 ```
 
-Then inspect:
+Then inspect (use a real case ID from the first response):
 
-```bash
-curl http://localhost:8000/cases | python -m json.tool
-curl http://localhost:8000/cases/<case-id> | python -m json.tool
+```powershell
+$cases = Invoke-RestMethod http://localhost:8000/cases
+$caseId = $cases[0].id
+Invoke-RestMethod "http://localhost:8000/cases/$caseId" | ConvertTo-Json -Depth 10
 # details.actions[0].result should contain a genuine plink_* id,
 # details.actions[0].result.simulated == false,
 # and detail '{"short_url": "https://rzp.io/..."}' (not /simulated/).
@@ -334,7 +335,7 @@ curl http://localhost:8000/cases/<case-id> | python -m json.tool
 $cases = Invoke-RestMethod http://localhost:8000/cases
 $linkId = $cases[0].razorpay_payment_link_id
 python scripts/send_test_webhook.py payment_link.paid --payment-link-id $linkId --amount 1800
-curl http://localhost:8000/cases
+curl.exe http://localhost:8000/cases
 # case should show state RECOVERED, audit event case_recovered_silently
 ```
 
@@ -378,7 +379,7 @@ Invoke-RestMethod http://localhost:8000/cases/$caseId | ConvertTo-Json -Depth 10
 # customer replies "I'll pay 8000 Friday"
 Invoke-RestMethod -Method Post -Uri http://localhost:8000/cases/$caseId/customer-reply `
   -ContentType "application/json" `
-  -Body '{"body": "I'\''ll pay 8000 Friday"}'
+  -Body '{"body": "I''ll pay 8000 Friday"}'
 # -> {"case_state":"AWAITING_OUTCOME"} with a PromiseToPay + scheduled FOLLOW_UP_PTP
 
 # customer disputes
@@ -450,11 +451,11 @@ Invoke-RestMethod http://localhost:8000/cases/$caseId | ConvertTo-Json -Depth 10
 
 ```powershell
 # Valid PTP with explicit amount
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/cases/$caseId/customer-reply -ContentType "application/json" -Body '{"body": "I'\''ll pay 8000 Friday"}'
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/cases/$caseId/customer-reply -ContentType "application/json" -Body '{"body": "I''ll pay 8000 Friday"}'
 # -> promise_to_pay, promised_amount=8000, promised_date=YYYY-MM-DD, FOLLOW_UP_PTP scheduled
 
 # Valid without explicit amount -> per deterministic rule currently HUMAN_REVIEW (no invented amount)
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/cases/$caseId/customer-reply -ContentType "application/json" -Body '{"body": "I'\''ll pay Friday"}'
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/cases/$caseId/customer-reply -ContentType "application/json" -Body '{"body": "I''ll pay Friday"}'
 # -> HUMAN_REVIEW (amount_method stays customer_explicit only when explicit)
 
 # Ambiguous -> uncertain/HUMAN_REVIEW
@@ -537,14 +538,16 @@ Copy-Item .env.example .env   # then set RECOVERY_POLICY=baseline
 $env:RECOVERY_POLICY="baseline"
 # restart uvicorn, then:
 python scripts/send_test_webhook.py payment.failed --payment-id pay_demo_baseline --amount 2000 --error-reason insufficient_funds
-curl http://localhost:8000/cases/<id> | python -m json.tool   # decisions[0].policy_mode == "baseline"
+$caseId = 'actual-case-uuid'
+curl.exe "http://localhost:8000/cases/$caseId" | python -m json.tool   # decisions[0].policy_mode == "baseline"
 ```
 
 *Shadow* — baseline executes, adaptive audited:
 ```powershell
 $env:RECOVERY_POLICY="shadow"
 # restart, then same webhook; check audit:
-curl http://localhost:8000/cases/<id> | python -m json.tool
+$caseId = 'actual-case-uuid'
+curl.exe "http://localhost:8000/cases/$caseId" | python -m json.tool
 # audit_trail contains shadow_adaptive_recommendation {baseline_chosen, adaptive_suggested, candidates, fingerprint, disagreement}
 # No second Action created
 ```
@@ -555,8 +558,9 @@ $env:RECOVERY_POLICY="adaptive"
 $env:ADAPTIVE_POLICY_PROFILE="balanced"
 # restart, then webhook where adaptive differs (e.g., TRANSIENT_INFRASTRUCTURE may still WAIT, but INVALID_INSTRUMENT may choose CREATE vs CONTACT based on friction)
 python scripts/send_test_webhook.py payment.failed --payment-id pay_demo_adaptive --amount 2000 --error-reason card_expired
-curl http://localhost:8000/cases/<id> | python -m json.tool
-# decisions[0].policy_mode == "adaptive", model_version == "recovery-v1", fingerprint_short e.g. 75e9cfd6, friction_profile == "balanced", alternatives contain p_recovery/utility/friction_score
+$caseId = 'actual-case-uuid'
+curl.exe "http://localhost:8000/cases/$caseId" | python -m json.tool
+# decisions[0].policy_mode == "adaptive", model_version == "recovery-v1", fingerprint_short identifies the current build artifact, friction_profile == "balanced", alternatives contain p_recovery/utility/friction_score
 ```
 
 *Forced fallback* — corrupt/missing model falls back to baseline:
@@ -566,7 +570,7 @@ curl http://localhost:8000/cases/<id> | python -m json.tool
 
 Check health:
 ```powershell
-curl http://localhost:8000/health | python -m json.tool
+curl.exe http://localhost:8000/health | python -m json.tool
 # adaptive_policy {configured_mode, model_available, model_version, fingerprint_short, feature_schema_compatible}
 ```
 
@@ -664,15 +668,15 @@ Start-Process "http://localhost:5173/?case=$caseId"
 # Seed B awaits a real/simulated payment_link.paid webhook; the seed does not fabricate recovery.
 
 # 3. Run experiment (synthetic — not production lift):
-curl -X POST http://localhost:8000/experiments -H "Content-Type: application/json" -d '{"count": 500, "seed": 11}'
-curl http://localhost:8000/experiments/<run_id> | python -m json.tool
-curl http://localhost:8000/experiments/<run_id>/export.csv -o audit.csv
+$runId = (Invoke-RestMethod -Method Post -Uri 'http://localhost:8000/experiments' -ContentType 'application/json' -Body '{"count":500,"seed":11}').run_id
+curl.exe "http://localhost:8000/experiments/$runId" | python -m json.tool
+Invoke-WebRequest -Uri "http://localhost:8000/experiments/$runId/export.csv" -OutFile 'audit.csv'
 
 # 4. Dashboard summary (read-only, no invented values):
-curl http://localhost:8000/dashboard/summary | python -m json.tool
-curl http://localhost:8000/health | python -m json.tool
-curl "http://localhost:8000/cases?state=RECOVERED&limit=10" | python -m json.tool
-curl http://localhost:8000/cases/<case_id> | python -m json.tool  # enriched with timeline/decision_inspectors/provider_truth
+curl.exe http://localhost:8000/dashboard/summary | python -m json.tool
+curl.exe http://localhost:8000/health | python -m json.tool
+curl.exe "http://localhost:8000/cases?state=RECOVERED&limit=10" | python -m json.tool
+curl.exe "http://localhost:8000/cases/$caseId" | python -m json.tool  # enriched with timeline/decision_inspectors/provider_truth
 ```
 
 **CMD equivalents (note `set` vs `$env:`):**
@@ -694,7 +698,7 @@ curl http://localhost:8000/dashboard/summary
 | `python scripts/evaluate_policies.py …` | `backend/` |
 | `python scripts/process_followups.py` | `backend/` |
 | `python scripts/reconcile_actions.py` | `backend/` |
-| `python scripts/reconcile_payment_links.py --action-id <id> --dry-run` | `backend/` |
+| `$actionId = 'actual-action-uuid'; python scripts/reconcile_payment_links.py --action-id $actionId --dry-run` | `backend/` (PowerShell) |
 | `rq worker ... recoveryos` | `backend/` |
 | `python scripts/run_synthetic_batch.py …` | `backend/` (it sets `DATABASE_URL=sqlite:///:memory:` itself) |
 | `python -m pytest` | `backend/` |
@@ -734,5 +738,92 @@ After a restart: start Compose, run `alembic upgrade head`, run `python scripts/
 | Actions remain `EXECUTING` after a worker crash | After `ACTION_CLAIM_TIMEOUT_SECONDS`, run reconciliation. It resets attempts still within budget and fails exhausted work to human review. |
 | `npm run lint` fails | `oxlint` (not eslint) — run `npm install` first; check Node 22+. |
 | `alembic upgrade head` says `already at head` | Fine - current head is `a1b2c3d4e5f6` (decision provenance). CI verifies migrations against SQLite and local verification uses PostgreSQL. |
+
+---
+
+## 15. Release hardening — health/readiness, demo safety, deployment (this pass)
+
+**Health vs readiness:**
+
+```bash
+curl http://localhost:8000/health   # liveness — always 200 if process up, sanitized
+curl http://localhost:8000/live     # pure liveness (no DB)
+curl http://localhost:8000/ready    # readiness — 200 ready, 503 not_ready; gates DB+Redis, LLM/Razorpay never unhealthy
+curl http://localhost:8000/dashboard/summary | python -m json.tool  # operational metrics + mode labels
+```
+
+`X-Request-ID` is echoed on every response; structured JSON logs include `request_id, route, latency_ms`.
+
+**Public-demo safety (optional):**
+
+```bash
+# In backend/.env
+DEMO_ADMIN_TOKEN_ENABLED=true
+DEMO_ADMIN_TOKEN=replace_with_random_16+chars
+# restart uvicorn — then sensitive operator reads and mutations require header:
+curl -H "X-Demo-Admin-Token: $DEMO_ADMIN_TOKEN" -X POST http://localhost:8000/experiments -H "Content-Type: application/json" -d '{"count":10,"seed":1}'
+curl -H "X-Demo-Admin-Token: $DEMO_ADMIN_TOKEN" -X POST http://localhost:8000/cases/<id>/customer-reply -H "Content-Type: application/json" -d '{"body":"hello"}'
+# webhook remains HMAC-only, no token:
+curl -X POST http://localhost:8000/webhooks/razorpay -H "x-razorpay-signature: ..." -H "x-razorpay-event-id: evt_1" ...
+```
+
+Frontend token entry: System tab → paste token → stored `sessionStorage` only, never baked into build.
+
+Protected reads are `GET /cases*`, `GET /dashboard/summary`, and `GET /experiments*`. Public routes remain `GET /`, `/health`, `/live`, `/ready`, plus the HMAC-authenticated `POST /webhooks/razorpay`.
+
+**Startup validation (fail-fast):**
+
+```bash
+uvicorn app.main:app --reload   # aborts on RAZORPAY_API_ENABLED=true with incomplete/live key, unknown RECOVERY_POLICY, or DEMO_ADMIN_TOKEN_ENABLED without token
+```
+
+Tests use `ENV=test` and skip this gate.
+
+**Experiment guard:**
+
+```
+EXPERIMENT_MAX_COUNT=1000  # API rejects count > limit; dashboard demo uses 100
+```
+
+Banner `SYNTHETIC SIMULATION · NOT PRODUCTION LIFT` on every experiment surface.
+
+**CORS:**
+
+```
+FRONTEND_ORIGIN=http://localhost:5173
+# or comma-separated for deploy: FRONTEND_ORIGIN=https://demo.example.com,http://localhost:5173
+# never "*" with credentials
+```
+
+**Failure injection (dev/test only):**
+
+```bash
+# backend/.env: FAILURE_INJECTION_ENABLED=true
+# then header:
+curl -H "X-Failure-Inject: razorpay_timeout" http://localhost:8000/...   # + cases: razorpay_500, rq_enqueue_failure, worker_execution_failure, etc.
+```
+
+Never silently active — gated, header-triggered, not persisted.
+
+**Offline demo:**
+
+See `docs/OFFLINE_DEMO.md`. Summary: `python scripts/seed_demo.py --reset-demo` + `uvicorn` + `rq worker` + `npm run dev` all work without internet (SIMULATED `plink_sim_*`).
+
+**Deployment:**
+
+```bash
+# Local source run: train explicitly.
+python -m app.ml.train
+# Container build: backend/Dockerfile trains after COPY and fails the build
+# unless scorer.get_model_info().available is true. Host artifacts are ignored.
+
+# Migrations — one-time release step, not raced by workers:
+alembic upgrade head
+# or with prod compose:
+docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm migrate
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+Public webhook tunnel: see `docs/PUBLIC_WEBHOOK.md`.
 
 No real credentials are included above. For full boundaries see `docs/INTEGRATIONS.md`.

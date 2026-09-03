@@ -4,6 +4,7 @@ from sqlalchemy import func, text
 
 from app.core.database import get_db
 from app.core.config import settings
+from app.core.demo_auth import require_demo_admin
 from app.models import RevenueCase, PromiseToPay
 from app.services.task_queue import get_queue
 
@@ -71,7 +72,7 @@ def _resolve_counts(db: Session):
 
 
 @router.get("/summary")
-def dashboard_summary(db: Session = Depends(get_db)):
+def dashboard_summary(db: Session = Depends(get_db), _auth: bool = Depends(require_demo_admin)):
     counts = _resolve_counts(db)
 
     # Policy / model info
@@ -191,4 +192,3 @@ def dashboard_summary(db: Session = Depends(get_db)):
         "llm": llm_info,
         "database": "connected" if db_ok else "unreachable",
     }
-

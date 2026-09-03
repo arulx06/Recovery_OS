@@ -18,3 +18,6 @@ dist/
 
 # OS
 .DS_Store
+
+# Local coding-agent transcripts
+session-ses_*.md

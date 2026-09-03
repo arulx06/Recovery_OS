@@ -1,0 +1,63 @@
+# Production-oriented compose — uses same backend image for API and worker.
+# Run once per deploy: docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm migrate
+services:
+  migrate:
+    build: ./backend
+    image: recoveryos/backend:release-hardening
+    profiles: ["migrate"]
+    command: ["alembic", "upgrade", "head"]
+    env_file: ["./backend/.env"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg2://recoveryos:recoveryos@postgres:5432/recoveryos}"
+
+  api:
+    build: ./backend
+    image: recoveryos/backend:release-hardening
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file: ["./backend/.env"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg2://recoveryos:recoveryos@postgres:5432/recoveryos}"
+      REDIS_URL: "${REDIS_URL:-redis://redis:6379/0}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/live')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    build: ./backend
+    image: recoveryos/backend:release-hardening
+    restart: unless-stopped
+    command: ["rq", "worker", "--with-scheduler", "--url", "redis://redis:6379/0", "recoveryos"]
+    working_dir: /app
+    env_file: ["./backend/.env"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg2://recoveryos:recoveryos@postgres:5432/recoveryos}"
+      REDIS_URL: "${REDIS_URL:-redis://redis:6379/0}"
+
+  frontend:
+    image: recoveryos/frontend:release-hardening
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: "${VITE_API_BASE_URL:-http://localhost:8000}"
+    ports:
+      - "5173:80"
+    depends_on:
+      api:
+        condition: service_healthy

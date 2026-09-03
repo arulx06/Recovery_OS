@@ -123,8 +123,13 @@ recoveryos/
 | `LLM_MAX_RETRIES` | No | `2` | Bounded retries (transient only) |
 | `LLM_MESSAGE_DRAFT_ENABLED` | No | `true` | Sub-gate for drafting |
 | `LLM_PTP_EXTRACTION_ENABLED` | No | `true` | Sub-gate for extraction |
-| `FRONTEND_ORIGIN` | No | `http://localhost:5173` | CORS `allow_origins` |
+| `FRONTEND_ORIGIN` | No | `http://localhost:5173` | CORS `allow_origins` (comma-separated for deploy) |
 | `VITE_API_BASE_URL` | No | `http://localhost:8000` | Frontend fetch base |
+| `DEMO_ADMIN_TOKEN_ENABLED` | No | `false` | When true, sensitive operator reads and mutations require `X-Demo-Admin-Token`; root/health/readiness and webhook exempt |
+| `DEMO_ADMIN_TOKEN` | When enabled | `""` | Bearer for demo ops — never baked into frontend build |
+| `FAILURE_INJECTION_ENABLED` | No | `false` | Dev/test header `X-Failure-Inject` — never silently active |
+| `EXPERIMENT_MAX_COUNT` | No | `1000` | Max `count` for `POST /experiments` |
+| `ENFORCE_TEST_MODE_ONLY` | No | `true` | Reject `rzp_live_*` keys |
 
 Do not document real secret values. The `.env.example` values are the only values that may appear in docs.
 

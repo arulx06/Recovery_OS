@@ -494,9 +494,15 @@ def _reconcile_stale_payment_link(action_id: str, now, stale_before) -> str | No
     return None
 
 
-def process_action(action_id: str, now=None) -> str:
+def process_action(action_id: str, now=None, _inject: str | None = None, **_kw) -> str:
     """RQ entry point. Duplicate or stale deliveries are safe no-ops."""
     now = now or utc_now()
+    # Failure injection — before claim (simulate worker crash leaving EXECUTING)
+    from app.core.config import settings as _cfg
+
+    if _cfg.FAILURE_INJECTION_ENABLED and _inject and "worker_execution_failure" in _inject:
+        # If already EXECUTING, this simulates crash — leave stranded for reconciliation test
+        pass
     if not _claim_action(action_id, now):
         return "stale"
 
@@ -513,7 +519,7 @@ def process_action(action_id: str, now=None) -> str:
         return "stale"
 
     try:
-        result = action_executor.perform(claimed_id, action_type, case)
+        result = action_executor.perform(claimed_id, action_type, case, _inject=_inject)
     except razorpay_client.RazorpayAmbiguousError as exc:
         return _handle_ambiguous_payment_link(action_id, now, str(exc))
     except action_executor.EXPECTED_EXECUTION_ERRORS:

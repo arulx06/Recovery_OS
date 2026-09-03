@@ -37,8 +37,28 @@ def _job_is_registered(queue: Queue, job_id: str) -> bool:
     )
 
 
-def enqueue_action(action_id: str) -> bool:
-    """Publish the current scheduled generation of an action after DB commit."""
+def enqueue_action(action_id: str, _header_inject: str | None = None) -> bool:
+    """Publish the current scheduled generation of an action after DB commit.
+
+    Supports failure injection: when FAILURE_INJECTION_ENABLED and header
+    contains rq_enqueue_failure, simulate publish failure without touching Redis.
+    """
+    # Failure injection — dev/test only (must run even when queue disabled for testing)
+    from app.services.failure_injection import should_inject
+
+    if should_inject("rq_enqueue_failure", _header_inject):
+        # Simulate enqueue failure — leave SCHEDULED in DB for reconciliation
+        with SessionLocal.begin() as db:
+            action = db.query(Action).filter(Action.id == action_id, Action.status == "SCHEDULED").first()
+            if action:
+                action.last_error = "queue publish failed (injected)"
+                db.add(AuditEvent(
+                    revenue_case_id=action.revenue_case_id,
+                    event="action_enqueue_failed",
+                    detail={"action_id": action.id, "injected": True},
+                ))
+        return False
+
     if not settings.TASK_QUEUE_ENABLED:
         return False
 

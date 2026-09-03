@@ -83,7 +83,7 @@
 | **Context** | Buildathon evaluation is against Razorpay Test Mode API; production live-money is out of scope but the codebase must prevent misleading "it works" claims or accidental live calls. |
 | **Decision** | `create_payment_link` rejects any non-`rzp_test_*` key at call time with `RazorpayAPIError("RecoveryOS only permits Razorpay Test Mode API keys")`, even when `RAZORPAY_API_ENABLED=true`. Docs state `TEST MODE ≠ production` as a top-level disclaimer (`README.md: Two disclaimers`, `docs/INTEGRATIONS.md: TEST MODE ≠ production`). |
 | **Why** | Verification path needed to demonstrate the real Razorpay REST call (`POST /v1/payment_links` → genuine `plink_*`) without moving real money; production readiness is a separate future phase with explicit environment/secret management. |
-| **Consequences** | Positive: the manually observed `plink_*` / `rzp.io` path cited in this pass is explicitly Test Mode and labelled. Negative: a production cut-over would touch `razorpay_client.py`, `config.py`, and `INTEGRATIONS.md` at minimum — not a one-line flip. |
+| **Consequences** | Positive: any future `plink_*` / `rzp.io` smoke is constrained to Test Mode and labelled; automated coverage remains network-hermetic. Negative: a production cut-over would touch `razorpay_client.py`, `config.py`, and `INTEGRATIONS.md` at minimum — not a one-line flip. |
 | **Reference** | `app/services/razorpay_client.py:48`, `docs/CURRENT_STATE.md: Capability matrix footnote` |
 
 ---
@@ -222,7 +222,7 @@
 | **Context** | `ground_truth` is the only labeled data; training on it and evaluating on the same assumptions is circular if presented as lift. |
 | **Decision** | Keep synthetic `ground_truth`/`synthetic_history` but document circularity, add Brier score (`0.1597`) and no-calibration rationale, keep one canonical `features.py` pipeline (`FEATURE_SCHEMA_VERSION=v1`) validated at train and serve, require `manifest.json` (`model_version recovery-v1`, `fingerprint` sha256, `synthetic_data_notice`) with fingerprint exposed in `Decision`, `AuditEvent`, `/health`, `/cases/{id}`, and `common-random` matched scenarios. Real validation (temporal split, IPS/DR, controlled rollout) is documented as a roadmap, not implemented. |
 | **Why** | A lower honest metric (e.g., balanced adaptive `-28k` on one seed) is better than a high invalid claim; friction-aware evaluation reports `contacts`, `contact_rate`, `friction`, `recovered_per_contact` alongside `recovered`. |
-| **Consequences** | Positive: `train` prints `ROC-AUC 0.7756, Brier 0.1597, Accuracy 0.7510, fingerprint 75e9cfd6`; `GET /health` shows `model_available` without requiring Razorpay; `train_serve_parity` test guards drift. Negative: synthetic robustness ≠ production validation — still needs logged `Decision` provenance + outcome timestamps for future real learning. |
+| **Consequences** | Positive: seeded training prints stable evaluation metrics and a SHA-256 fingerprint for the generated artifact; `GET /health` shows `model_available` without requiring Razorpay; `train_serve_parity` guards drift. The byte fingerprint is build-specific, not a release constant. Negative: synthetic robustness ≠ production validation — still needs logged `Decision` provenance + outcome timestamps for future real learning. |
 | **Reference** | `app/ml/train.py`, `app/ml/scorer.py`, `app/ml/features.py`, `app/ml/manifest.py`, `app/services/experiment_runner.py`, `docs/ML_AND_EVALUATION.md` |
 
 ---
@@ -294,6 +294,20 @@
 | **Why** | Keeps PostgreSQL authoritative; avoids GraphQL/analytics duplication; timeline built at read time stays consistent with audit trail; historical Decisions without adaptive fields render “Not recorded” instead of fabricated values; synthetic metrics stay labeled `SYNTHETIC SIMULATION`; no LLM-generated controller explanation. Alternative of persisting a duplicate timeline or letting frontend derive `P*amount` would break auditability and risk inventing lift. |
 | **Consequences** | Positive: single coherent `GET /cases/{id}` with timeline/decision_inspectors/provider_truth, server-side filtered case list, revenue-vs-friction Pareto and action distribution without heavy charting; `scripts/seed_demo.py` demos are idempotent and source-scoped; corrective tests cover the real CLI, FK deletion order, latest-Decision SQL filtering, and exact-Action reconciliation. Negative: timeline and current friction surface are computed per request (acceptable for hackathon scale; no Redis caching added); no new migration — reads only. |
 | **Reference** | `app/services/explainability.py`, `app/routers/dashboard.py`, `app/routers/cases.py`, `frontend/src/App.tsx` + `frontend/src/components/**`, `scripts/seed_demo.py`, `tests/test_observability.py`, `docs/CURRENT_STATE.md` capability rows, `ARCHITECTURE.md` read-model diagram, `docs/SYSTEM_FLOWS.md` flows 23–29 |
+
+---
+
+## ADR-22 — Release hardening: trust, not features
+
+| Field | Value |
+|-------|-------|
+| **Status** | Accepted and implemented |
+| **Date** | 2026-09-03 |
+| **Context** | Hackathon demo must survive missing Wi-Fi, wrong keys, hung workers, and judge clicking. Prior passes added capability; remaining risk was operational fragility, secret leakage, and overstated claims. |
+| **Decision** | Harden without new AI: (a) split `/health` liveness vs `/ready` readiness (DB/Redis gated, LLM/Razorpay optional, sanitized), (b) optional `DEMO_ADMIN_TOKEN_ENABLED` for sensitive operator reads and mutations (webhook stays HMAC-only, token in `sessionStorage` never baked), (c) `validate_startup_config` fail-fast, including ambiguous mixed-wildcard CORS, (d) structured JSON logging + `X-Request-ID` correlation, (e) bounded experiments and dev-only failure injection, (f) queue orphan recovery, (g) secret-safe Docker contexts with a build-generated model and native dependency healthchecks, and (h) reproducible judge script + offline fallback. |
+| **Why** | Keeps PostgreSQL authoritative and Razorpay provider-authoritative; Redis/RQ stays at-least-once transport with stale-`EXECUTING` reconciliation already proven. Smallest correct public-demo protection beats building IAM; header-gated injection beats unauthenticated public crash endpoints; one-time migrate beats raced workers. Synthetic evaluation stays labeled `SYNTHETIC SIMULATION`. |
+| **Consequences** | Positive: 460 hermetic tests, health never leaks secrets, live keys rejected, duplicate reconciliation idempotent, demo seed/reset safe, frontend survives API outage with honest errors and bounded polling, deployment reproducible. Negative: no production IAM, no live-money path — documented as `DEMO-GRADE` and `TEST_MODE_ONLY`. |
+| **Reference** | `app/core/config.py:validate_startup_config`, `app/main.py`, `app/core/middleware.py`, `app/core/logging_config.py`, `app/core/demo_auth.py`, `app/routers/health.py`, `app/routers/admin.py`, `app/services/failure_injection.py`, `docker-compose.prod.yml`, `docs/DEMO_SCRIPT.md`, `docs/OFFLINE_DEMO.md`, `docs/PUBLIC_WEBHOOK.md`, `tests/test_release_hardening.py` |
 
 ---
 

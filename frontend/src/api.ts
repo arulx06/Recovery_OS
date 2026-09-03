@@ -1,5 +1,18 @@
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
+function getDemoToken(): string | null {
+  try {
+    return sessionStorage.getItem("demo_admin_token");
+  } catch {
+    return null;
+  }
+}
+
+function authHeaders(): Record<string, string> {
+  const t = getDemoToken();
+  return t ? { "X-Demo-Admin-Token": t } : {};
+}
+
 export type HealthResponse = {
   status: string;
   service: string;
@@ -317,9 +330,10 @@ export type ExperimentSummary = {
 };
 
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`);
+  const res = await fetch(`${API_BASE}${path}`, { headers: { ...authHeaders() } });
   if (!res.ok) {
     const text = await res.text();
+    // Never surface raw stack trace — truncate
     throw new Error(`${path} returned ${res.status}: ${text.slice(0, 200)}`);
   }
   return res.json() as Promise<T>;
@@ -328,7 +342,7 @@ async function get<T>(path: string): Promise<T> {
 async function post<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -337,6 +351,29 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   }
   return res.json() as Promise<T>;
 }
+
+async function downloadExperimentCsv(runId: string): Promise<void> {
+  const path = `/experiments/${runId}/export.csv`;
+  const res = await fetch(`${API_BASE}${path}`, { headers: { ...authHeaders() } });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${path} returned ${res.status}: ${text.slice(0, 200)}`);
+  }
+  const url = URL.createObjectURL(await res.blob());
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `recoveryos_experiment_${runId}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+export function setDemoToken(token: string | null) {
+  try {
+    if (token) sessionStorage.setItem("demo_admin_token", token);
+    else sessionStorage.removeItem("demo_admin_token");
+  } catch {}
+}
+export function getDemoTokenValue() { return getDemoToken(); }
 
 function buildCaseQuery(filters: CaseFilters): string {
   const params = new URLSearchParams();
@@ -353,6 +390,8 @@ function buildCaseQuery(filters: CaseFilters): string {
 
 export const api = {
   health: () => get<HealthResponse>("/health"),
+  readiness: () => get<Record<string, unknown>>("/ready"),
+  liveness: () => get<Record<string, unknown>>("/live"),
   dashboardSummary: () => get<DashboardSummary>("/dashboard/summary"),
   cases: (filters?: CaseFilters) => get<RevenueCase[]>(filters ? buildCaseQuery(filters) : "/cases"),
   caseDetail: (id: string) => get<CaseDetail>(`/cases/${id}`),
@@ -360,5 +399,7 @@ export const api = {
     post<ExperimentSummary>("/experiments", { count, seed: seed ?? null }),
   experiment: (runId: string) => get<ExperimentSummary>(`/experiments/${runId}`),
   experiments: () => get<Array<{ run_id: string; created_at: string | null }>>("/experiments"),
-  experimentCsvUrl: (runId: string) => `${API_BASE}/experiments/${runId}/export.csv`,
+  downloadExperimentCsv,
+  demoReset: () => post<{status:string; deleted_cases:number}>("/admin/demo-reset", {}),
+  demoCheck: () => get<{demo_cases: unknown[]; count:number}>("/admin/demo-check"),
 };

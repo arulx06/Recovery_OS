@@ -19,7 +19,7 @@
   - `payment.dispute.created` → `_handle_dispute` (matched on `RevenueCase.razorpay_payment_id`)
   - Anything else → `return None` (acknowledged but no case change; historically `unknown` payloads may carry odd wrappers; `_entity_from_payload` iterates `payload.payload.values()`).
 
-**What has been manually verified:**
+**Bounded manual Test Mode smoke (not performed in the current corrective pass):**
 
 ```
 payment.failed { error_reason: "card_expired" }
@@ -33,7 +33,7 @@ payment_link.paid { payload.payment_link.entity.id == <that plink_*> }
   → state RECOVERED, audit case_recovered_silently
 ```
 
-No other production Razorpay API surface is used. No subscriptions/orders mutation.
+The flow above is the expected manual verification procedure and is covered by hermetic request-shape/reconciliation tests. It was not sent to Razorpay during the current corrective pass. No production Razorpay API surface is used and no subscriptions/orders mutation exists.
 
 ### Payment Links — gates, identity, and verified provider semantics
 

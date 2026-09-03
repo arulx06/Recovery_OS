@@ -192,13 +192,12 @@ export default function ExperimentPanel() {
                   seed {result.resolved_seed ?? "—"} · {result.evaluation_friction_profile ?? "balanced"} × {result.evaluation_friction_weight ?? "—"} · {result.model_version ?? ""} {result.model_fingerprint ? `· ${String(result.model_fingerprint).slice(0, 8)}` : ""} · {result.scenario_count ?? result.case_count / 2} scenarios
                 </span>
               </div>
-              <a
-                href={api.experimentCsvUrl(result.run_id)}
+              <button
+                onClick={() => api.downloadExperimentCsv(result.run_id).catch((e) => setError(e instanceof Error ? e.message : "CSV download failed"))}
                 className="rounded border border-white/10 px-3 py-1.5 text-xs text-gray-300 hover:bg-white/10"
-                download
               >
                 Download audit CSV
-              </a>
+              </button>
             </div>
 
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">

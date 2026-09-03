@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { api } from "./api";
+import { api, setDemoToken, getDemoTokenValue } from "./api";
 import type { HealthResponse, DashboardSummary, CaseDetail } from "./api";
 import { HealthPanel } from "./components/HealthPanel";
 import { DashboardOverview } from "./components/DashboardOverview";
@@ -35,9 +35,11 @@ export default function App() {
   const [dashboardError, setDashboardError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("overview");
   const [selectedCaseId, setSelectedCaseId] = useCaseDeepLink();
-  const [detail, setDetail] = useState<CaseDetail | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
-  const [detailError, setDetailError] = useState<string | null>(null);
+  const [detailResult, setDetailResult] = useState<{
+    caseId: string;
+    detail: CaseDetail | null;
+    error: string | null;
+  }>({ caseId: "", detail: null, error: null });
 
   // Initial health + dashboard fetch
   useEffect(() => {
@@ -55,20 +57,33 @@ export default function App() {
     if (selectedCaseId) setTab("cases");
   }, [selectedCaseId]);
 
-  // Fetch case detail when selected
+  // Fetch case detail when selected — with bounded polling for temporal updates
   useEffect(() => {
-    if (!selectedCaseId) {
-      setDetail(null);
-      setDetailError(null);
-      return;
-    }
-    setDetailLoading(true);
-    setDetailError(null);
-    api
-      .caseDetail(selectedCaseId)
-      .then(setDetail)
-      .catch((e) => setDetailError(e instanceof Error ? e.message : "failed to load case"))
-      .finally(() => setDetailLoading(false));
+    if (!selectedCaseId) return;
+    let cancelled = false;
+    const fetchDetail = () => {
+      api
+        .caseDetail(selectedCaseId)
+        .then((detail) => {
+          if (!cancelled) setDetailResult({ caseId: selectedCaseId, detail, error: null });
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            setDetailResult({
+              caseId: selectedCaseId,
+              detail: null,
+              error: error instanceof Error ? error.message : "failed to load case",
+            });
+          }
+        });
+    };
+    fetchDetail();
+    // Bounded polling every 10s while a case is selected — cheap, no hammering
+    const pollTimer = window.setInterval(fetchDetail, 10000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(pollTimer);
+    };
   }, [selectedCaseId]);
 
   const handleSelectCase = (id: string) => {
@@ -78,7 +93,12 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  const backendUp = healthError ? false : health ? health.status === "ok" : null;
+  const backendUp = healthError ? false : health ? (health.status === "ok" || (health as unknown as Record<string, unknown>).status === "degraded" ? true : health.status === "ok") : null;
+  const detail = detailResult.caseId === selectedCaseId ? detailResult.detail : null;
+  const detailError = detailResult.caseId === selectedCaseId ? detailResult.error : null;
+  const detailLoading = selectedCaseId !== null && detailResult.caseId !== selectedCaseId;
+  const [demoTokenInput, setDemoTokenInput] = useState(() => getDemoTokenValue() ?? "");
+  const [tokenSaved, setTokenSaved] = useState(false);
 
   return (
     <div className="min-h-screen bg-[#0b0d10] px-4 py-6 md:px-8 lg:px-12">
@@ -223,7 +243,7 @@ export default function App() {
                 </Card>
               ) : detailError ? (
                 <Card>
-                  <ErrorState message={detailError} onRetry={() => selectedCaseId && api.caseDetail(selectedCaseId).then(setDetail).catch((e) => setDetailError(e instanceof Error ? e.message : "error"))} />
+                  <ErrorState message={detailError} onRetry={() => selectedCaseId && api.caseDetail(selectedCaseId).then((nextDetail) => setDetailResult({ caseId: selectedCaseId, detail: nextDetail, error: null })).catch((error) => setDetailResult({ caseId: selectedCaseId, detail: null, error: error instanceof Error ? error.message : "error" }))} />
                 </Card>
               ) : (
                 <CaseDetailView detail={detail} />
@@ -253,7 +273,7 @@ export default function App() {
           <Card>
             <h3 className="text-sm font-semibold">How to interpret</h3>
             <div className="mt-2 text-xs leading-relaxed text-gray-400">
-              Experiments are <span className="font-medium text-gray-200">SYNTHETIC SIMULATION</span> — not production Razorpay lift. Training and evaluation share the same hand-authored simulator{" "}
+              <span className="inline-flex rounded bg-amber-900/30 px-1.5 py-0.5 font-mono text-amber-300">SYNTHETIC SIMULATION · NOT PRODUCTION LIFT</span> — not production Razorpay lift. Training and evaluation share the same hand-authored simulator{" "}
               <span className="font-mono text-[11px]">(ground_truth.py)</span>. They validate code and utility ordering, not lift. Real lift needs logged outcomes,
               temporal splits, and controlled rollout — see ML_AND_EVALUATION.md.
               <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-3 text-[11px]">
@@ -270,6 +290,46 @@ export default function App() {
       {tab === "system" && (
         <div className="space-y-4">
           <HealthPanel health={health} dashboard={dashboard} healthError={healthError} />
+          {/* Demo mode labels */}
+          <Card>
+            <h3 className="text-sm font-semibold">Demo mode</h3>
+            <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-4 text-xs">
+              <div className="rounded border border-white/10 bg-black/20 px-2 py-2">
+                <div className="text-[11px] uppercase text-gray-500">Razorpay</div>
+                <div className="font-mono text-gray-200">{dashboard?.razorpay.mode_label ?? "—"}</div>
+                <div className="text-[11px] text-gray-600">{dashboard?.razorpay.simulated ? "simulated plink_sim_*" : dashboard?.razorpay.mode_label === "RAZORPAY TEST MODE" ? "real Test Mode plink_*" : "—"}</div>
+              </div>
+              <div className="rounded border border-white/10 bg-black/20 px-2 py-2">
+                <div className="text-[11px] uppercase text-gray-500">LLM</div>
+                <div className="font-mono text-gray-200">{dashboard?.llm?.enabled ? `${dashboard.llm.provider}/${dashboard.llm.model ?? ""}` : "deterministic fallback"}</div>
+                <div className="text-[11px] text-gray-600">{dashboard?.llm?.enabled ? "Anthropic" : "LLM_API_ENABLED=false"}</div>
+              </div>
+              <div className="rounded border border-white/10 bg-black/20 px-2 py-2">
+                <div className="text-[11px] uppercase text-gray-500">Policy</div>
+                <div className="font-mono text-gray-200">{dashboard?.policy_mode ?? "baseline"}</div>
+                <div className="text-[11px] text-gray-600">model {dashboard?.model.fingerprint_short ?? "none"}</div>
+              </div>
+              <div className="rounded border border-white/10 bg-black/20 px-2 py-2">
+                <div className="text-[11px] uppercase text-gray-500">Data</div>
+                <div className="font-mono text-amber-300">SYNTHETIC DEMO</div>
+                <div className="text-[11px] text-gray-600">never production lift</div>
+              </div>
+            </div>
+            {dashboardError && <div className="mt-2 rounded border border-red-900/30 bg-red-950/20 px-2 py-1 text-xs text-red-300">{dashboardError}</div>}
+            {!dashboard && !dashboardError && <div className="mt-2 text-xs text-gray-500">API unreachable — showing offline fallback. Dashboard needs backend at {String(import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000")}.</div>}
+          </Card>
+          {/* Operator token (transient, sessionStorage only) */}
+          <Card>
+            <h3 className="text-sm font-semibold">Operator access {dashboard?.razorpay ? "" : ""}</h3>
+            <p className="text-xs text-gray-500">When DEMO_ADMIN_TOKEN_ENABLED=true, operator reads and mutations require a token. Paste it here — stored only in sessionStorage, never baked into build.</p>
+            <div className="mt-2 flex gap-2">
+              <input value={demoTokenInput} onChange={(e) => setDemoTokenInput(e.target.value)} placeholder="paste DEMO_ADMIN_TOKEN (if required)" type="password" className="flex-1 rounded border border-white/10 bg-black/30 px-2 py-1.5 text-xs text-gray-200 placeholder:text-gray-600" />
+              <button onClick={() => { setDemoToken(demoTokenInput || null); setTokenSaved(true); setTimeout(() => setTokenSaved(false), 2000); }} className="rounded bg-white px-3 py-1.5 text-xs font-medium text-black hover:bg-gray-100">Save</button>
+              <button onClick={() => { setDemoToken(null); setDemoTokenInput(""); setTokenSaved(true); setTimeout(() => setTokenSaved(false), 2000); }} className="rounded border border-white/10 px-3 py-1.5 text-xs text-gray-300 hover:bg-white/10">Clear</button>
+            </div>
+            {tokenSaved && <div className="mt-1 text-[11px] text-emerald-400">Token stored in sessionStorage (transient).</div>}
+            <div className="mt-1 text-[11px] text-gray-600">Public routes remain: /health, /ready, /live, /webhooks/razorpay (signature). Do not hard-code token into frontend build.</div>
+          </Card>
           <Card>
             <h3 className="text-sm font-semibold">Configuration</h3>
             <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2 text-xs">
@@ -293,7 +353,7 @@ export default function App() {
               </div>
             </div>
             <div className="mt-3 rounded border border-white/10 bg-white/5 p-3 text-xs leading-relaxed text-gray-500">
-              Single-merchant local demo — no auth, no multi-tenancy. Documented as deployment limitation. All outbound customer messages remain <span className="font-medium text-amber-300">DRAFT / NOT SENT</span>.
+              Single-merchant demo with optional operator-token protection, not production IAM or multi-tenancy. All outbound customer messages remain <span className="font-medium text-amber-300">DRAFT / NOT SENT</span>.
             </div>
           </Card>
           <Card>
@@ -324,7 +384,7 @@ export default function App() {
           <span>
             RecoveryOS · Razorpay Test Mode only · Synthetic evaluation · Messages DRAFT / NOT SENT · LLM does not control money moves
           </span>
-          <span className="font-mono text-[11px]">branch feat/observability-demo-ux · dashboard is read-model, not decision-maker</span>
+          <span className="font-mono text-[11px]">branch feat/release-hardening-e2e · dashboard is read-model, not decision-maker</span>
         </div>
       </footer>
     </div>
