@@ -129,15 +129,17 @@ def test_execute_contact_action_handles_live_api_failure_gracefully(db_session, 
 
     monkeypatch.setattr(llm_client, "draft_contact_message", raise_error)
 
-    with pytest.raises(llm_client.LLMAPIError):
-        action_executor.perform(
-            action.id, action.action_type, action_executor.snapshot_case(case),
-        )
-    action_executor.apply_terminal_failure(db_session, case, action)
-
-    assert action.status == "FAILED"
-    assert "error" in action.result
-    assert case.state == "HUMAN_REVIEW"
-
+    # Per LLM fallback spec, CONTACT action must not fail recovery — deterministic fallback draft is used
+    result = action_executor.perform(
+        action.id, action.action_type, action_executor.snapshot_case(case),
+    )
+    assert "body" in result
+    assert result.get("generation_method") == "llm_fallback_template"
+    # Apply success should still create a DRAFT message, not FAILED
+    action_executor.apply_success(db_session, case, action, result)
+    assert action.status == "EXECUTED"
+    assert case.state == "AWAITING_OUTCOME"
     messages = db_session.query(CustomerMessage).filter(CustomerMessage.revenue_case_id == case.id).all()
-    assert len(messages) == 0  # nothing recorded as "sent" if drafting failed
+    assert len(messages) == 1
+    assert messages[0].status == "DRAFT"
+    assert messages[0].generation_method == "llm_fallback_template"

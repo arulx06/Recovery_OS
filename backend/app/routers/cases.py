@@ -146,6 +146,12 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
                 "channel": m.channel,
                 "body": m.body,
                 "extracted": m.extracted,
+                "generation_method": getattr(m, "generation_method", None),
+                "llm_provider": getattr(m, "llm_provider", None),
+                "llm_model": getattr(m, "llm_model", None),
+                "prompt_version": getattr(m, "prompt_version", None),
+                "schema_version": getattr(m, "schema_version", None),
+                "status": getattr(m, "status", None),
                 "created_at": m.created_at.isoformat() if m.created_at else None,
             }
             for m in messages
@@ -157,6 +163,14 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
                 "promised_date": p.promised_date.isoformat() if p.promised_date else None,
                 "confidence": float(p.confidence) if p.confidence is not None else None,
                 "status": p.status,
+                "extraction_method": getattr(p, "extraction_method", None),
+                "llm_provider": getattr(p, "llm_provider", None),
+                "llm_model": getattr(p, "llm_model", None),
+                "prompt_version": getattr(p, "prompt_version", None),
+                "schema_version": getattr(p, "schema_version", None),
+                "amount_method": getattr(p, "amount_method", None),
+                "reasoning_code": getattr(p, "reasoning_code", None),
+                "source_message_id": getattr(p, "source_message_id", None),
             }
             for p in promises
         ],
@@ -187,7 +201,9 @@ def customer_reply(case_id: str, body: CustomerReplyRequest, db: Session = Depen
 
     now = utc_now()
     business_now = utc_to_local(now, settings.MERCHANT_TIMEZONE)
-    extraction = llm_client.extract_ptp_intent(body.body, now=business_now)
+    # Extraction runs outside DB transaction (no lock held during LLM call)
+    # The wrapper catches only typed provider errors; unexpected errors still propagate.
+    extraction = llm_client.extract_with_fallback(body.body, now=business_now)
     case = (
         db.query(RevenueCase)
         .filter(RevenueCase.id == case_id)

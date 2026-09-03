@@ -171,9 +171,16 @@ def test_live_extraction_malformed_json_falls_back_to_unclear(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(httpx, "post", fake_post)
-    result = llm_client.extract_ptp_intent("whatever", now=NOW)
+    # malformed JSON must raise typed error at provider boundary; wrapper handles fallback
+    with pytest.raises(llm_client.LLMInvalidResponseError):
+        llm_client.extract_ptp_intent("whatever", now=NOW)
+    # wrapper fallback returns deterministic, not llm-tagged
+    result = llm_client.extract_with_fallback("whatever", now=NOW)
     assert result.intent == "unclear"
-    assert result.simulated is False
+    assert result.simulated is True
+    assert result.extraction_method == "deterministic"
+    assert result.provider is None
+    assert result.raw.get("fallback_from_llm") is True
 
 
 def test_live_extraction_failure_raises(monkeypatch):

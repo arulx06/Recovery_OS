@@ -500,7 +500,9 @@ def handle_customer_reply(
 
     extraction = extraction or llm_client.extract_ptp_intent(message_body, now=business_now)
 
-    db.add(CustomerMessage(
+    # Persist inbound message with provenance — customer text canonical record
+    # generation_method / llm metadata stored on CustomerMessage for auditability
+    inbound_msg = CustomerMessage(
         revenue_case_id=case.id,
         direction="inbound",
         channel="simulated" if extraction.simulated else "llm",
@@ -508,33 +510,85 @@ def handle_customer_reply(
         extracted={
             "intent": extraction.intent,
             "amount": extraction.amount,
+            "promised_amount": extraction.promised_amount,
             "date": extraction.date,
+            "promised_date": extraction.promised_date,
             "confidence": extraction.confidence,
+            "reasoning_code": extraction.reasoning_code,
+            "provider": extraction.provider,
+            "model": extraction.model,
+            "prompt_version": extraction.prompt_version,
+            "schema_version": extraction.schema_version,
+            "extraction_method": extraction.extraction_method,
         },
-    ))
+        generation_method=extraction.extraction_method or ("deterministic" if extraction.simulated else "llm"),
+        llm_provider=extraction.provider,
+        llm_model=extraction.model,
+        prompt_version=extraction.prompt_version,
+        schema_version=extraction.schema_version,
+        status="RECEIVED",
+    )
+    db.add(inbound_msg)
+    db.flush()
+
+    # Observability: extraction completed audit (sanitized, no raw customer text)
+    _log_audit(
+        db, case, "ptp_extraction_completed",
+        {
+            "intent": extraction.intent,
+            "confidence": extraction.confidence,
+            "extraction_method": extraction.extraction_method,
+            "provider": extraction.provider,
+            "model": extraction.model,
+            "prompt_version": extraction.prompt_version,
+            "reasoning_code": extraction.reasoning_code,
+        },
+    )
 
     if case.state not in REPLYABLE_STATES:
         _log_audit(db, case, "customer_reply_ignored_terminal_state", {"state": case.state})
         db.flush()
         return case
 
-    if extraction.intent == "dispute":
-        _dispute_case(db, case, reason="customer_reported_dispute", extra_detail={"message": message_body[:200]})
+    # Payment claim / dispute — never mark RECOVERED, always conservative DISPUTED / manual
+    if extraction.intent in ("dispute", "payment_claim"):
+        _log_audit(db, case, "customer_payment_claim_received", {"intent": extraction.intent, "extraction_method": extraction.extraction_method})
+        _dispute_case(db, case, reason="customer_reported_dispute", extra_detail={"intent": extraction.intent})
+        db.flush()
+        return case
+
+    # Not-a-promise / do-not-contact
+    if extraction.intent in ("not_a_promise",):
+        _log_audit(db, case, "ptp_extraction_uncertain", {"reason": "not_a_promise / opt_out", "intent": extraction.intent})
+        _cancel_scheduled_actions(db, case)
+        case.state = "HUMAN_REVIEW"
+        case.updated_at = now
+        _log_audit(db, case, "ptp_validation_rejected", {"reason": "not_a_promise", "intent": extraction.intent})
         db.flush()
         return case
 
     outstanding = float(case.amount) if case.amount is not None else 0.0
+    # Case eligibility checks per spec 12
+    if case.state in ("RECOVERED", "DISPUTED", "STOPPED"):
+        _log_audit(db, case, "ptp_validation_rejected", {"reason": f"case state {case.state} not eligible", "intent": extraction.intent})
+        _cancel_scheduled_actions(db, case)
+        case.state = "HUMAN_REVIEW"
+        case.updated_at = now
+        db.flush()
+        return case
+
     validation = ptp_extractor.validate_promise(
         extraction, outstanding_amount=outstanding, now=business_now,
     )
 
     if not validation.valid:
+        # Use deterministic validation result
         _cancel_scheduled_actions(db, case)
         case.state = "HUMAN_REVIEW"
         case.updated_at = now
         _log_audit(
             db, case, "ptp_validation_failed",
-            {"reason": validation.reason, "extraction": {"intent": extraction.intent, "amount": extraction.amount, "date": extraction.date, "confidence": extraction.confidence}},
+            {"reason": validation.reason, "extraction": {"intent": extraction.intent, "amount": extraction.amount, "promised_amount": extraction.promised_amount, "date": extraction.date, "promised_date": extraction.promised_date, "confidence": extraction.confidence, "reasoning_code": extraction.reasoning_code}},
         )
         db.flush()
         return case
@@ -566,6 +620,14 @@ def handle_customer_reply(
         promised_date=datetime.combine(validation.promised_date, time.min),
         confidence=extraction.confidence,
         status="PENDING",
+        extraction_method=extraction.extraction_method or ("deterministic" if extraction.simulated else "llm"),
+        llm_provider=extraction.provider,
+        llm_model=extraction.model,
+        prompt_version=extraction.prompt_version,
+        schema_version=extraction.schema_version,
+        amount_method=validation.amount_method,
+        reasoning_code=extraction.reasoning_code or validation.reasoning_code,
+        source_message_id=inbound_msg.id,
     )
     db.add(promise)
     db.flush()
@@ -591,6 +653,13 @@ def handle_customer_reply(
             "followup_at_utc": followup_at.isoformat(),
             "merchant_timezone": settings.MERCHANT_TIMEZONE,
             "superseded_promises": len(previous_promises),
+            "extraction_method": promise.extraction_method,
+            "provider": promise.llm_provider,
+            "model": promise.llm_model,
+            "prompt_version": promise.prompt_version,
+            "amount_method": promise.amount_method,
+            "confidence": float(promise.confidence) if promise.confidence is not None else None,
+            "source_message_id": promise.source_message_id,
         },
     )
     db.flush()

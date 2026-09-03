@@ -14,6 +14,16 @@ export type HealthResponse = {
     fingerprint_short: string | null;
     feature_schema_compatible: boolean;
   };
+  llm?: {
+    enabled: boolean;
+    provider: string;
+    configured: boolean;
+    model: string | null;
+    message_drafting: string;
+    ptp_extraction: string;
+    prompt_versions: { ptp_extraction: string; message_draft: string };
+    schema_versions: { ptp: string; message: string };
+  };
 };
 
 export type RevenueCase = {

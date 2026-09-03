@@ -65,8 +65,8 @@ flowchart LR
 | RQ Transport `app/services/task_queue.py`, `app/jobs.py` | [IMPLEMENTED · VERIFIED] | Publish ID-only immediate/delayed jobs after DB commit; Redis is reconstructable | Redis only |
 | Action Executor `app/services/action_executor.py` | [IMPLEMENTED · VERIFIED] | Perform provider calls outside DB transactions and persist final results | Razorpay (Payment Links) and LLM (draft) when enabled |
 | Razorpay Client `app/services/razorpay_client.py` | [IMPLEMENTED · SIMULATED / TEST_MODE_ONLY] | `POST /v1/payment_links`; simulation fallback; `rzp_test_*` gate | Yes — Razorpay Test Mode when `RAZORPAY_API_ENABLED=true` |
-| LLM Client `app/services/llm_client.py` | [IMPLEMENTED · SIMULATED / PARTIAL] | Draft outbound text; extract PTP intent `{intent, amount, date, confidence}` | Yes — Anthropic Messages API when `LLM_API_ENABLED=true`; **anthropic-only**, other providers raise |
-| PTP Extractor `app/services/ptp_extractor.py` | [IMPLEMENTED] | Validate LLM extraction before recording `PromiseToPay` | No |
+| LLM Client `app/services/llm_client.py` | [IMPLEMENTED · OPTIONAL LLM] | Draft outbound text (DRAFT with `[[PAYMENT_LINK]]` placeholder) and structured PTP extraction `{intent, promised_amount, promised_date, confidence, reasoning_code}` — typed errors, prompt versioning, bounded retries, PII-minimized | Yes — Anthropic Messages API when `LLM_API_ENABLED=true` + `LLM_MESSAGE_DRAFT_ENABLED` / `LLM_PTP_EXTRACTION_ENABLED`; **anthropic-only**, other providers raise; `LLM_API_ENABLED=false` → deterministic fallback |
+| PTP Extractor `app/services/ptp_extractor.py` | [IMPLEMENTED · VERIFIED] | Deterministic validation of structured extraction before recording `PromiseToPay` (intent, date range, amount ≤ outstanding, amount_method=customer_explicit, confidence, case eligible) | No |
 | PTP Follow-up `app/services/ptp_followup.py` | [IMPLEMENTED · VERIFIED] | Resolve the exact linked promise after its merchant-local due day | No |
 | Windows Worker `app/worker.py` | [IMPLEMENTED · VERIFIED] | RQ `SimpleWorker` with timer timeout, avoiding unsupported fork/SIGALRM | Redis/PostgreSQL |
 | Experiment Runner `app/services/experiment_runner.py` | [IMPLEMENTED] | Matched-scenario baseline vs adaptive with `run_id` + CSV audit | No |
@@ -433,12 +433,75 @@ ground_truth.py: BASE_PROBABILITY[(category, action)]  ──┤
 
 | Concern | Truth |
 |---------|-------|
-| Provider | **Anthropic only** (`app/services/llm_client.py:32` `ANTHROPIC_MODEL=claude-3-5-haiku-latest`). `LLM_PROVIDER != anthropic` raises `LLMAPIError`. Not provider-agnostic. |
-| Enablement | `LLM_API_ENABLED=true` **and** `LLM_API_KEY` must both be set; credentials alone never trigger network. |
-| Fallback | Templated drafts (`_TEMPLATES`); regex/keyword PTP extraction (`_simulated_extract`, `DISPUTE_PHRASES`, `AMOUNT_PATTERN`). Both tag `simulated=true` / `channel=simulated`. |
-| Allowed responsibilities | Draft one outbound recovery message; classify a single inbound customer reply into `{promise_to_pay, dispute, unclear}` + extract `{amount, date, confidence}`. |
-| Prohibited responsibilities | Never decides whether money moves. Extraction is validated by `ptp_extractor.validate_promise` before recording; disputes still route through the same `_dispute_case` path as Razorpay webhooks. |
-| Failure mode | `LLMAPIError` → executor marks `Action FAILED` + `HUMAN_REVIEW`; malformed Anthropic JSON → `unclear` with `parse_error` (does not crash pipeline). |
+| Provider | **Anthropic only** (`app/services/llm_client.py:32` `ANTHROPIC_MODEL=claude-3-5-haiku-latest`, `LLM_MODEL` config). `LLM_PROVIDER != anthropic` raises `LLMAPIError`. Not provider-agnostic. |
+| Enablement | `LLM_API_ENABLED=true` **and** `LLM_API_KEY` must both be set; credentials alone never trigger network. Optional sub-gates `LLM_MESSAGE_DRAFT_ENABLED` / `LLM_PTP_EXTRACTION_ENABLED` (default true). When disabled, deterministic behavior is fully operational. |
+| Structured output | PTP extraction schema `PTPExtraction {intent: promise_to_pay | not_a_promise | uncertain | payment_claim | dispute | unclear, promised_amount, promised_date (YYYY-MM-DD), confidence 0..1, reasoning_code}` — `PTP_SCHEMA_VERSION=ptp-schema-v1`, prompt `ptp-v1` / `message-v1`. Validated at LLM boundary (`_validate_structured_output`) — invalid enum/amount/date/confidence → `LLMInvalidResponseError` → deterministic fallback. No CoT stored. |
+| Promised amount semantics | LLM extracts only what customer explicitly said. Omitted amount is NOT invented; existing deterministic rule requires explicit amount (amount_method=customer_explicit) — otherwise `HUMAN_REVIEW`. If inference ever allowed, it happens outside LLM with `amount_method=deterministic_full_balance`. Never invent discount/fee/settlement. |
+| Fallback | Templated drafts (`_TEMPLATES` with `[[PAYMENT_LINK]]` placeholder); regex/keyword PTP extraction (`_simulated_extract`, `DISPUTE_PHRASES`, `AMOUNT_PATTERN`). Both tag `generation_method=deterministic` / `extraction_method=deterministic`. LLM failure → `LLMUnavailableError` / `LLMInvalidResponseError` → deterministic template / uncertain (no HTTP 500, no stuck case). |
+| Payment Link safety | LLM drafts with `[[PAYMENT_LINK]]` placeholder; application removes every model-provided HTTP(S) URL and inserts the authoritative `short_url` exactly once. Validated link is provider-authoritative. |
+| PII / data minimization | Drafting sends only `amount, failure_category, has_payment_link` (no IDs, friction, risk scores). Extraction sends only customer reply text + merchant-local reference date. Full webhook payload / payment history / credentials never sent. |
+| Logging | No raw prompts/customer text in logs by default; audit logs only metadata `{task, provider, model, prompt_version, latency, reason_code, error class}` |
+| Provenance | Every artifact records `generation_method/extraction_method, provider, model, prompt_version, schema_version, confidence, source_message_id, amount_method` — `CustomerMessage.generation_method/llm_provider/llm_model/prompt_version/status=DRAFT` and `PromiseToPay.extraction_method/llm_provider/llm_model/prompt_version/amount_method/source_message_id`. Deterministic fallback clearly says `deterministic` / `llm_fallback_template`, not `llm`. |
+| Allowed responsibilities | Draft one outbound recovery message (DRAFT only, not SENT); classify a single inbound customer reply into structured PTP intent. Both produce bounded text/guess only. |
+| Prohibited responsibilities | Never decides whether money moves. Never chooses `WAIT/WAIT_FOR_NATIVE_RETRY/CREATE_PAYMENT_LINK/CONTACT_CUSTOMER/COLLECT_PROMISE_TO_PAY/ESCALATE/STOP`. Extraction validated by `ptp_extractor.validate_promise` before recording; disputes/payment_claims route through same `_dispute_case` as Razorpay dispute webhook; `RECOVERED` only via provider webhook. |
+| Relative dates | Merchant-local date (`MERCHANT_TIMEZONE=Asia/Kolkata`) passed explicitly as reference for `tomorrow/Friday/next Monday`; resolved absolute `promised_date` persisted, not phrase. Tests freeze reference time. |
+| Injection defense | Customer text delimited `<untrusted_customer_text>` and system instructions separate; `_detect_injection` downgrades the model result to `uncertain` regardless of extracted intent or amount; deterministic validation remains authoritative. |
+| Failure mode | `LLMUnavailableError` / `LLMTimeoutError` / `LLMInvalidResponseError` (all subclasses of `LLMAPIError`) → deterministic fallback / uncertain; `action_executor` never marks `CONTACT_CUSTOMER` as `FAILED` solely due to LLM outage — fallback draft keeps `EXECUTED` + `AWAITING_OUTCOME`. Direct malformed JSON raises `LLMInvalidResponseError`; `extract_with_fallback` converts it to a deterministic extraction with `provider=null` and fallback provenance. DB errors propagate, not swallowed. |
+| Timeouts | Bounded `LLM_TIMEOUT_SECONDS=10` + `LLM_MAX_RETRIES=2` (only transient 429/5xx/timeout); no DB row lock held during LLM HTTP (snapshot then commit, read context then release, then LLM call). |
+
+```
+Controller
+   ↓
+selected customer-facing Action (deterministic or guarded adaptive)
+   ↓
+LLM assistance boundary (optional)
+   ↓
+deterministic validation / placeholder substitution / fallback template
+   ↓
+CustomerMessage DRAFT / PTP candidate (stored, not sent)
+```
+
+```
+customer text
+   ↓
+LLM/deterministic extraction (merchant-local reference time)
+   ↓
+deterministic PTP validation (intent, date range, amount ≤ outstanding, not past, not absurd, case eligible)
+   ↓
+PromiseToPay (linked) with provenance
+   ↓
+existing temporal FOLLOW_UP_PTP scheduling (exclusive end-of-day UTC)
+```
+
+Razorpay/provider events remain sole payment truth.
+
+```mermaid
+flowchart TB
+    PF[Razorpay payment.failed] --> DIAG[Diagnosis]
+    DIAG --> GUARD[Guardrails]
+    GUARD --> DISP[Policy Dispatcher\nbaseline/shadow/adaptive]
+    DISP --> DEC[Decision + Action]
+    DEC --> EXEC{Action type?}
+    EXEC -->|CONTACT/COLLECT| DRAFT[LLM drafting\nor deterministic template\n[[PAYMENT_LINK]] placeholder]
+    EXEC -->|CREATE link| LINK[Razorpay POST\nreference_id=Action.id]
+    LINK --> DRAFT2[Optional link draft\nplaceholder → authoritative short_url]
+    DRAFT --> MSG[(CustomerMessage DRAFT)]
+    DRAFT2 --> MSG
+    MSG --> WAIT[AWAITING_OUTCOME]
+
+    CUST[Customer reply\n"I'll pay 8000 Friday"] --> EXTRACT[LLM/deterministic extraction\nstructured PTPExtraction]
+    EXTRACT --> VALID[Deterministic PTP validation]
+    VALID -->|valid| PTP[(PromiseToPay PENDING\nprovenance + amount_method)]
+    PTP --> FOLLOW[FOLLOW_UP_PTP\nend-of-local-day UTC]
+    VALID -->|invalid/uncertain| HUMAN[HUMAN_REVIEW]
+    EXTRACT -->|payment_claim| DISP2[DISPUTED\nsame path as Razorpay dispute]
+
+    WEBHOOK[Razorpay payment.captured\npayment_link.paid] --> REC[RECOVERED\nprovider-authoritative\nonly truth that moves money]
+
+    style REC fill:#065f46
+    style DRAFT fill:#1e3a5f
+    style PTP fill:#1e3a5f
+```
 
 ---
 

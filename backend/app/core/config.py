@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = "anthropic"
     LLM_API_KEY: str = ""
     LLM_API_ENABLED: bool = False
+    LLM_MODEL: str = "claude-3-5-haiku-latest"
+    LLM_TIMEOUT_SECONDS: float = 10.0
+    LLM_MAX_RETRIES: int = 2
+    LLM_MESSAGE_DRAFT_ENABLED: bool = True
+    LLM_PTP_EXTRACTION_ENABLED: bool = True
 
     # Recovery policy dispatch — baseline is the safe default.
     RECOVERY_POLICY: str = "baseline"  # baseline | shadow | adaptive

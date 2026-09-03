@@ -118,6 +118,11 @@ recoveryos/
 | `LLM_API_ENABLED` | No | `false` | **Gate** — Anthropic only when `true` |
 | `LLM_PROVIDER` | No | `anthropic` | Non-`anthropic` raises `LLMAPIError` when enabled |
 | `LLM_API_KEY` | When enabled | `""` | Only with gate |
+| `LLM_MODEL` | No | `claude-3-5-haiku-latest` | Model id |
+| `LLM_TIMEOUT_SECONDS` | No | `10` | Bounded LLM timeout |
+| `LLM_MAX_RETRIES` | No | `2` | Bounded retries (transient only) |
+| `LLM_MESSAGE_DRAFT_ENABLED` | No | `true` | Sub-gate for drafting |
+| `LLM_PTP_EXTRACTION_ENABLED` | No | `true` | Sub-gate for extraction |
 | `FRONTEND_ORIGIN` | No | `http://localhost:5173` | CORS `allow_origins` |
 | `VITE_API_BASE_URL` | No | `http://localhost:8000` | Frontend fetch base |
 
@@ -213,6 +218,20 @@ Before adding a test that needs the trained model, accept a `trained_model_path`
 - **Safe fallback:** Any `scorer` exception must emit `adaptive_fallback` audit and delegate to `policy_engine.decide` in the same transaction; `RECOVERY_POLICY` is startup-loaded, global-at-decision-time, and requires restart to change.
 - **Shadow-first rollout:** New adaptive logic should be validated in `RECOVERY_POLICY=shadow` (baseline executes, `shadow_adaptive_recommendation` audited) before `adaptive` promotion.
 - **No direct side effects from ML:** `ml_policy` may only rank; `action_executor` remains the only caller of `razorpay_client`/`llm_client` via `temporal_runtime`.
+
+### LLM engineering invariants (this stage)
+
+- **LLM never chooses financial actions** — deterministic/guardrails or guarded adaptive remain sole controllers; LLM is downstream support only (draft / structured extraction).
+- **Customer input is untrusted** — prompt architecture separates system/task instructions from `<untrusted_customer_text>`; `_detect_injection` downgrades model output regardless of intent or amount; deterministic `ptp_extractor.validate_promise` authoritative.
+- **Structured output is validated** — `_validate_structured_output` checks enum, amount type, date format, confidence bounds; direct malformed output raises `LLMInvalidResponseError`, and only `extract_with_fallback` converts it to deterministic fallback provenance.
+- **No prompt chaining into payment state** — customer text cannot set `RECOVERED`; only Razorpay webhook truth does; `payment_claim` → `DISPUTED`/`HUMAN_REVIEW`.
+- **Deterministic fallback required** — `LLM_API_ENABLED=false` fully operational; `draft_with_fallback` / `extract_with_fallback` ensure `DRAFT` / `uncertain` on timeout/429/500/invalid; no case stuck because LLM down.
+- **DB errors not swallowed** — provider/LLM errors may fallback, DB write failures propagate; `except Exception` around DB operations must not convert to LLM fallback.
+- **Prompts versioned** — `PTP_EXTRACTION_PROMPT_VERSION=ptp-v1`, `MESSAGE_DRAFT_PROMPT_VERSION=message-v1`, schema versions in `llm_client.py:43`, stored in `CustomerMessage`/`PromiseToPay` provenance and audit detail; never scattered.
+- **Provider calls mocked in tests** — `httpx.post` monkeypatched, `conftest.py` socket guard loopback-only, `TASK_QUEUE_ENABLED=false`, `LLM_API_ENABLED=false` default; fake credentials never hit network.
+- **Payment Link URLs provider-authoritative** — LLM generates `[[PAYMENT_LINK]]` placeholder; all model-provided HTTP(S) URLs are stripped and `action_executor` inserts the exact `short_url` once; amount/discount/fee never invented — authoritative fields rendered deterministically outside LLM.
+- **Omitted financial facts are not invented** — `promised_amount` is only what customer explicitly said; omitted → `HUMAN_REVIEW` with `amount_method=customer_explicit` (current rule); `[[PAYMENT_LINK]]` substitution uses only authoritative provider state.
+- **Customer claims do not establish payment truth** — `RECOVERED` only via `payment.captured`/`payment_link.paid`.
 
 ---
 
@@ -317,9 +336,9 @@ docs/DECISIONS.md       — append-only ADRs; phase lead proposes, reviewers app
 
 ## Checklist before opening a PR
 
-- [ ] Tests pass: `cd backend && python -m pytest -q` (329 pass, no external network, no Redis required; includes shadow/friction/provenance safety).
-- [ ] Frontend passes: `cd frontend && npm run lint && npm run build` (policy/model/friction visible in header/experiment cards).
-- [ ] Migrations verify: `cd backend && DATABASE_URL=sqlite:///./ci_migration.db python -m alembic upgrade head` (head `a1b2c3d4e5f6` decision provenance; downgrade/upgrade fresh verified).
+- [ ] Tests pass: `cd backend && python -m pytest -q` (no external network or Redis required; includes LLM typed errors, placeholder safety, PTP validation, drafting fallback, controller isolation, DB boundary, provenance, demos). The current count is recorded only in `docs/CURRENT_STATE.md`.
+- [ ] Frontend passes: `cd frontend && npm run lint && npm run build` (policy/model/friction/llm visible in header; `DRAFT / NOT SENT` banner).
+- [ ] Migrations verify: `cd backend && DATABASE_URL=sqlite:///./ci_migration.db python -m alembic upgrade head` (head `c9d0e1f2a3b4` LLM provenance; downgrade/upgrade fresh verified).
 - [ ] No secrets introduced into diff (`backend/.env`, `frontend/.env` are gitignored — check `.env.example` only); `httpx` calls are mocked in tests, simulation remains default.
 - [ ] Documentation updated per table above; `git diff --check` (whitespace) clean.
 - [ ] Report lists docs changed / intentionally unchanged / reason.

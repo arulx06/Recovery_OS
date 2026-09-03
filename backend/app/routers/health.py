@@ -59,6 +59,26 @@ def health(db: Session = Depends(get_db)):
     except Exception:
         pass
 
+    # LLM readiness — sanitized, no secrets, no provider call
+    from app.services import llm_client as _llm
+
+    llm_info = {
+        "enabled": bool(settings.LLM_API_ENABLED),
+        "provider": settings.LLM_PROVIDER,
+        "configured": bool(settings.LLM_API_KEY),
+        "model": getattr(settings, "LLM_MODEL", _llm.ANTHROPIC_MODEL),
+        "message_drafting": "available" if (settings.LLM_API_ENABLED and getattr(settings, "LLM_MESSAGE_DRAFT_ENABLED", True) and settings.LLM_API_KEY) else ("disabled" if not settings.LLM_API_ENABLED else "unavailable"),
+        "ptp_extraction": "available" if (settings.LLM_API_ENABLED and getattr(settings, "LLM_PTP_EXTRACTION_ENABLED", True) and settings.LLM_API_KEY) else ("disabled" if not settings.LLM_API_ENABLED else "unavailable"),
+        "prompt_versions": {
+            "ptp_extraction": _llm.PTP_EXTRACTION_PROMPT_VERSION,
+            "message_draft": _llm.MESSAGE_DRAFT_PROMPT_VERSION,
+        },
+        "schema_versions": {
+            "ptp": _llm.PTP_SCHEMA_VERSION,
+            "message": _llm.MESSAGE_DRAFT_SCHEMA_VERSION,
+        },
+    }
+    # LLM unavailable must not make baseline unhealthy
     # Determine overall status: baseline fallback always available, so adaptive degraded is not "degraded" for baseline
     overall = "ok" if db_ok and redis_status != "unreachable" else "degraded"
 
@@ -69,4 +89,5 @@ def health(db: Session = Depends(get_db)):
         "redis": redis_status,
         "queue": settings.RQ_QUEUE_NAME if settings.TASK_QUEUE_ENABLED else "disabled",
         "adaptive_policy": adaptive_info,
+        "llm": llm_info,
     }

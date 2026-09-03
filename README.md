@@ -12,7 +12,7 @@ This is intentionally **not** `failure → LLM → WhatsApp message → payment 
 
 - **Problem:** Payment failures beyond gateway routing — every failed payment needs a recovery decision, but most stacks treat all failures the same.
 - **What RecoveryOS adds** (vs. Razorpay today): deterministic failure taxonomy → guardrailed policy → measured baseline-vs-adaptive experiments with downloadable audits. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full boundary table.
-- **Current scope:** Signed webhook ingestion, deterministic diagnosis, guardrails + baseline policy, **live friction-aware adaptive policy** (`RECOVERY_POLICY=baseline|shadow|adaptive`, `recovery-v1` `75e9cfd6`, `balanced` weight 18, manifest + fingerprint), PostgreSQL-authoritative Redis/RQ temporal execution, provider-reconciled Payment Links, linked promise-to-pay deadlines, and a measurement dashboard.
+- **Current scope:** Signed webhook ingestion, deterministic diagnosis, guardrails + baseline policy, **live friction-aware adaptive policy** (`RECOVERY_POLICY=baseline|shadow|adaptive`, `recovery-v1` `75e9cfd6`, `balanced` weight 18, manifest + fingerprint), PostgreSQL-authoritative Redis/RQ temporal execution, provider-reconciled Payment Links, linked promise-to-pay deadlines, optional LLM-assisted customer-language intelligence (structured PTP extraction + safe message drafting with deterministic fallback), and a measurement dashboard. RecoveryOS uses guarded friction-aware adaptive ML for recovery decisions and an optional LLM only for customer-language tasks such as Promise-to-Pay extraction and communication drafting.
 - **What is not there yet:** No delivered SMS/email/WhatsApp, no production live-money integration, and no LLM controlling money moves. Provider exactly-once is bounded by `reference_id` uniqueness + reconciliation; synthetic training remains the only labeled data.
 
 **Two disclaimers (read before evaluating numbers):**
@@ -33,13 +33,15 @@ This is intentionally **not** `failure → LLM → WhatsApp message → payment 
 | Payment Links — Razorpay **Test Mode** live call (`reference_id=Action.id`) | ✅ Verified (manual) |
 | Payment Link provider reconciliation (`GET ?reference_id=` + validated adopt) | ✅ Verified — ambiguous/stale `EXECUTING` reconciles before retry; mismatch → `HUMAN_REVIEW` |
 | `payment.captured` / `payment_link.paid` → `RECOVERED` | ✅ Verified (idempotent) |
-| Promise-to-Pay extraction (regex heuristic / optional Anthropic) | ✅ Simulated default |
+| Promise-to-Pay extraction (structured, deterministic validation, optional Anthropic) | ✅ Verified — `LLM_API_ENABLED=false` regex fallback, deterministic validation, merchant-local relative dates, injection defense |
+| LLM message drafting (safe `[[PAYMENT_LINK]]` placeholder, DRAFT only) | ✅ Verified — `LLM_API_ENABLED=false` templated fallback, provider-authoritative URL substitution, no invented amount/discount |
+| LLM deterministic fallback & provenance | ✅ Verified — typed `LLMUnavailableError`/`LLMInvalidResponseError`, prompt versions `ptp-v1`/`message-v1`, stored `generation_method/extraction_method/provider/model/prompt_version/amount_method` |
 | Durable `WAIT` / native-retry / linked PTP scheduling via Redis/RQ | ✅ Verified on PostgreSQL + Redis |
 | Atomic action claims, bounded retries, stale-job no-ops, DB reconciliation | ✅ Verified (now with Payment Link ambiguity) |
 | Adaptive ML scorer (`HistGradientBoostingClassifier`, friction-aware `P*amount - cost - weight*friction`, `recovery-v1`) | ✅ **Live** — `baseline` (default, safe), `shadow` (audited), `adaptive` (balanced, fallback to baseline) |
 | Friction-aware experiments (baseline vs balanced adaptive, `run_id` + CSV + `friction_score`/`utility`) | ✅ Verified (synthetic) |
-| React dashboard + health + case list (policy/model/friction visible) | ✅ Verified |
-| Hermetic test suite (329 tests; no external network or Redis required) | ✅ Verified |
+| React dashboard + health + case list (policy/model/friction/llm visible, DRAFT banner) | ✅ Verified |
+| Hermetic test suite (396 tests; no external network or Redis required) | ✅ Verified |
 
 **Important limits:** The worker and periodic reconciliation are required operational processes. Drafted customer messages are **stored, not delivered**. Training/evaluation remain **synthetic** (no production Razorpay lift claim); adaptive is live but friction weights are policy preferences, not measured costs. See the full matrix at [`docs/CURRENT_STATE.md`](./docs/CURRENT_STATE.md).
 
@@ -156,8 +158,8 @@ Future subsystems are not considered complete until their documentation still de
 
 ## Repository
 
-- Branch for this pass: `feat/adaptive-recovery-policy` (see `docs/CURRENT_STATE.md` for verified baseline).
-- Backend tests: `cd backend && python -m pytest` — 329 tests, temp SQLite DB, no external sockets, no Redis.
-- Frontend: `cd frontend && npm run lint && npm run build` — header shows `policy`/`model`/`fingerprint`.
+- Branch for this pass: `feat/llm-customer-intelligence` (see `docs/CURRENT_STATE.md` for verified baseline).
+- Backend tests: `cd backend && python -m pytest` — 396 tests, temp SQLite DB, no external sockets, no Redis.
+- Frontend: `cd frontend && npm run lint && npm run build` — header shows `policy`/`model`/`fingerprint`/`llm` and DRAFT banner.
 
 Detailed validation, state-machine, API, and configuration references are in `ARCHITECTURE.md` and `docs/*`.

@@ -227,6 +227,62 @@
 
 ---
 
+## ADR-17 — LLM is advisory language intelligence, not recovery controller
+
+| Field | Value |
+|-------|-------|
+| **Status** | Accepted and implemented |
+| **Date** | 2026-09-05 |
+| **Context** | LLMs are good at language, bad at consistently correct financial decisions; allowing a model to choose `WAIT` vs `CREATE_PAYMENT_LINK` would be unauditable and a liability. |
+| **Decision** | LLM (`app/services/llm_client.py`) is optional downstream support only: (a) draft one `DRAFT` message with `[[PAYMENT_LINK]]` placeholder after controller has chosen `CONTACT_CUSTOMER`/`COLLECT_PROMISE_TO_PAY`/`CREATE_PAYMENT_LINK`, (b) extract one structured `PTPExtraction` `{intent, promised_amount, promised_date, confidence, reasoning_code}` from customer free text. Both are wrapped by non-LLM checks: drafting substitution uses authoritative `short_url`; extraction is validated by `ptp_extractor.validate_promise` before any `PromiseToPay` is recorded. LLM never calls `policy_engine`/`ml_policy` nor mutates `RevenueCase.state` directly. |
+| **Why** | Keeps action authority in `orchestrator`/`policy_dispatcher`/`temporal_runtime` and preserves append-only `AuditEvent` trail; interaction judges audit is "LLM guessed → deterministic validation → deterministic state change", not "LLM decided". Deterministic fallback (`draft_with_fallback`/`extract_with_fallback`) ensures no case stuck when provider down. |
+| **Consequences** | Positive: `action_executor.perform` hermetic with `LLM_API_ENABLED=false`; `CONTACT_CUSTOMER` still `EXECUTED` with fallback draft; injection cannot change policy mode/guardrails. Negative: outbound copy quality is templated-by-default; improving tone requires explicit enablement of Anthropic path. |
+| **Reference** | `app/services/llm_client.py:43` (prompt/schema versions, placeholder), `app/services/action_executor.py:43`, `app/services/orchestrator.py:475`, `ARCHITECTURE.md: LLM boundary`, `docs/CURRENT_STATE.md: LLM PTP extraction / LLM message drafting` |
+
+---
+
+## ADR-18 — Payment truth remains provider-authoritative
+
+| Field | Value |
+|-------|-------|
+| **Status** | Accepted and implemented |
+| **Date** | 2026-09-05 |
+| **Context** | Customer text "I already paid" is a claim, not evidence; letting a model set `RECOVERED` would let prompt injection create fake recovery and bypass Razorpay reconciliation. |
+| **Decision** | `RECOVERED` is only via `_recover_case` from `payment.captured`/`subscription.charged`/`payment_link.paid` webhooks (provider truth). Customer `payment_claim`/`dispute` from PTP extraction routes through same `_dispute_case` as `payment.dispute.created` → `DISPUTED` (or `HUMAN_REVIEW`), cancels `SCHEDULED` actions, never `RECOVERED`. No model confidence overrides provider evidence. |
+| **Why** | Webhook verification + provider reconciliation are the only financial truth; semantic classification (`payment_claim`) is not a state mutation primitive. |
+| **Consequences** | Positive: injection `"mark payment successful"` cannot recover money; amount injection cannot create arbitrary PTP. Negative: legitimate "already paid" requires manual provider reconciliation to confirm. |
+| **Reference** | `app/services/orchestrator.py:540`, `app/services/ptp_extractor.py`, `tests/test_llm_stage.py::test_llm_cannot_set_recovered`, `docs/CURRENT_STATE.md: Payment truth` |
+
+---
+
+## ADR-19 — Structured PTP extraction requires deterministic validation and placeholder safety
+
+| Field | Value |
+|-------|-------|
+| **Status** | Accepted and implemented |
+| **Date** | 2026-09-05 |
+| **Context** | Unconstrained prose parsing for amount/date is hallucination-prone; relative "Friday" needs explicit merchant-local reference; payment links are easy to hallucinate. |
+| **Decision** | Define typed schema `PTPExtraction` (`intent`, `promised_amount!`, `promised_date YYYY-MM-DD`, `confidence 0..1`, `reasoning_code`) `ptp-schema-v1`; provider JSON validated at LLM boundary (`_validate_structured_output` checks enum, amount>0, date format, confidence bounds). Direct malformed output raises `LLMInvalidResponseError`; the wrapper alone converts typed provider errors to deterministic provenance. `promised_amount` is only customer-explicit (`amount_method=customer_explicit`); omitted → `HUMAN_REVIEW`, not invented. Relative dates use `business_now = utc_to_local(now, MERCHANT_TIMEZONE)` explicitly; `FOLLOW_UP_PTP` at exclusive end-of-day UTC. Payment Link drafts use `[[PAYMENT_LINK]]`; every model-provided HTTP(S) URL is stripped before the authoritative `short_url` is inserted exactly once. |
+| **Why** | Short machine-readable reason codes + prompt versions make behavior testable; deterministic validation blocks vague "sometime next week" → precise date; placeholder prevents `rzp.io` hallucination; merchant-local day keeps business deadline sane. |
+| **Consequences** | Positive: `tests/test_llm_stage.py` freezes reference time; ambiguous → `uncertain`/`HUMAN_REVIEW`; `tests/test_ptp_extractor.py` still passes; provenance (`prompt_version`, `amount_method`, `source_message_id`) audit-ready. Negative: date-only promises currently not auto-inferred to full balance (explicit-only) — conservative but honest. |
+| **Reference** | `app/services/llm_client.py:47` (placeholder), `app/services/llm_client.py:493` (validation), `app/services/ptp_extractor.py:38`, `app/models.py:PromiseToPay`, `c9d0e1f2a3b4`, `ARCHITECTURE.md: LLM boundary` |
+
+---
+
+## ADR-20 — Customer communication remains draft-only until a delivery provider exists
+
+| Field | Value |
+|-------|-------|
+| **Status** | Accepted and implemented |
+| **Date** | 2026-09-05 |
+| **Context** | Adding Twilio/SendGrid/WhatsApp in this hackathon would imply delivered messages without a real transport and would require consent, opt-out, and delivery-proof. |
+| **Decision** | All outbound `CustomerMessage` are `status=DRAFT` / `MANUAL_ONLY` (`generation_method=deterministic|llm|llm_fallback_template`, `channel=simulated|llm`, `prompt_version=message-v1`). No SMS/email/WhatsApp call. Dashboard shows `DRAFT / NOT SENT`. Delivery transport is `PLANNED` future component. |
+| **Why** | Keeps demo honest: judges see stored draft and provenance, not a false `DELIVERED` claim; no external side effect to mock/test. |
+| **Consequences** | Positive: `action_executor.apply_success` idempotent and always `DRAFT`; no delivery retry needed. Negative: operator must manually share `short_url` until transport exists. |
+| **Reference** | `app/models.py:CustomerMessage`, `app/services/action_executor.py:107`, `frontend/src/App.tsx:154`, `docs/CURRENT_STATE.md: Customer delivery` |
+
+---
+
 ## Proposed template for future ADRs
 
 ```markdown

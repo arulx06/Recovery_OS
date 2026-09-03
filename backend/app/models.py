@@ -167,6 +167,15 @@ class PromiseToPay(Base):
     promised_date = Column(DateTime, nullable=False)
     confidence = Column(Numeric(3, 2), nullable=True)
     status = Column(String, default="PENDING")  # PENDING | KEPT | BROKEN | SUPERSEDED
+    # LLM provenance (nullable for legacy / deterministic rows)
+    extraction_method = Column(String, nullable=True)  # deterministic | llm | manual
+    llm_provider = Column(String, nullable=True)
+    llm_model = Column(String, nullable=True)
+    prompt_version = Column(String, nullable=True)
+    schema_version = Column(String, nullable=True)
+    amount_method = Column(String, nullable=True)  # customer_explicit | deterministic_full_balance
+    reasoning_code = Column(String, nullable=True)
+    source_message_id = Column(UUID(as_uuid=False), ForeignKey("customer_messages.id"), nullable=True)
 
     created_at = Column(DateTime, default=utc_now)
 
@@ -183,6 +192,13 @@ class CustomerMessage(Base):
     channel = Column(String, nullable=True)
     body = Column(Text, nullable=False)
     extracted = Column(JSON, nullable=True)  # LLM-parsed structured intent, if any
+    # Provenance for LLM-assisted generation/extraction
+    generation_method = Column(String, nullable=True)  # deterministic | llm | llm_fallback_template
+    llm_provider = Column(String, nullable=True)
+    llm_model = Column(String, nullable=True)
+    prompt_version = Column(String, nullable=True)
+    schema_version = Column(String, nullable=True)
+    status = Column(String, nullable=True)  # DRAFT for outbound, RECEIVED for inbound
 
     created_at = Column(DateTime, default=utc_now)
 

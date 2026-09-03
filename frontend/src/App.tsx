@@ -69,6 +69,11 @@ export default function App() {
                   {health.adaptive_policy.model_available ? "" : " (unavailable → baseline fallback)"}
                 </span>
               )}
+              {health.llm && (
+                <span className="text-[10px] text-gray-600">
+                  llm: {health.llm.enabled ? `${health.llm.provider}/${health.llm.model ?? "—"} · ${health.llm.message_drafting}` : "disabled (deterministic)"} · drafts: DRAFT / NOT SENT
+                </span>
+              )}
             </>
           )}
         </div>
@@ -145,10 +150,13 @@ export default function App() {
         )}
       </section>
 
-      <footer className="mt-10 text-xs text-gray-600">
-        Phase 7 — one click runs a matched baseline-vs-adaptive experiment
-        and produces a downloadable, case-level audit CSV. See
-        ARCHITECTURE.md for the full pipeline.
+      <section className="mt-6 rounded-lg border border-amber-900/30 bg-amber-950/20 p-3 text-xs text-amber-200/70">
+        Customer communication: <span className="font-medium">DRAFT / NOT SENT (MANUAL_ONLY)</span> — no SMS/email/WhatsApp delivery. PTP extraction: <span className="font-mono">LLM optional, deterministic validation authoritative</span>. Payment Link URLs are provider-authoritative; LLM uses <span className="font-mono">{"[[PAYMENT_LINK]]"}</span> placeholder.
+      </section>
+
+      <footer className="mt-6 text-xs text-gray-600">
+        Phase 8 — LLM-assisted drafting + PTP extraction (optional, deterministic fallback) + friction-aware adaptive + provider-reconciled links. See
+        ARCHITECTURE.md for LLM boundary.
       </footer>
     </div>
   );

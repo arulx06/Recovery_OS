@@ -470,7 +470,9 @@ def test_experiment_actions_never_enqueued(monkeypatch):
     monkeypatch.setattr(task_queue, "enqueue_action", lambda aid: (_ for _ in ()).throw(AssertionError("experiment enqueued")))
     # reconcile should not enqueue experiment
     summary = temporal_runtime.reconcile_actions(now=NOW)
-    assert summary["scheduled"] == 0 or action_id not in [row[0] for row in SessionLocal().query(Action.id).filter(Action.status == "SCHEDULED").all() if False]
+    assert summary["scheduled"] == 0
+    with SessionLocal() as db:
+        assert db.get(Action, action_id).status == "SCHEDULED"
 
 
 def test_synthetic_batch_not_in_queue(monkeypatch):
