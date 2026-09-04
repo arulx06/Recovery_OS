@@ -33,8 +33,8 @@ This is intentionally **not** `failure → LLM → WhatsApp message → payment 
 | Payment Links — Razorpay **Test Mode** live call (`reference_id=Action.id`) | ⚠️ Implemented + hermetically tested; current manual smoke not performed |
 | Payment Link provider reconciliation (`GET ?reference_id=` + validated adopt) | ✅ Verified — ambiguous/stale `EXECUTING` reconciles before retry; mismatch → `HUMAN_REVIEW` |
 | `payment.captured` / `payment_link.paid` → `RECOVERED` | ✅ Verified (idempotent) |
-| Promise-to-Pay extraction (structured, deterministic validation, optional Anthropic) | ✅ Verified — `LLM_API_ENABLED=false` regex fallback, deterministic validation, merchant-local relative dates, injection defense |
-| LLM message drafting (safe `[[PAYMENT_LINK]]` placeholder, DRAFT only) | ✅ Verified — `LLM_API_ENABLED=false` templated fallback, provider-authoritative URL substitution, no invented amount/discount |
+| Promise-to-Pay extraction (structured, deterministic validation, optional Anthropic / OpenCode Zen `muse-spark-1.2-contributor-free`) | ✅ Verified — `LLM_API_ENABLED=false` regex fallback, deterministic validation, merchant-local relative dates, injection defense |
+| LLM message drafting (safe `[[PAYMENT_LINK]]` placeholder, DRAFT only) | ✅ Verified — `LLM_API_ENABLED=false` templated fallback, provider-authoritative URL substitution, no invented amount/discount; OpenCode Zen free model `muse-spark-1.2-contributor-free` via `https://opencode.ai/zen/v1/responses` (Bearer) |
 | LLM deterministic fallback & provenance | ✅ Verified — typed `LLMUnavailableError`/`LLMInvalidResponseError`, prompt versions `ptp-v1`/`message-v1`, stored `generation_method/extraction_method/provider/model/prompt_version/amount_method` |
 | Durable `WAIT` / native-retry / linked PTP scheduling via Redis/RQ | ✅ Verified on PostgreSQL + Redis |
 | Atomic action claims, bounded retries, stale-job no-ops, DB reconciliation | ✅ Verified (now with Payment Link ambiguity) |
@@ -152,7 +152,7 @@ See [`docs/RUNBOOK.md`](./docs/RUNBOOK.md) for Payment Link → `payment_link.pa
 | Database | PostgreSQL (SQLite for tests) |
 | Delayed actions | PostgreSQL-authoritative `Action` rows + Redis/RQ worker/scheduler |
 | ML | scikit-learn `HistGradientBoostingClassifier` (`recovery-v1`, build-specific SHA-256, `features v1`, friction-aware utility, `manifest.json`) |
-| LLM | Optional Anthropic Messages API; templated/regex simulation otherwise |
+| LLM | Optional Anthropic (`claude-3-5-haiku-latest`) or OpenCode Zen (`muse-spark-1.2-contributor-free` via `https://opencode.ai/zen/v1/responses`); templated/regex simulation otherwise |
 | Payments | Signed webhooks; simulated or opt-in Test-Mode Payment Links |
 
 ---

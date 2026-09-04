@@ -414,7 +414,7 @@ curl -X POST http://localhost:8000/cases/$CASE_ID/customer-reply -H "Content-Typ
 curl -X POST http://localhost:8000/cases/$CASE_ID/customer-reply -H "Content-Type: application/json" -d '{"body": "actually this is wrong, I already paid this"}'
 ```
 
-Message drafting / intent extraction are **simulated** by default (`channel=simulated`, `generation_method=deterministic`); to use Anthropic, set `LLM_PROVIDER=anthropic`, `LLM_API_KEY`, `LLM_API_ENABLED=true` in `backend/.env`. `LLM_MODEL` defaults to `claude-3-5-haiku-latest`; `LLM_TIMEOUT_SECONDS=10`, `LLM_MAX_RETRIES=2`.
+Message drafting / intent extraction are **simulated** by default (`channel=simulated`, `generation_method=deterministic`); to use Anthropic, set `LLM_PROVIDER=anthropic`, `LLM_API_KEY`, `LLM_API_ENABLED=true` in `backend/.env`. `LLM_MODEL` defaults to `claude-3-5-haiku-latest`; to use OpenCode Zen (free `muse-spark-1.2-contributor-free`), set `LLM_PROVIDER=opencode_zen`, `LLM_API_KEY=<opencode_key>`, `LLM_MODEL=muse-spark-1.2-contributor-free`, `LLM_BASE_URL=https://opencode.ai/zen/v1/responses`, `LLM_API_ENABLED=true` in `backend/.env`. OpenCode Zen uses `Authorization: Bearer <key>` and Responses API (`output[].content[].text` / `output_text`); its free availability may be temporary. Use only synthetic data with the experimental free tier; secrets belong only in untracked `backend/.env`. `LLM_TIMEOUT_SECONDS=10`, `LLM_MAX_RETRIES=2`.
 
 ### LLM-enabled checks
 
@@ -477,9 +477,14 @@ python scripts/send_test_webhook.py payment.failed --payment-id pay_link_demo --
 
 ```powershell
 # In backend/.env set real LLM_API_KEY and LLM_API_ENABLED=true, restart uvicorn
+# Anthropic example:
+# LLM_PROVIDER=anthropic LLM_API_KEY=sk-ant-... LLM_MODEL=claude-3-5-haiku-latest
+# OpenCode Zen example (free):
+# LLM_PROVIDER=opencode_zen LLM_API_KEY=<opencode_key> LLM_MODEL=muse-spark-1.2-contributor-free LLM_BASE_URL=https://opencode.ai/zen/v1/responses
 # Then with fake test text (never real customer data):
 python -c "from app.services.llm_client import extract_ptp_intent, draft_contact_message; print(extract_ptp_intent('I will pay 8000 Friday')); print(draft_contact_message('CONTACT_CUSTOMER', {'amount': 1000, 'failure_category': 'UNKNOWN'}))"
-# Report provider/model/success/latency, never print key. This is MANUAL LLM PROVIDER TEST, not production.
+# Report provider/model/intent/amount/date/generation_method/fallback, never print key or headers. This is MANUAL LLM PROVIDER TEST, not production.
+# Verify health: curl http://localhost:8000/health | python -m json.tool   # .llm {enabled, provider, configured, model, message_drafting, ptp_extraction}
 ```
 
 The RQ scheduler processes the linked promise after the full merchant-local promised day. To repair missed queue publication or abandoned claims:

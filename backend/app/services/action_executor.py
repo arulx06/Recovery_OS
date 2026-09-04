@@ -205,7 +205,7 @@ def sanitize_provider_error(exc: Exception) -> str:
     """Return sanitized error text without secrets."""
     msg = str(exc)
     # Strip any accidental credential leakage (should not occur, but be safe).
-    for secret in ("rzp_test_", "rzp_live_", "sk-ant-"):
+    for secret in ("rzp_test_", "rzp_live_", "sk-ant-", "bearer", "muse-spark", "opencode"):
         if secret in msg.lower():
             return "external service request failed"
     # Keep concise, no headers/payload.

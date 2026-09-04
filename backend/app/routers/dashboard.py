@@ -119,11 +119,15 @@ def dashboard_summary(db: Session = Depends(get_db), _auth: bool = Depends(requi
 
     # LLM
     from app.services import llm_client as _llm
+    try:
+        _eff_model = _llm._get_effective_model()  # type: ignore[attr-defined]
+    except Exception:
+        _eff_model = getattr(settings, "LLM_MODEL", _llm.ANTHROPIC_MODEL)
     llm_info = {
         "enabled": bool(settings.LLM_API_ENABLED),
         "provider": settings.LLM_PROVIDER,
         "configured": bool(settings.LLM_API_KEY),
-        "model": getattr(settings, "LLM_MODEL", _llm.ANTHROPIC_MODEL),
+        "model": _eff_model,
         "message_drafting": "available" if (settings.LLM_API_ENABLED and getattr(settings, "LLM_MESSAGE_DRAFT_ENABLED", True) and settings.LLM_API_KEY) else ("disabled" if not settings.LLM_API_ENABLED else "unavailable"),
         "ptp_extraction": "available" if (settings.LLM_API_ENABLED and getattr(settings, "LLM_PTP_EXTRACTION_ENABLED", True) and settings.LLM_API_KEY) else ("disabled" if not settings.LLM_API_ENABLED else "unavailable"),
         "prompt_versions": {

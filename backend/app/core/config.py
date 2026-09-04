@@ -35,10 +35,12 @@ class Settings(BaseSettings):
     RAZORPAY_API_ENABLED: bool = False
 
     # LLM provider — filled in during Phase 6 (Promise-to-Pay)
+    # Optional second provider: opencode_zen (Muse Spark, free tier)
     LLM_PROVIDER: str = "anthropic"
     LLM_API_KEY: str = ""
     LLM_API_ENABLED: bool = False
     LLM_MODEL: str = "claude-3-5-haiku-latest"
+    LLM_BASE_URL: str | None = None
     LLM_TIMEOUT_SECONDS: float = 10.0
     LLM_MAX_RETRIES: int = 2
     LLM_MESSAGE_DRAFT_ENABLED: bool = True
@@ -112,9 +114,9 @@ def validate_startup_config() -> list[str]:
     # Demo token: if protection enabled, token must be non-empty
     if settings.DEMO_ADMIN_TOKEN_ENABLED and not settings.DEMO_ADMIN_TOKEN:
         errors.append("DEMO_ADMIN_TOKEN_ENABLED=true but DEMO_ADMIN_TOKEN is empty")
-    # LLM: if enabled, provider must be anthropic
-    if settings.LLM_API_ENABLED and settings.LLM_PROVIDER.lower() != "anthropic":
-        errors.append(f"LLM_API_ENABLED=true but LLM_PROVIDER={settings.LLM_PROVIDER!r} — only anthropic is implemented")
+    # LLM: if enabled, provider must be anthropic or opencode_zen
+    if settings.LLM_API_ENABLED and settings.LLM_PROVIDER.lower() not in ("anthropic", "opencode_zen"):
+        errors.append(f"LLM_API_ENABLED=true but LLM_PROVIDER={settings.LLM_PROVIDER!r} — only anthropic and opencode_zen are supported")
     try:
         parse_frontend_origins()
     except ValueError as exc:
