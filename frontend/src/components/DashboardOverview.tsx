@@ -121,7 +121,14 @@ export function DashboardOverview({ data, cases }: { data: DashboardSummary | nu
             {["Diagnose", "Apply guardrails", "Compare interventions", "Execute", "Reconcile"].map((step, index, all) => (
               <div key={step} className="flex flex-1 items-center whitespace-nowrap">
                 <div className="rounded-md bg-slate-800/70 px-3 py-2 text-sm font-medium text-slate-200">{step}</div>
-                {index < all.length - 1 && <span className="px-3 text-slate-600">→</span>}
+                {index < all.length - 1 && (
+                  <span className="flex flex-1 items-center pl-3 pr-1 text-slate-400" aria-hidden="true">
+                    <span className="h-px flex-1 bg-current opacity-70" />
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" className="shrink-0 -ml-px block">
+                      <path d="M6 3L11 8L6 13" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </span>
+                )}
               </div>
             ))}
           </div>
