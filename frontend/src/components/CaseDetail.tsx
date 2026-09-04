@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
 import type { CandidateScore, CaseDetail, DecisionInspector, TimelineEvent } from "../api";
 import {
   Badge,
@@ -22,83 +23,79 @@ type GuardrailValue = {
   next_allowed_at?: string | null;
 };
 
-function CopyId({ id }: { id: string }) {
+type DetailTab = "customer" | "timeline" | "technical";
+
+function CopyId({ id, label = "Case" }: { id: string; label?: string }) {
   const [copied, setCopied] = useState(false);
   return (
     <button
+      type="button"
       onClick={() => {
         navigator.clipboard.writeText(id);
         setCopied(true);
         window.setTimeout(() => setCopied(false), 1200);
       }}
-      className="text-xs font-medium text-slate-500 hover:text-slate-200"
-      title="Copy full ID"
+      className="rounded text-xs font-medium text-slate-500 hover:text-slate-200"
+      title={`${label} ID: ${id}. Click to copy.`}
+      aria-label={`Copy ${label.toLowerCase()} ID ${id}`}
     >
-      {copied ? "Copied" : `Case ${id.slice(0, 8)}`}
+      {copied ? "Copied" : `${label} ${id.slice(0, 8)}`}
     </button>
   );
 }
 
 function actionReason(action: string | null, detail: CaseDetail): string {
-  if (detail.human_review_reason) return "An untrusted customer reply failed deterministic validation. Recovery is paused for human review, and no payment state was changed.";
-  if (action === "WAIT") return "This looks temporary. Waiting avoids an unnecessary customer interruption while keeping a durable recovery schedule.";
-  if (action === "WAIT_FOR_NATIVE_RETRY") return "Razorpay already has a native retry path, so RecoveryOS waits instead of creating duplicate customer work.";
-  if (action === "CREATE_PAYMENT_LINK" && detail.failure_category === "INVALID_INSTRUMENT") return "The current payment instrument is no longer valid. A fresh payment path is the best allowed intervention.";
-  if (action === "CREATE_PAYMENT_LINK") return "Another direct retry may fail again. A Payment Link offers a recoverable path with less friction than contacting the customer.";
-  if (action === "CONTACT_CUSTOMER") return "The customer can resolve this authentication failure, and contact is within the configured safety limits.";
+  if (detail.human_review_reason) return "Untrusted customer input failed deterministic validation, so automation paused for human review.";
+  if (action === "WAIT") return "The failure appears temporary; waiting avoids unnecessary customer contact while preserving a durable retry path.";
+  if (action === "WAIT_FOR_NATIVE_RETRY") return "Razorpay already has a native retry path, avoiding duplicate customer work.";
+  if (action === "CREATE_PAYMENT_LINK" && detail.failure_category === "INVALID_INSTRUMENT") return "A new payment path avoids retrying the invalid instrument.";
+  if (action === "CREATE_PAYMENT_LINK") return "A Payment Link provides a lower-friction recovery path than another direct retry.";
+  if (action === "CONTACT_CUSTOMER") return "Customer authentication is required and contact is within the configured safety limits.";
   if (action === "COLLECT_PROMISE_TO_PAY") return "A structured payment commitment is more useful than another blind retry.";
-  if (action === "ESCALATE") return "Automation cannot safely resolve this case, so RecoveryOS routes it to an operator.";
-  if (action === "STOP") return "Stopping is safer than another low-value or disallowed recovery attempt.";
+  if (action === "ESCALATE") return "Automation cannot resolve this case safely, so it was routed to an operator.";
+  if (action === "STOP") return "Another recovery attempt is low-value or disallowed by policy.";
   return detail.failure_explanation.category_meaning;
 }
 
 function blockedReasonLabel(reason: string | null): string {
   if (!reason) return "Guardrail restriction";
-  if (/semantic|infeasible|failure/i.test(reason)) return "Not compatible with this failure";
-  if (/cooldown/i.test(reason)) return "Contact cooldown active";
-  if (/amount/i.test(reason)) return "Above automation amount limit";
+  if (/semantic|infeasible|failure/i.test(reason)) return "Incompatible with failure";
+  if (/cooldown/i.test(reason)) return "Cooldown active";
+  if (/amount/i.test(reason)) return "Above amount limit";
   if (/contact/i.test(reason)) return "Contact limit reached";
   if (/attempt/i.test(reason)) return "Attempt budget exhausted";
   return humanize(reason);
 }
 
-function CaseHero({ detail, inspector }: { detail: CaseDetail; inspector: DecisionInspector | null }) {
+function CaseHeader({ detail, inspector }: { detail: CaseDetail; inspector: DecisionInspector | null }) {
   const chosenAction = inspector?.chosen_action ?? detail.decisions.at(-1)?.chosen_action ?? null;
   return (
     <Card padding="p-0" className="overflow-hidden" data-testid="case-hero">
-      <div className="grid lg:grid-cols-[1.15fr_0.85fr]">
-        <div className="px-7 py-6 lg:px-8">
-          <div className="flex items-center gap-3">
-            <CopyId id={detail.id} />
-            <span className="h-1 w-1 rounded-full bg-slate-600" />
-            <span className="text-xs text-slate-500">Updated {formatDate(detail.updated_at)}</span>
-          </div>
-          <div className="mt-5 flex flex-wrap items-end gap-x-5 gap-y-2">
-            <div className="text-4xl font-semibold tracking-tight text-white">{formatRupees(detail.amount)}</div>
-            <div className="pb-1 text-base text-slate-400">revenue at risk</div>
-          </div>
-          <div className="mt-5">
-            <div className="text-sm font-semibold uppercase tracking-[0.12em] text-slate-500">What failed</div>
-            <h1 className="mt-1 text-2xl font-semibold text-slate-100">{failureLabel(detail.failure_category)}</h1>
-            <p className="mt-2 max-w-3xl text-sm leading-relaxed text-slate-400">{detail.failure_explanation.category_meaning}</p>
-          </div>
-        </div>
-
-        <div className="border-t border-[#273244] bg-blue-500/[0.075] px-7 py-6 lg:border-l lg:border-t-0 lg:px-8">
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <div className="text-sm font-semibold uppercase tracking-[0.12em] text-blue-300">RecoveryOS chose</div>
-              <div className="mt-2 text-3xl font-semibold tracking-tight text-white">{actionLabel(chosenAction)}</div>
-            </div>
+      <div className="grid gap-4 px-4 py-4 sm:px-5 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-3">
+            <h1 className="text-2xl font-semibold tracking-tight text-white sm:text-3xl">{formatRupees(detail.amount)}</h1>
             <Badge tone={stateTone(detail.state)}>{stateLabel(detail.state)}</Badge>
           </div>
-          <p className="mt-5 text-base leading-relaxed text-slate-300">{actionReason(chosenAction, detail)}</p>
-          <div className="mt-5 flex flex-wrap items-center gap-3 text-xs text-slate-500">
-            <span>{inspector?.policy_mode ? humanize(inspector.policy_mode) : "Baseline"} policy</span>
-            {inspector?.is_adaptive && <><span>·</span><span>Friction-aware ranking</span></>}
-            {detail.provider_truth.has_payment_link && <><span>·</span><span>Provider reference persisted</span></>}
+          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+            <span className="font-semibold text-slate-100">{failureLabel(detail.failure_category)}</span>
+            <span className="hidden text-slate-700 sm:inline" aria-hidden>•</span>
+            <span className="text-slate-400">Selected: <strong className="font-semibold text-blue-200">{actionLabel(chosenAction)}</strong></span>
           </div>
+          <p className="mt-1 max-w-4xl text-xs leading-relaxed text-slate-500">{detail.failure_explanation.category_meaning}</p>
         </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500 lg:max-w-96 lg:justify-end">
+          <span className="truncate font-mono" title={detail.razorpay_payment_id ?? detail.id}>{detail.razorpay_payment_id ?? "Payment ID unavailable"}</span>
+          <span aria-hidden>•</span>
+          <span>Updated {formatDate(detail.updated_at)}</span>
+          <span aria-hidden>•</span>
+          <CopyId id={detail.id} />
+          <span aria-hidden>•</span>
+          <span>{inspector?.policy_mode ? humanize(inspector.policy_mode) : "Baseline"} policy</span>
+        </div>
+      </div>
+      <div className="border-t border-[#242d3b] bg-[#0e131b] px-4 py-2.5 text-xs leading-relaxed text-slate-400 sm:px-5">
+        <span className="font-semibold text-slate-200">Why it won: </span>{actionReason(chosenAction, detail)}
       </div>
     </Card>
   );
@@ -112,181 +109,237 @@ function candidateRecovery(candidate: CandidateScore): string {
 
 function DecisionComparison({ inspector }: { inspector: DecisionInspector | null }) {
   if (!inspector) {
-    return <Card><EmptyState title="No decision recorded yet" description="This case has been detected but no recovery action has been selected." /></Card>;
-  }
-  return (
-    <Card padding="p-0" className="overflow-hidden" data-testid="decision-comparison">
-      <div className="flex flex-col gap-2 border-b border-[#242d3b] px-6 py-5 md:flex-row md:items-end md:justify-between">
-        <div>
-          <p className="text-sm font-semibold uppercase tracking-[0.14em] text-blue-300">Why this action?</p>
-          <h2 className="mt-1 text-xl font-semibold text-white">Recovery alternatives, compared</h2>
+    return (
+      <section className="p-4 sm:p-5" data-testid="decision-comparison">
+        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-blue-300">Recovery decision</p>
+        <div className="mt-3 rounded-lg border border-dashed border-white/10 px-4 py-6 text-center">
+          <div className="text-sm font-medium text-slate-300">No decision recorded yet</div>
+          <div className="mt-1 text-xs text-slate-500">This case has been detected but no recovery action has been selected.</div>
         </div>
-        <div className="text-xs text-slate-500">Persisted at decision time · {formatDate(inspector.created_at)}</div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="min-w-0" data-testid="decision-comparison" aria-labelledby="decision-title">
+      <div className="flex flex-col gap-1 border-b border-[#242d3b] px-4 py-3 sm:flex-row sm:items-end sm:justify-between sm:px-5">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-blue-300">Why this action?</p>
+          <h2 id="decision-title" className="mt-0.5 text-base font-semibold text-white">Recovery alternatives</h2>
+        </div>
+        <span className="text-[11px] text-slate-600">Decision snapshot · {formatDate(inspector.created_at)}</span>
       </div>
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[840px] text-left text-sm">
-          <thead className="bg-[#0e131b] text-xs uppercase tracking-wide text-slate-500">
+        <table className="w-full min-w-[720px] text-left text-xs">
+          <thead className="bg-[#0e131b] uppercase tracking-wide text-slate-500">
             <tr>
-              <th className="px-6 py-3 font-medium">Intervention</th>
-              <th className="px-4 py-3 font-medium">Eligibility</th>
-              <th className="px-4 py-3 font-medium">Recovery chance</th>
-              <th className="px-4 py-3 font-medium">Customer friction</th>
-              <th className="px-4 py-3 font-medium">Net utility</th>
-              <th className="px-6 py-3 text-right font-medium">Result</th>
+              <th className="px-4 py-2 font-medium sm:px-5">Intervention</th>
+              <th className="px-3 py-2 font-medium">Eligible</th>
+              <th className="px-3 py-2 font-medium">Recovery</th>
+              <th className="px-3 py-2 font-medium">Friction</th>
+              <th className="px-3 py-2 font-medium">Utility</th>
+              <th className="px-4 py-2 text-right font-medium sm:px-5">Result</th>
             </tr>
           </thead>
           <tbody>
             {inspector.candidates.map((candidate) => (
-              <tr key={candidate.action} className={`border-t border-[#202735] ${candidate.selected ? "bg-blue-500/[0.09] shadow-[inset_3px_0_0_#6c91ff]" : ""}`}>
-                <td className="px-6 py-3.5">
-                  <div className={`font-semibold ${candidate.selected ? "text-white" : "text-slate-200"}`}>{actionLabel(candidate.action)}</div>
-                  {candidate.expected_recovered_value != null && <div className="mt-0.5 text-xs text-slate-500">{formatRupees(candidate.expected_recovered_value)} expected recovery</div>}
+              <tr key={candidate.action} className={`border-t border-[#202735] ${candidate.selected ? "bg-blue-500/[0.07] shadow-[inset_2px_0_0_#6c91ff]" : ""}`}>
+                <td className="px-4 py-2.5 sm:px-5">
+                  <div className={`font-semibold ${candidate.selected ? "text-white" : "text-slate-300"}`}>{actionLabel(candidate.action)}</div>
                 </td>
-                <td className="px-4 py-3.5">
+                <td className="px-3 py-2.5">
                   {candidate.allowed === false ? (
-                    <div><Badge tone="danger" size="sm">Blocked</Badge><div className="mt-1 max-w-48 text-xs text-rose-200/70">{blockedReasonLabel(candidate.blocked_reason)}</div></div>
-                  ) : candidate.allowed === true ? <span className="font-medium text-emerald-300">Eligible</span> : <span className="text-slate-500">Unavailable</span>}
+                    <div><span className="font-medium text-rose-300">Blocked</span><div className="mt-0.5 max-w-36 text-[11px] text-rose-200/60">{blockedReasonLabel(candidate.blocked_reason)}</div></div>
+                  ) : candidate.allowed === true ? <span className="font-medium text-emerald-300">Yes</span> : <span className="text-slate-600">Unavailable</span>}
                 </td>
-                <td className="px-4 py-3.5 font-semibold text-slate-200">{candidateRecovery(candidate)}</td>
-                <td className="px-4 py-3.5">
-                  {candidate.friction_score != null ? <><span className="font-semibold text-slate-200">{candidate.friction_score.toFixed(0)}</span>{candidate.friction_penalty != null && <div className="mt-0.5 text-xs text-slate-500">{formatRupees(candidate.friction_penalty)} penalty</div>}</> : <span className="text-slate-500">—</span>}
+                <td className="px-3 py-2.5">
+                  <span className="font-medium text-slate-200">{candidateRecovery(candidate)}</span>
+                  {candidate.expected_recovered_value != null && <div className="mt-0.5 text-[11px] text-slate-600">{formatRupees(candidate.expected_recovered_value)} expected</div>}
                 </td>
-                <td className="px-4 py-3.5 font-semibold text-slate-100">{candidate.utility != null ? formatRupees(candidate.utility) : "—"}</td>
-                <td className="px-6 py-3.5 text-right">{candidate.selected ? <Badge tone="info">Selected</Badge> : <span className="text-slate-600">—</span>}</td>
+                <td className="px-3 py-2.5">
+                  {candidate.friction_score != null ? (
+                    <><span className="font-medium text-slate-200">{candidate.friction_score.toFixed(0)}</span>{candidate.friction_penalty != null && <div className="mt-0.5 text-[11px] text-slate-600">{formatRupees(candidate.friction_penalty)} penalty</div>}</>
+                  ) : <span className="text-slate-600">Not available</span>}
+                </td>
+                <td className="px-3 py-2.5 font-medium text-slate-200">{candidate.utility != null ? formatRupees(candidate.utility) : <span className="font-normal text-slate-600">Not scored</span>}</td>
+                <td className="px-4 py-2.5 text-right sm:px-5">{candidate.selected ? <span className="font-semibold text-blue-200">Selected</span> : <span className="sr-only">Not selected</span>}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
-      <div className="flex flex-col gap-2 border-t border-[#242d3b] bg-[#0e131b] px-6 py-3 text-xs text-slate-500 md:flex-row md:items-center md:justify-between">
-        <span>{inspector.is_adaptive ? "Net utility = expected recovered value − action cost − customer friction penalty." : "Baseline decisions show eligibility and ordering; model probabilities are intentionally unavailable."}</span>
-        {inspector.explanation && <span className="max-w-2xl text-slate-400">{inspector.explanation}</span>}
+      <div className="border-t border-[#242d3b] bg-[#0e131b] px-4 py-2.5 text-[11px] leading-relaxed text-slate-500 sm:px-5">
+        {inspector.is_adaptive ? "Utility includes expected recovery, action cost, and customer friction." : "Baseline ordering is shown; model probabilities are intentionally not scored."}
+        {inspector.explanation && <span className="ml-2 text-slate-400">{inspector.explanation}</span>}
       </div>
-    </Card>
+    </section>
   );
 }
 
-function GuardrailChecklist({ detail }: { detail: CaseDetail }) {
+function guardrailRows(detail: CaseDetail) {
   const guardrails = detail.guardrails as Record<string, GuardrailValue | string[]>;
   const definitions: Array<{ key: string; label: string; value: (item: GuardrailValue) => string }> = [
-    { key: "max_contacts_per_case", label: "Contact limit", value: (item) => `${item.used ?? 0} of ${item.limit ?? "—"} used` },
-    { key: "max_contacts_per_7_days", label: "Seven-day contact cap", value: (item) => `${item.used ?? 0} of ${item.limit ?? "—"} used` },
-    { key: "cooldown", label: "Contact cooldown", value: (item) => item.pass === false ? `${item.hours ?? "—"}-hour window active` : "No active cooldown" },
-    { key: "max_automated_amount", label: "Automation amount", value: (item) => `${formatRupees(item.amount ?? detail.amount)} of ${formatRupees(item.limit)}` },
-    { key: "max_total_attempts", label: "Attempt budget", value: (item) => `${item.used ?? 0} of ${item.limit ?? "—"} used` },
+    { key: "max_contacts_per_case", label: "Contact limit", value: (item) => `${item.used ?? 0} / ${item.limit ?? "Not set"}` },
+    { key: "max_contacts_per_7_days", label: "7-day cap", value: (item) => `${item.used ?? 0} / ${item.limit ?? "Not set"}` },
+    { key: "cooldown", label: "Cooldown", value: (item) => item.pass === false ? `${item.hours ?? "?"}h active` : "Clear" },
+    { key: "max_automated_amount", label: "Amount", value: (item) => `${formatRupees(item.amount ?? detail.amount)} / ${formatRupees(item.limit)}` },
+    { key: "max_total_attempts", label: "Attempts", value: (item) => `${item.used ?? 0} / ${item.limit ?? "Not set"}` },
   ];
-  const rows = definitions.flatMap((definition) => {
+  return definitions.flatMap((definition) => {
     const item = guardrails[definition.key];
     return item && !Array.isArray(item) ? [{ ...definition, item }] : [];
   });
-  return (
-    <Card data-testid="guardrail-checklist">
-      <p className="text-sm font-semibold uppercase tracking-[0.14em] text-slate-500">Safety checks</p>
-      <h2 className="mt-1 text-xl font-semibold text-white">Rules before ranking</h2>
-      <p className="mt-2 text-sm leading-relaxed text-slate-400">Deterministic guardrails decide what the policy is allowed to compare.</p>
-      <div className="mt-5 divide-y divide-[#242d3b]">
-        {rows.map((row) => (
-          <div key={row.key} className="flex items-start gap-3 py-3 first:pt-0 last:pb-0">
-            <span className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-xs font-bold ${row.item.pass === false ? "bg-rose-500/15 text-rose-300" : "bg-emerald-500/15 text-emerald-300"}`} aria-label={row.item.pass === false ? "Blocked" : "Passed"}>{row.item.pass === false ? "!" : "✓"}</span>
-            <div className="min-w-0">
-              <div className="text-sm font-medium text-slate-200">{row.label}</div>
-              <div className="mt-0.5 text-xs text-slate-500">{row.value(row.item)}</div>
-            </div>
-          </div>
-        ))}
-        {rows.length === 0 && <div className="text-sm text-slate-500">Safety status is not available for this case.</div>}
-      </div>
-    </Card>
-  );
 }
 
-function ProviderTruth({ detail, environmentMode }: { detail: CaseDetail; environmentMode?: string }) {
-  if (!detail.provider_truth.has_payment_link) return null;
-  const mode = detail.provider_truth.mode_label && detail.provider_truth.mode_label !== "unavailable" ? detail.provider_truth.mode_label : environmentMode;
-  return (
-    <Card data-testid="provider-truth">
-      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-        <div>
-          <div className="flex flex-wrap items-center gap-2">
-            <p className="text-sm font-semibold uppercase tracking-[0.14em] text-emerald-300">Provider truth</p>
-            {mode && <Badge tone="success">{mode}</Badge>}
-          </div>
-          <h2 className="mt-2 text-xl font-semibold text-white">Razorpay Payment Link</h2>
-          <p className="mt-2 max-w-3xl text-sm leading-relaxed text-slate-400">The durable Action ID is the provider reference. RecoveryOS validates the provider response before adoption; only provider evidence can mark the case recovered.</p>
-        </div>
-        <div className="min-w-72 rounded-lg bg-[#0b1017] px-4 py-3">
-          <div className="flex items-center justify-between gap-4">
-            <span className="text-xs text-slate-500">Action status</span>
-            <Badge tone={detail.provider_truth.status === "EXECUTED" ? "success" : "neutral"}>{stateLabel(detail.provider_truth.status)}</Badge>
-          </div>
-          {detail.provider_truth.short_url && <a href={detail.provider_truth.short_url} target="_blank" rel="noreferrer" className="mt-3 block truncate text-sm font-medium text-blue-300 underline decoration-blue-400/40 underline-offset-4">{detail.provider_truth.short_url}</a>}
-          {detail.state === "RECOVERED" && <div className="mt-3 text-sm font-semibold text-emerald-300">Payment confirmed by Razorpay</div>}
-        </div>
-      </div>
-    </Card>
-  );
-}
+function DecisionContext({ detail, environmentMode }: { detail: CaseDetail; environmentMode?: string }) {
+  const rows = guardrailRows(detail);
+  const latestAction = detail.latest_action;
+  const provider = detail.provider_truth;
+  const mode = provider.mode_label && provider.mode_label !== "unavailable"
+    ? provider.mode_label
+    : provider.simulated
+      ? "Simulated"
+      : environmentMode;
 
-function CustomerConversation({ detail }: { detail: CaseDetail }) {
-  if (detail.messages.length === 0 && detail.promises_to_pay.length === 0 && !detail.human_review_reason) return null;
   return (
-    <Card padding="p-0" className="overflow-hidden" data-testid="customer-conversation">
-      <div className="border-b border-[#242d3b] px-6 py-5">
-        <p className="text-sm font-semibold uppercase tracking-[0.14em] text-blue-300">Customer interaction</p>
-        <h2 className="mt-1 text-xl font-semibold text-white">Conversation and Promise to Pay</h2>
-        <p className="mt-1 text-sm text-slate-400">Language can assist interpretation. Deterministic validation decides what becomes workflow state.</p>
-      </div>
-      {detail.human_review_reason && (
-        <div className="border-b border-amber-500/20 bg-amber-500/[0.07] px-6 py-3 text-sm text-amber-100">
-          <span className="font-semibold">Safety intervention:</span> untrusted instructions were rejected and the case was routed to human review. No promise or payment outcome was created.
+    <aside className="border-t border-[#242d3b] bg-[#0e131b] xl:border-l xl:border-t-0" aria-label="Decision context">
+      <section className="px-4 py-3.5 sm:px-5" data-testid="guardrail-checklist" aria-labelledby="safety-title">
+        <div className="flex items-center justify-between gap-3">
+          <h2 id="safety-title" className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Safety</h2>
+          <span className="text-[11px] text-slate-600">Current case state</span>
         </div>
-      )}
-      <div className="grid gap-0 lg:grid-cols-[1.08fr_0.92fr]">
-        <div className="space-y-4 px-6 py-5 lg:border-r lg:border-[#242d3b]">
-          {detail.messages.map((message) => {
-            const outbound = message.direction === "outbound";
-            return (
-              <div key={message.id} className={`flex ${outbound ? "justify-start" : "justify-end"}`}>
-                <div className={`max-w-[85%] ${outbound ? "" : "text-right"}`}>
-                  <div className="mb-1.5 flex items-center gap-2 text-xs text-slate-500">
-                    <span className="font-semibold text-slate-300">{outbound ? "RecoveryOS" : "Customer"}</span>
-                    {message.status && <Badge tone={message.status === "DRAFT" ? "warning" : "success"} size="sm">{message.status === "DRAFT" ? "Draft · not sent" : stateLabel(message.status)}</Badge>}
-                  </div>
-                  <div className={`rounded-lg px-4 py-3 text-left text-sm leading-relaxed ${outbound ? "bg-slate-800/80 text-slate-200" : "bg-blue-500/15 text-blue-50"}`}>{message.body}</div>
-                </div>
-              </div>
-            );
-          })}
-          {detail.messages.length === 0 && <div className="text-sm text-slate-500">No customer messages for this case.</div>}
-        </div>
-        <div className="bg-[#0e131b] px-6 py-5">
-          {detail.promises_to_pay.length > 0 ? detail.promises_to_pay.map((promise) => {
-            const followUp = detail.actions.find((action) => action.promise_to_pay_id === promise.id);
-            return (
-              <div key={promise.id}>
-                <div className="flex items-center justify-between gap-3">
-                  <div className="text-sm font-semibold text-slate-400">RecoveryOS extraction</div>
-                  <Badge tone={promise.status === "PENDING" ? "info" : promise.status === "KEPT" ? "success" : promise.status === "BROKEN" ? "danger" : "muted"}>{stateLabel(promise.status)}</Badge>
-                </div>
-                <div className="mt-5 text-sm font-semibold uppercase tracking-[0.12em] text-blue-300">Promise to Pay</div>
-                <div className="mt-2 text-3xl font-semibold tracking-tight text-white">{formatRupees(promise.promised_amount)}</div>
-                <div className="mt-1 text-sm text-slate-400">Promised by {formatDate(promise.promised_date)}</div>
-                <div className="mt-5 grid grid-cols-2 gap-3">
-                  <div className="rounded-lg bg-slate-800/60 p-3"><div className="text-xs text-slate-500">Confidence</div><div className="mt-1 text-lg font-semibold text-white">{promise.confidence != null ? `${Math.round(promise.confidence * 100)}%` : "—"}</div></div>
-                  <div className="rounded-lg bg-slate-800/60 p-3"><div className="text-xs text-slate-500">Validation</div><div className="mt-1 text-sm font-semibold text-white">{promise.llm_provider ? "LLM + rules" : "Deterministic"}</div></div>
-                </div>
-                {followUp && <div className="mt-4 flex items-center gap-2 rounded-lg border border-blue-500/20 bg-blue-500/[0.07] px-3 py-2 text-sm text-blue-100"><span className="text-blue-300">✓</span><span>Follow-up scheduled for {formatDate(followUp.scheduled_for)}</span></div>}
-              </div>
-            );
-          }) : (
-            <div className="flex min-h-48 flex-col items-center justify-center text-center">
-              <div className="text-sm font-semibold text-slate-300">No Promise to Pay created</div>
-              <div className="mt-1 max-w-sm text-sm text-slate-500">Customer text cannot create recovery state unless deterministic validation succeeds.</div>
+        <div className="mt-2 space-y-1">
+          {rows.map((row) => (
+            <div key={row.key} className="grid grid-cols-[16px_minmax(0,1fr)_auto] items-center gap-2 py-1 text-xs">
+              <span className={row.item.pass === false ? "text-rose-300" : "text-emerald-300"} aria-hidden>{row.item.pass === false ? "!" : "✓"}</span>
+              <span className="text-slate-300">{row.label}<span className="sr-only">: {row.item.pass === false ? "blocked" : "passed"}</span></span>
+              <span className="text-right font-medium text-slate-400">{row.value(row.item)}</span>
             </div>
+          ))}
+          {rows.length === 0 && <div className="py-2 text-xs text-slate-500">Safety status is not available.</div>}
+        </div>
+      </section>
+
+      <section className="border-t border-[#242d3b] px-4 py-3.5 sm:px-5" data-testid="provider-truth" aria-labelledby="execution-title">
+        <div className="flex items-center justify-between gap-3">
+          <h2 id="execution-title" className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Execution</h2>
+          {mode && <span className="text-[11px] font-medium text-slate-500">{mode}</span>}
+        </div>
+        <div className="mt-2.5 space-y-2.5">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-slate-100">{actionLabel(latestAction?.action_type)}</div>
+              <div className="mt-0.5 text-xs text-slate-500">Latest recovery action</div>
+            </div>
+            <span className={`text-xs font-semibold ${latestAction?.status === "EXECUTED" ? "text-emerald-300" : "text-blue-200"}`}>{stateLabel(latestAction?.status)}</span>
+          </div>
+
+          {provider.has_payment_link ? (
+            <div className="rounded-md border border-emerald-500/15 bg-emerald-500/[0.045] px-3 py-2.5">
+              <div className="flex items-center justify-between gap-3 text-xs">
+                <span className="font-medium text-slate-300">Razorpay Payment Link</span>
+                <span className="font-semibold text-emerald-300">{stateLabel(provider.status)}</span>
+              </div>
+              <div className={`mt-1 text-xs font-medium ${detail.state === "RECOVERED" ? "text-emerald-300" : "text-slate-400"}`}>
+                {detail.state === "RECOVERED" ? "Payment confirmed by Razorpay" : provider.reconciled ? "Provider state reconciled" : "Awaiting provider confirmation"}
+              </div>
+              {provider.short_url && <a href={provider.short_url} target="_blank" rel="noreferrer" className="mt-2 inline-block text-xs font-semibold text-blue-300 hover:text-blue-200">Open payment link ↗</a>}
+            </div>
+          ) : (
+            <div className="text-xs text-slate-500">No provider payment artifact is required for this action.</div>
           )}
         </div>
+
+        <details className="mt-3 border-t border-[#242d3b] pt-2.5 text-xs">
+          <summary className="cursor-pointer font-medium text-slate-500 hover:text-slate-300">View provider details</summary>
+          <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-[11px]">
+            <dt className="text-slate-600">Action ID</dt><dd className="truncate font-mono text-slate-400" title={latestAction?.id ?? undefined}>{latestAction?.id ?? "Not available"}</dd>
+            <dt className="text-slate-600">Payment Link ID</dt><dd className="truncate font-mono text-slate-400" title={provider.payment_link_id ?? undefined}>{provider.payment_link_id ?? "Not available"}</dd>
+            <dt className="text-slate-600">Reference</dt><dd className="truncate font-mono text-slate-400" title={provider.reference_id ?? undefined}>{provider.reference_id ?? "Not available"}</dd>
+            <dt className="text-slate-600">Reconciled</dt><dd className="text-slate-400">{provider.reconciled ? "Yes" : "No"}</dd>
+            <dt className="text-slate-600">Simulated</dt><dd className="text-slate-400">{provider.simulated == null ? "Unknown" : provider.simulated ? "Yes" : "No"}</dd>
+          </dl>
+        </details>
+      </section>
+    </aside>
+  );
+}
+
+function DecisionWorkspace({ detail, inspector, environmentMode }: { detail: CaseDetail; inspector: DecisionInspector | null; environmentMode?: string }) {
+  return (
+    <Card padding="p-0" className="overflow-hidden" data-testid="decision-workspace">
+      <div className="grid items-start xl:grid-cols-[minmax(0,2fr)_minmax(300px,1fr)]">
+        <DecisionComparison inspector={inspector} />
+        <DecisionContext detail={detail} environmentMode={environmentMode} />
       </div>
     </Card>
+  );
+}
+
+function CustomerActivity({ detail }: { detail: CaseDetail }) {
+  const hasPromises = detail.promises_to_pay.length > 0;
+  return (
+    <div data-testid="customer-conversation">
+      {detail.human_review_reason && (
+        <div className="mb-3 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-xs text-amber-100">
+          <span className="font-semibold">Safety intervention:</span> untrusted instructions were rejected and recovery was routed to human review.
+        </div>
+      )}
+      <div className={`grid gap-4 ${hasPromises ? "lg:grid-cols-[minmax(0,1.3fr)_minmax(280px,0.7fr)]" : ""}`}>
+        <section aria-labelledby="customer-messages-title">
+          <div className="flex items-center justify-between gap-3">
+            <h3 id="customer-messages-title" className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Customer interaction</h3>
+            <span className="text-[11px] text-slate-600">{detail.messages.length} {detail.messages.length === 1 ? "message" : "messages"}</span>
+          </div>
+          <div className="mt-3 space-y-3">
+            {detail.messages.map((message) => {
+              const outbound = message.direction === "outbound";
+              return (
+                <div key={message.id} className={`flex ${outbound ? "justify-start" : "justify-end"}`}>
+                  <div className="max-w-3xl">
+                    <div className={`mb-1 flex items-center gap-2 text-[11px] text-slate-500 ${outbound ? "" : "justify-end"}`}>
+                      <span className="font-semibold text-slate-300">{outbound ? "RecoveryOS" : "Customer"}</span>
+                      {message.status && <span className={message.status === "DRAFT" ? "text-amber-300" : "text-emerald-300"}>{message.status === "DRAFT" ? "Draft · not sent" : stateLabel(message.status)}</span>}
+                    </div>
+                    <div className={`rounded-md px-3 py-2.5 text-sm leading-relaxed ${outbound ? "bg-slate-800/70 text-slate-200" : "bg-blue-500/10 text-blue-50"}`}>{message.body}</div>
+                  </div>
+                </div>
+              );
+            })}
+            {detail.messages.length === 0 && <div className="rounded-md border border-dashed border-white/10 px-3 py-3 text-xs text-slate-500">No customer messages for this case.</div>}
+          </div>
+        </section>
+
+        {hasPromises ? (
+          <section className="border-t border-[#242d3b] pt-4 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0" aria-labelledby="ptp-title">
+            <h3 id="ptp-title" className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Promise to Pay</h3>
+            <div className="mt-3 space-y-3">
+              {detail.promises_to_pay.map((promise) => {
+                const followUp = detail.actions.find((item) => item.promise_to_pay_id === promise.id);
+                return (
+                  <div key={promise.id} className="rounded-md bg-[#0e131b] p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div><div className="text-xl font-semibold text-white">{formatRupees(promise.promised_amount)}</div><div className="mt-0.5 text-xs text-slate-500">By {formatDate(promise.promised_date)}</div></div>
+                      <span className="text-xs font-semibold text-blue-200">{stateLabel(promise.status)}</span>
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 gap-3 border-t border-[#242d3b] pt-2.5 text-xs">
+                      <div><span className="text-slate-600">Confidence</span><div className="mt-0.5 font-medium text-slate-300">{promise.confidence != null ? `${Math.round(promise.confidence * 100)}%` : "Not available"}</div></div>
+                      <div><span className="text-slate-600">Extraction</span><div className="mt-0.5 font-medium text-slate-300">{promise.llm_provider ? "LLM + rules" : "Deterministic"}</div></div>
+                    </div>
+                    {followUp && <div className="mt-2.5 text-xs text-blue-200">Follow-up scheduled {formatDate(followUp.scheduled_for)}</div>}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        ) : (
+          <div className="flex items-center justify-between gap-3 border-t border-[#242d3b] pt-3 text-xs">
+            <span className="font-medium text-slate-400">Promise to Pay</span>
+            <span className="text-slate-600">None</span>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -315,54 +368,119 @@ function timelineTitle(event: TimelineEvent): string {
   return event.title;
 }
 
+function timelineTone(event: TimelineEvent): string {
+  const value = `${event.severity} ${event.title}`.toLowerCase();
+  if (/recover|paid|confirmed|executed|success/.test(value)) return "border-emerald-500/40 text-emerald-300";
+  if (/fail|review|warn|broken|disput/.test(value)) return "border-amber-500/40 text-amber-300";
+  return "border-blue-500/35 text-blue-300";
+}
+
 function RecoveryTimeline({ detail }: { detail: CaseDetail }) {
   const visible = importantTimeline(detail.timeline);
   return (
-    <Card data-testid="recovery-timeline">
-      <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
-        <div>
-          <p className="text-sm font-semibold uppercase tracking-[0.14em] text-slate-500">Recovery timeline</p>
-          <h2 className="mt-1 text-xl font-semibold text-white">Important events</h2>
+    <div data-testid="recovery-timeline">
+      <div className="flex items-end justify-between gap-3">
+        <div><p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Recovery timeline</p><h3 className="mt-0.5 text-base font-semibold text-white">Important events</h3></div>
+        <span className="text-[11px] text-slate-600">{detail.timeline.length} audit events retained</span>
+      </div>
+      {visible.length > 0 ? (
+        <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+          {visible.map((event, index) => (
+            <div key={`${event.timestamp}-${index}`} className={`border-l-2 pl-3 ${timelineTone(event)}`}>
+              <div className="text-[11px] font-semibold">{String(index + 1).padStart(2, "0")}</div>
+              <div className="mt-1 text-sm font-semibold text-slate-200">{timelineTitle(event)}</div>
+              <div className="mt-1 text-[11px] leading-snug text-slate-600">{formatDate(event.timestamp)}</div>
+            </div>
+          ))}
         </div>
-        <span className="text-xs text-slate-500">{detail.timeline.length} total audit events retained</span>
-      </div>
-      <div className="mt-5 grid gap-3 md:grid-cols-3 xl:grid-cols-6">
-        {visible.map((event, index) => (
-          <div key={`${event.timestamp}-${index}`} className="relative border-l border-slate-700 pl-3">
-            <div className="text-xs font-semibold text-blue-300">{String(index + 1).padStart(2, "0")}</div>
-            <div className="mt-1 text-sm font-semibold text-slate-200">{timelineTitle(event)}</div>
-            <div className="mt-1 text-xs text-slate-500">{formatDate(event.timestamp)}</div>
-          </div>
-        ))}
-      </div>
-      <details className="mt-5 border-t border-[#242d3b] pt-4">
-        <summary className="cursor-pointer text-sm font-semibold text-slate-300 hover:text-white">View full audit trail</summary>
-        <div className="mt-4 max-h-96 space-y-2 overflow-auto pr-2">
+      ) : <div className="mt-3 text-xs text-slate-500">No timeline events recorded.</div>}
+      <details className="mt-4 border-t border-[#242d3b] pt-3">
+        <summary className="cursor-pointer text-xs font-semibold text-slate-400 hover:text-white">View full audit trail</summary>
+        <div className="mt-3 max-h-80 space-y-1.5 overflow-auto pr-2">
           {detail.timeline.map((event, index) => (
-            <div key={`${event.timestamp}-${index}`} className="flex gap-4 rounded-md bg-[#0b1017] px-3 py-2.5">
-              <div className="w-36 shrink-0 text-xs text-slate-500">{formatDate(event.timestamp)}</div>
-              <div><div className="text-sm font-medium text-slate-200">{event.title}</div><div className="mt-0.5 text-xs text-slate-500">{event.description}</div></div>
+            <div key={`${event.timestamp}-${index}`} className="grid gap-1 rounded-md bg-[#0b1017] px-3 py-2 sm:grid-cols-[145px_1fr] sm:gap-3">
+              <div className="text-[11px] text-slate-600">{formatDate(event.timestamp)}</div>
+              <div><div className="text-xs font-medium text-slate-300">{event.title}</div><div className="mt-0.5 text-[11px] text-slate-500">{event.description}</div></div>
             </div>
           ))}
         </div>
       </details>
-    </Card>
+    </div>
   );
 }
 
 function TechnicalDetails({ detail, inspector }: { detail: CaseDetail; inspector: DecisionInspector | null }) {
   return (
-    <details className="rounded-xl border border-[#242d3b] bg-[#0e131b]">
-      <summary className="cursor-pointer px-5 py-4 text-sm font-semibold text-slate-300 hover:text-white">Technical details</summary>
-      <div className="border-t border-[#242d3b] px-5 py-5">
-        <div className="grid gap-4 md:grid-cols-3">
-          <div><div className="text-xs uppercase tracking-wide text-slate-500">Provider IDs</div><div className="mt-2 space-y-1 break-all font-mono text-xs text-slate-400"><div>{detail.razorpay_payment_id ?? "—"}</div><div>{detail.razorpay_payment_link_id ?? "—"}</div><div>{detail.razorpay_subscription_id ?? "—"}</div></div></div>
-          <div><div className="text-xs uppercase tracking-wide text-slate-500">Model provenance</div><div className="mt-2 space-y-1 font-mono text-xs text-slate-400"><div>{inspector?.model_provenance.model_version ?? "No model"}</div><div>{inspector?.model_provenance.model_fingerprint?.slice(0, 16) ?? "—"}</div><div>{inspector?.model_provenance.friction_profile ?? "—"}</div></div></div>
-          <div><div className="text-xs uppercase tracking-wide text-slate-500">Normalized signal</div><div className="mt-2 space-y-1 font-mono text-xs text-slate-400"><div>source: {detail.error_source ?? "—"}</div><div>step: {detail.error_step ?? "—"}</div><div>reason: {detail.error_reason ?? "—"}</div></div></div>
-        </div>
-        <pre className="mt-5 max-h-80 overflow-auto rounded-lg bg-black/30 p-4 text-xs leading-relaxed text-slate-500">{JSON.stringify({ actions: detail.actions, decisions: detail.decisions, provider_truth: detail.provider_truth, payment_events: detail.payment_events, audit_trail: detail.audit_trail }, null, 2)}</pre>
+    <div data-testid="technical-details">
+      <div className="grid gap-4 md:grid-cols-3">
+        <section><h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Identifiers</h3><div className="mt-2 space-y-1.5 break-all font-mono text-xs text-slate-400"><div>{detail.id}</div><div>{detail.latest_action?.id ?? "No action ID"}</div><div>{detail.razorpay_payment_id ?? "No payment ID"}</div><div>{detail.razorpay_payment_link_id ?? "No payment link ID"}</div><div>{detail.razorpay_subscription_id ?? "No subscription ID"}</div></div></section>
+        <section><h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Policy provenance</h3><div className="mt-2 space-y-1.5 font-mono text-xs text-slate-400"><div>{inspector?.model_provenance.policy_mode ?? "Baseline"}</div><div>{inspector?.model_provenance.model_version ?? "No model"}</div><div>{inspector?.model_provenance.model_fingerprint ?? "No fingerprint"}</div><div>{inspector?.model_provenance.friction_profile ?? detail.friction.profile}</div></div></section>
+        <section><h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Normalized signal</h3><div className="mt-2 space-y-1.5 font-mono text-xs text-slate-400"><div>source: {detail.error_source ?? "Not available"}</div><div>step: {detail.error_step ?? "Not available"}</div><div>reason: {detail.error_reason ?? "Not available"}</div></div></section>
       </div>
-    </details>
+      <details className="mt-4 border-t border-[#242d3b] pt-3">
+        <summary className="cursor-pointer text-xs font-semibold text-slate-400 hover:text-white">View raw case data</summary>
+        <pre className="mt-3 max-h-80 overflow-auto rounded-lg bg-black/30 p-3 text-[11px] leading-relaxed text-slate-500">{JSON.stringify({ actions: detail.actions, decisions: detail.decisions, provider_truth: detail.provider_truth, payment_events: detail.payment_events, audit_trail: detail.audit_trail, friction: detail.friction, shadow: detail.shadow }, null, 2)}</pre>
+      </details>
+    </div>
+  );
+}
+
+function ActivityWorkspace({ detail, inspector }: { detail: CaseDetail; inspector: DecisionInspector | null }) {
+  const defaultTab: DetailTab = detail.messages.length > 0 || detail.promises_to_pay.length > 0 || detail.human_review_reason ? "customer" : "timeline";
+  const [activeTab, setActiveTab] = useState<DetailTab>(defaultTab);
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const customerCount = detail.messages.length + detail.promises_to_pay.length;
+  const tabs: Array<{ id: DetailTab; label: string }> = [
+    { id: "customer", label: `Customer${customerCount > 0 ? ` (${customerCount})` : ""}` },
+    { id: "timeline", label: `Timeline (${Math.min(importantTimeline(detail.timeline).length, 6)})` },
+    { id: "technical", label: "Technical" },
+  ];
+
+  const onTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let nextIndex = index;
+    if (event.key === "ArrowRight") nextIndex = (index + 1) % tabs.length;
+    else if (event.key === "ArrowLeft") nextIndex = (index - 1 + tabs.length) % tabs.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    setActiveTab(tabs[nextIndex].id);
+    tabRefs.current[nextIndex]?.focus();
+  };
+
+  return (
+    <Card padding="p-0" className="overflow-hidden" data-testid="case-activity-workspace">
+      <div className="flex overflow-x-auto border-b border-[#242d3b] bg-[#0e131b] px-3" role="tablist" aria-label="Case activity details">
+        {tabs.map((tab, index) => (
+          <button
+            key={tab.id}
+            ref={(node) => { tabRefs.current[index] = node; }}
+            type="button"
+            role="tab"
+            id={`case-tab-${tab.id}`}
+            aria-selected={activeTab === tab.id}
+            aria-controls={`case-panel-${tab.id}`}
+            tabIndex={activeTab === tab.id ? 0 : -1}
+            onClick={() => setActiveTab(tab.id)}
+            onKeyDown={(event) => onTabKeyDown(event, index)}
+            className={`relative shrink-0 px-3 py-3 text-xs font-semibold ${activeTab === tab.id ? "text-white after:absolute after:inset-x-3 after:bottom-0 after:h-0.5 after:bg-blue-400" : "text-slate-500 hover:text-slate-300"}`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+      <div
+        role="tabpanel"
+        id={`case-panel-${activeTab}`}
+        aria-labelledby={`case-tab-${activeTab}`}
+        tabIndex={0}
+        className="p-4 sm:p-5"
+      >
+        {activeTab === "customer" && <CustomerActivity detail={detail} />}
+        {activeTab === "timeline" && <RecoveryTimeline detail={detail} />}
+        {activeTab === "technical" && <TechnicalDetails detail={detail} inspector={inspector} />}
+      </div>
+    </Card>
   );
 }
 
@@ -370,16 +488,10 @@ export function CaseDetailView({ detail, environmentMode }: { detail: CaseDetail
   if (!detail) return <Card><EmptyState title="Select a case to inspect" description="Open any case to see the selected intervention and why it won." /></Card>;
   const inspector = detail.decision_inspectors.at(-1) ?? null;
   return (
-    <div className="space-y-5 pb-56" data-testid="case-detail-page">
-      <CaseHero detail={detail} inspector={inspector} />
-      <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_340px]">
-        <DecisionComparison inspector={inspector} />
-        <GuardrailChecklist detail={detail} />
-      </div>
-      <ProviderTruth detail={detail} environmentMode={environmentMode} />
-      <div id="customer"><CustomerConversation detail={detail} /></div>
-      <RecoveryTimeline detail={detail} />
-      <TechnicalDetails detail={detail} inspector={inspector} />
+    <div className="space-y-3 pb-6" data-testid="case-detail-page">
+      <CaseHeader detail={detail} inspector={inspector} />
+      <DecisionWorkspace detail={detail} inspector={inspector} environmentMode={environmentMode} />
+      <ActivityWorkspace key={detail.id} detail={detail} inspector={inspector} />
     </div>
   );
 }

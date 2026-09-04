@@ -6,7 +6,7 @@ import { CaseList } from "./components/CaseList";
 import { DashboardOverview } from "./components/DashboardOverview";
 import ExperimentPanel from "./components/ExperimentPanel";
 import { HealthPanel } from "./components/HealthPanel";
-import { Card, ErrorState, Loading, actionLabel, humanize } from "./components/ui";
+import { Card, ErrorState, Loading, actionLabel, failureLabel, formatRupees, humanize, stateLabel } from "./components/ui";
 
 type Tab = "overview" | "cases" | "experiments" | "system";
 
@@ -17,6 +17,91 @@ const DEMO_SCENARIOS = [
   { paymentId: "pay_demo_D_adaptive_001", label: "Friction-aware choice", detail: "Adaptive comparison" },
   { paymentId: "pay_demo_E_injection_001", label: "Prompt injection", detail: "Human review" },
 ];
+
+function shortIdentifier(value: string | null | undefined): string {
+  if (!value) return "Identifier unavailable";
+  if (value.length <= 22) return value;
+  return `${value.slice(0, 14)}…${value.slice(-5)}`;
+}
+
+function caseOptionLabel(item: Pick<RevenueCase, "id" | "amount" | "failure_category" | "chosen_action" | "state" | "razorpay_payment_id">): string {
+  return `${formatRupees(item.amount)} · ${failureLabel(item.failure_category)} · ${actionLabel(item.chosen_action)} · ${stateLabel(item.state)} · ${shortIdentifier(item.razorpay_payment_id ?? item.id)}`;
+}
+
+function CaseNavigator({
+  cases,
+  selectedId,
+  detail,
+  onBack,
+  onSelect,
+}: {
+  cases: RevenueCase[];
+  selectedId: string;
+  detail: CaseDetail | null;
+  onBack: () => void;
+  onSelect: (id: string) => void;
+}) {
+  const selectedCase = cases.find((item) => item.id === selectedId);
+  const currentAction = detail?.latest_action?.action_type ?? detail?.decisions.at(-1)?.chosen_action ?? selectedCase?.chosen_action ?? null;
+  const currentAmount = detail?.amount ?? selectedCase?.amount;
+  const currentFailure = detail?.failure_category ?? selectedCase?.failure_category;
+  const currentState = detail?.state ?? selectedCase?.state;
+  const currentIdentifier = detail?.razorpay_payment_id ?? selectedCase?.razorpay_payment_id ?? selectedId;
+  const currentLabel = detail
+    ? caseOptionLabel({
+        id: detail.id,
+        amount: detail.amount,
+        failure_category: detail.failure_category,
+        chosen_action: currentAction,
+        state: detail.state,
+        razorpay_payment_id: detail.razorpay_payment_id,
+      })
+    : selectedCase
+      ? caseOptionLabel(selectedCase)
+      : `Case ${shortIdentifier(selectedId)}`;
+  const selectedIsListed = cases.some((item) => item.id === selectedId);
+
+  return (
+    <nav className="flex flex-col gap-2 rounded-xl border border-[#242d3b] bg-[#0e131b] p-2 sm:flex-row sm:items-center" aria-label="Case navigation">
+      <button
+        onClick={onBack}
+        className="inline-flex h-10 shrink-0 items-center gap-2 rounded-lg px-3 text-sm font-semibold text-slate-400 hover:bg-slate-800/70 hover:text-white"
+      >
+        <span aria-hidden>←</span>
+        All cases
+      </button>
+      <div className="hidden h-7 w-px bg-[#2a3443] sm:block" aria-hidden />
+      <label className="group relative min-w-0 flex-1 cursor-pointer rounded-lg border border-slate-700 bg-[#111720] px-3 py-1.5 transition hover:border-slate-500 hover:bg-[#151c27] focus-within:border-blue-400 focus-within:ring-2 focus-within:ring-blue-500/25">
+        <span className="flex min-w-0 items-center gap-2 pr-8">
+          <span className="shrink-0 text-sm font-semibold text-white">{formatRupees(currentAmount)}</span>
+          <span className="truncate text-sm font-medium text-slate-300">{failureLabel(currentFailure)}</span>
+        </span>
+        <span className="mt-0.5 flex min-w-0 items-center gap-2 pr-8 text-[11px] text-slate-500">
+          <span className="truncate text-blue-200">{actionLabel(currentAction)}</span>
+          <span aria-hidden>·</span>
+          <span className="shrink-0">{stateLabel(currentState)}</span>
+          <span className="hidden truncate font-mono lg:inline" title={currentIdentifier}>· {shortIdentifier(currentIdentifier)}</span>
+        </span>
+        <svg className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500 transition group-hover:text-slate-300" viewBox="0 0 20 20" fill="none" aria-hidden>
+          <path d="m6 8 4 4 4-4" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        <select
+          aria-label="Switch selected recovery case"
+          value={selectedId}
+          onChange={(event) => onSelect(event.target.value)}
+          className="absolute inset-0 h-full w-full cursor-pointer opacity-0 focus:outline-none"
+        >
+          {!selectedIsListed && <option value={selectedId}>{currentLabel}</option>}
+          {cases.map((item) => <option key={item.id} value={item.id}>{caseOptionLabel(item)}</option>)}
+        </select>
+      </label>
+      <div className="flex shrink-0 items-center gap-2 px-2 text-[11px] text-slate-500" aria-live="polite">
+        <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" aria-hidden />
+        Detail refreshes every 10s
+      </div>
+    </nav>
+  );
+}
 
 function useCaseDeepLink(): [string | null, (id: string | null) => void] {
   const read = () => new URLSearchParams(window.location.search).get("case");
@@ -152,15 +237,23 @@ export default function App() {
         )}
 
         {tab === "cases" && (
-          selectedCaseId ? (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <button onClick={() => setSelectedCaseId(null)} className="inline-flex items-center gap-2 text-sm font-semibold text-slate-400 hover:text-white"><span>←</span> All recovery cases</button>
-                {detail?.latest_action && <span className="text-xs text-slate-500">Latest action: {actionLabel(detail.latest_action.action_type)}</span>}
-              </div>
-              {detailLoading ? <Card><Loading label="Loading decision evidence…" /></Card> : detailError ? <Card><ErrorState message={detailError} /></Card> : <CaseDetailView detail={detail} environmentMode={dashboard?.razorpay.mode_label} />}
+          <>
+            <div className={selectedCaseId ? "hidden" : undefined}>
+              <CaseList onSelect={handleSelectCase} selectedId={selectedCaseId} />
             </div>
-          ) : <CaseList onSelect={handleSelectCase} selectedId={selectedCaseId} />
+            {selectedCaseId && (
+              <div className="space-y-3">
+                <CaseNavigator
+                  cases={overviewCases}
+                  selectedId={selectedCaseId}
+                  detail={detail}
+                  onBack={() => setSelectedCaseId(null)}
+                  onSelect={handleSelectCase}
+                />
+                {detailLoading ? <Card><Loading label="Loading decision evidence…" /></Card> : detailError ? <Card><ErrorState message={detailError} /></Card> : <CaseDetailView detail={detail} environmentMode={dashboard?.razorpay.mode_label} />}
+              </div>
+            )}
+          </>
         )}
 
         {tab === "experiments" && <ExperimentPanel />}
