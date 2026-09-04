@@ -56,9 +56,8 @@ def list_cases(
     offset: int = Query(default=0, ge=0),
 ):
     """
-    Returns recent revenue cases with their current state, diagnosed
-    failure category, and — from Phase 3 on — the most recent decision the
-    policy engine made for each one.
+    Returns recent revenue cases with their current state, diagnosed failure
+    category, and most recent policy decision.
     Supports server-side filtering, search, and pagination to avoid browser-side
     mass filtering.
     """
@@ -396,7 +395,7 @@ def get_case(case_id: str, db: Session = Depends(get_db), _auth: bool = Depends(
 @router.post("/{case_id}/customer-reply")
 def customer_reply(case_id: str, body: CustomerReplyRequest, request: Request, db: Session = Depends(get_db), _auth: bool = Depends(require_demo_admin)):
     """
-    Phase 6: simulates receiving an inbound customer reply (SMS/WhatsApp/
+    Simulates receiving an inbound customer reply (SMS/WhatsApp/
     email — whichever channel eventually sends this in production isn't
     RecoveryOS's concern; this is the ingestion point regardless of
     transport). Runs PTP/dispute extraction and returns the resulting case

@@ -1,5 +1,5 @@
 """
-Expected-value action scorer (Phase 5).
+Expected-value action scorer.
 
     expected_value(action) = P(recovery | context, action) * amount - cost(action)
 

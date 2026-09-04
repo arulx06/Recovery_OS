@@ -1,6 +1,6 @@
-# RecoveryOS — Development Guide
+# RecoveryOS - Development Guide
 
-> How to change the system without breaking what is verified. Read `docs/CURRENT_STATE.md` first for status, then `ARCHITECTURE.md` for component boundaries.
+Read `docs/CURRENT_STATE.md` for implementation status and `ARCHITECTURE.md` for component boundaries before changing runtime behavior.
 
 ---
 
@@ -11,7 +11,7 @@ recoveryos/
 ├── README.md                 # concise entry point → links outward
 ├── ARCHITECTURE.md           # canonical design with [STATUS] labels
 ├── docs/
-│   ├── CURRENT_STATE.md      # MOST IMPORTANT living doc — update first
+│   ├── CURRENT_STATE.md      # implemented behavior and current limitations
 │   ├── SYSTEM_FLOWS.md       # exact flows derived from orchestrator/policy/executor
 │   ├── RUNBOOK.md            # Windows-friendly operator commands
 │   ├── ML_AND_EVALUATION.md  # training, simulator, circularity, tradeoff
@@ -37,7 +37,7 @@ recoveryos/
 │   │   │   ├── razorpay_client.py     # Payment Links — simulated or Test Mode
 │   │   │   ├── action_executor.py     # SCHEDULED → EXECUTED / FAILED (+ CustomerMessage)
 │   │   │   ├── ml_policy.py           # friction-aware adaptive — live via dispatcher, guarded + manifest
-│   │   │   ├── llm_client.py          # draft + extract — simulated or Anthropic
+│   │   │   ├── llm_client.py          # draft + extract; deterministic or provider-backed
 │   │   │   ├── ptp_extractor.py       # validates extraction before PromiseToPay
 │   │   │   ├── ptp_followup.py        # exact linked-promise completion
 │   │   │   ├── task_queue.py          # after-commit RQ publishing
@@ -51,11 +51,11 @@ recoveryos/
 │   │   │   ├── scorer.py              # P̂·amount − cost ranking
 │   │   │   └── artifacts/             # gitignored model.joblib
 │   │   └── routers/
-│   │       ├── health.py              # GET /health, GET /
+│   │       ├── health.py              # GET /health, GET /ready, GET /live
 │   │       ├── cases.py               # GET /cases, GET /cases/{id}, POST /cases/{id}/customer-reply
 │   │       ├── webhooks.py            # POST /webhooks/razorpay
 │   │       └── experiments.py         # POST/GET /experiments, GET /{id}/export.csv
-│   ├── alembic/versions/     # 4 revisions — only way schema changes
+│   ├── alembic/versions/     # schema migrations
 │   ├── scripts/
 │   │   ├── send_test_webhook.py       # signed webhook sender (local testing)
 │   │   ├── run_synthetic_batch.py     # 100-case policy health check
@@ -74,14 +74,6 @@ recoveryos/
     ├── package.json
     └── .env.example
 ```
-
----
-
-## Branch expectations
-
-- Active branch for this pass: `feat/payment-link-reconciliation`.
-- Do **not** switch / merge / rebase / stash / commit from documentation passes — leave changes uncommitted.
-- Feature work branches from the same baseline must keep `docs/CURRENT_STATE.md` as its first doc update when behavior changes.
 
 ---
 
@@ -115,10 +107,11 @@ recoveryos/
 | `RAZORPAY_KEY_ID` | When enabled | `""` | Only with gate; `rzp_test_*` enforced |
 | `RAZORPAY_KEY_SECRET` | When enabled | `""` | Only with gate |
 | `RAZORPAY_WEBHOOK_SECRET` | Yes | `""` → **fails closed** (signature never passes) | No |
-| `LLM_API_ENABLED` | No | `false` | **Gate** — Anthropic only when `true` |
-| `LLM_PROVIDER` | No | `anthropic` | Non-`anthropic` raises `LLMAPIError` when enabled |
+| `LLM_API_ENABLED` | No | `false` | **Gate** - enables the configured LLM provider |
+| `LLM_PROVIDER` | No | `anthropic` | Supports `anthropic` and `opencode_zen` |
 | `LLM_API_KEY` | When enabled | `""` | Only with gate |
-| `LLM_MODEL` | No | `claude-3-5-haiku-latest` | Model id |
+| `LLM_MODEL` | No | `claude-3-5-haiku-latest` | Provider model ID |
+| `LLM_BASE_URL` | No | Provider default | Optional provider endpoint override |
 | `LLM_TIMEOUT_SECONDS` | No | `10` | Bounded LLM timeout |
 | `LLM_MAX_RETRIES` | No | `2` | Bounded retries (transient only) |
 | `LLM_MESSAGE_DRAFT_ENABLED` | No | `true` | Sub-gate for drafting |
@@ -211,7 +204,7 @@ Before adding a test that needs the trained model, accept a `trained_model_path`
 - Publish only after the action transaction commits. Queue failure must leave recoverable `SCHEDULED` state.
 - Lock the case before conditionally claiming an action to preserve lock ordering.
 - Commit `EXECUTING` before any Redis/provider/LLM network call; finalize in a new transaction — **provider HTTP is never inside a long DB transaction** (`temporal_runtime` snapshots the case and closes the claim txn before `action_executor.perform`; reconciliation does `GET /v1/payment_links?reference_id=` outside any txn before finalize).
-- Recheck terminal state and supersession during finalization, and re-check `case.state` before provider reconciliation (spec 38).
+- Recheck terminal state and supersession during finalization, and recheck `case.state` before provider reconciliation.
 - Persist sanitized failure categories, not raw provider exceptions — use `_sanitize_link()` and truncated `sanitize_provider_error()`.
 - Any schema or status change must update `scripts/reconcile_actions.py`, `scripts/reconcile_payment_links.py`, `GET /cases/{id}`, runtime tests, and canonical docs.
 
@@ -224,7 +217,7 @@ Before adding a test that needs the trained model, accept a `trained_model_path`
 - **Shadow-first rollout:** New adaptive logic should be validated in `RECOVERY_POLICY=shadow` (baseline executes, `shadow_adaptive_recommendation` audited) before `adaptive` promotion.
 - **No direct side effects from ML:** `ml_policy` may only rank; `action_executor` remains the only caller of `razorpay_client`/`llm_client` via `temporal_runtime`.
 
-### LLM engineering invariants (this stage)
+### LLM engineering invariants
 
 - **LLM never chooses financial actions** — deterministic/guardrails or guarded adaptive remain sole controllers; LLM is downstream support only (draft / structured extraction).
 - **Customer input is untrusted** — prompt architecture separates system/task instructions from `<untrusted_customer_text>`; `_detect_injection` downgrades model output regardless of intent or amount; deterministic `ptp_extractor.validate_promise` authoritative.
@@ -273,12 +266,12 @@ npm run dev     # Vite dev server on 5173; expects backend on 8000
 
 API client: `src/api.ts` — typed `HealthResponse`, `DashboardSummary`, `RevenueCase`, `CaseDetail`, `DecisionInspector`, `TimelineEvent`, `ArmSummary`, `ExperimentSummary`. `frontend/src/components/**` drives Overview / Cases / Experiments / System with `GET /dashboard/summary`, `GET /cases` (filtered), `GET /cases/{id}` (enriched with timeline/decision_inspectors/provider_truth), and `?case=<id>` deep-linking. `ExperimentPanel.tsx` shows revenue-vs-friction Pareto & action distribution.
 
-### Observability / read-model invariants (this stage)
+### Observability / read-model invariants
 
 - **PostgreSQL remains truth.** `explainability.py` only derives from `RevenueCase`+`Decision`+`Action`+`AuditEvent`+`CustomerMessage`+`PromiseToPay`+`PaymentEvent`. No second timeline table. Historical missing provenance renders `null`/`unavailable`, never fabricated (frontend never invents controller scores).
 - **Frontend never invents financial truth.** Revenue at risk/recovered, state counts, friction, utility, provider truth come from backend read-model or deterministic computation; synthetic metrics remain labeled `SYNTHETIC SIMULATION`.
 - **Customer drafts never shown as delivered.** All outbound `CustomerMessage` are `status=DRAFT` / `MANUAL_ONLY` until a real transport exists; dashboard shows `DRAFT / NOT SENT`.
-- **No LLM-generated controller explanation.** All human-readable explanations of controller behavior are deterministic from persisted fields (`CATEGORY_ACTION_PREFERENCE`, `alternatives`, `decision.explanation`, guardrail config). LLM is downstream support only (draft / PTP extraction with placeholder safety and deterministic validation). No new AI, no RAG, no agent — this stage only exposes existing intelligence.
+- **No LLM-generated controller explanation.** All human-readable explanations of controller behavior are deterministic from persisted fields (`CATEGORY_ACTION_PREFERENCE`, `alternatives`, `decision.explanation`, guardrail config). The LLM is downstream support only for drafting and PTP extraction with placeholder safety and deterministic validation.
 
 ---
 
@@ -294,29 +287,29 @@ API client: `src/api.ts` — typed `HealthResponse`, `DashboardSummary`, `Revenu
 | Provider shape, gates, simulation, delivery, payload samples | `docs/INTEGRATIONS.md` |
 | Repo layout, branches, migrations, tests, how-to guides | `docs/DEVELOPMENT.md` (this file) |
 | Reasoning behind a principle or constraint | `docs/DECISIONS.md` |
-| New top-level capability (judge-visible in 2 minutes) | `README.md` (keep concise — link outward) |
+| New top-level capability | `README.md` (keep concise and link outward) |
 
-**README should stay concise and link outward.** It is the only document a judge reads fully; the rest are canonical references.
+**README should stay concise and link outward.** Detailed behavior belongs in the relevant reference document.
 
 ---
 
-## Definition of Done for every future subsystem
+## Definition Of Done
 
-Every implementation phase must ship:
+Every implementation change must include, where applicable:
 
 1. **Code** — feature under `backend/app/**` or `frontend/src/**`.
 2. **Tests** — hermetic; no external network; covers happy + known bad-input + idempotency; lives under `backend/tests/**` and passes on the temp SQLite DB.
 3. **Migrations** — if schema changed, one `alembic revision` applied to `app/models.py`.
-4. **README** — only if entry-point behavior changes (new judge-visible capability, new disclaimer, new quick-start path).
+4. **README** - only if entry-point behavior, major capabilities, limitations, or quick-start instructions change.
 5. **ARCHITECTURE** — if architecture changes (new component, state, transition, DB truth guarantee, diagram).
 6. **`CURRENT_STATE.md`** — capability-matrix row updated, runtime-reality table updated if delayed/side-effect semantics changed, technical debt / next subsystem refreshed, doc legend honoured.
 7. **`SYSTEM_FLOWS.md`** — flow row added/updated with trigger/persisted entities/state change/side effects/failure behavior/current limitation.
 8. **`RUNBOOK.md`** — if any command, `working_directory`, or env var changed (plus Windows `--` vs `-` and PowerShell vs CMD splits where syntax differs).
 9. **`INTEGRATIONS.md`** — if any external provider behavior changed (gates, payloads, test-mode gates, delivery transports).
 10. **`ML_AND_EVALUATION.md`** — if anything touching model/features/costs/evaluation/revenue-friction tradeoff changed (with circularity note and synthetic vs production disclaimer).
-11. **Final validation results** — `python -m pytest --collect-only -q` still reports the current count, `npm run build` and `npm run lint` pass, `alembic upgrade head` (SQLite) still passes; paste doctext in the phase report.
+11. **Validation results** - run the backend tests, frontend lint and build, and migration check before opening a pull request.
 
-A phase is **not complete** if its docs still describe the old behavior.
+A change is **not complete** if its documentation still describes the old behavior.
 
 ---
 
@@ -324,24 +317,24 @@ A phase is **not complete** if its docs still describe the old behavior.
 
 > Documentation is part of the implementation.
 >
-> A subsystem is not considered complete until its canonical documentation no longer describes the previous behavior. Every future prompt report must identify: **which doc files changed**, **which were intentionally left unchanged and why**, and **the reason** for each (e.g. "no new provider shape → `INTEGRATIONS.md` unchanged").
+> A subsystem is not considered complete until its canonical documentation no longer describes the previous behavior.
 >
-> Avoid repeating volatile values. The test count is authoritative in `docs/CURRENT_STATE.md` — do not duplicate it in README/ARCHITECTURE/RUNBOOK unless you are prepared to bump all of them every run.
+> Avoid repeating volatile values such as test counts across documentation.
 
 ---
 
 ## Governance — who owns what
 
 ```
-README.md               — maintained by whoever ships a judge-visible change; reviewed against "2-minute" test.
-ARCHITECTURE.md         — owned by the phase lead for architectural changes; reviewed for diagram ↔ code alignment.
-docs/CURRENT_STATE.md   — owned by every phase; mandatory first update when the matrix drifts.
+README.md               - maintained with user-visible changes.
+ARCHITECTURE.md         - maintained with component, boundary, and state-model changes.
+docs/CURRENT_STATE.md   - maintained whenever capability status or limitations change.
 docs/SYSTEM_FLOWS.md    — co-owned by orchestrator/policy/executor leads; updated per flow.
 docs/RUNBOOK.md         — owned by DevEx / reliability; every command must be copy-pasteable on Windows.
 docs/ML_AND_EVALUATION.md — owned by ML lead; must remain scientifically honest (circularity, tradeoff).
 docs/INTEGRATIONS.md    — owned by integration leads (Razorpay/LLM/Queue); real vs simulated must be explicit.
 docs/DEVELOPMENT.md     — owned by infra/DX; how to change the system safely.
-docs/DECISIONS.md       — append-only ADRs; phase lead proposes, reviewers approve, never rewrite past.
+docs/DECISIONS.md       - append-only records for consequential architecture decisions.
 ```
 
 ---
@@ -353,4 +346,3 @@ docs/DECISIONS.md       — append-only ADRs; phase lead proposes, reviewers app
 - [ ] Migrations verify: `cd backend && DATABASE_URL=sqlite:///./ci_migration.db python -m alembic upgrade head` (head `c9d0e1f2a3b4` LLM provenance; downgrade/upgrade fresh verified).
 - [ ] No secrets introduced into diff (`backend/.env`, `frontend/.env` are gitignored — check `.env.example` only); `httpx` calls are mocked in tests, simulation remains default.
 - [ ] Documentation updated per table above; `git diff --check` (whitespace) clean.
-- [ ] Report lists docs changed / intentionally unchanged / reason.

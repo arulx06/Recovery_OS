@@ -92,7 +92,7 @@ def validate_feature_row(row: dict): ...
     "training_seed": 42,
     "training_n": 24000,
     "holdout_n": 6000,
-    "metrics": {"roc_auc": 0.7756, "log_loss": 0.4715, "brier_score": 0.1597, "accuracy": 0.7510, "base_rate": 0.37},
+    "metrics": {"roc_auc": "<generated>", "log_loss": "<generated>", "brier_score": "<generated>", "accuracy": "<generated>", "base_rate": "<generated>"},
     "model_class": "HistGradientBoostingClassifier",
     "fingerprint": "<sha256 of this generated joblib>",
     "fingerprint_short": "<first 8 hex characters>",
@@ -105,20 +105,11 @@ def validate_feature_row(row: dict): ...
 
 ---
 
-## Current metrics (holdout, synthetic)
+## Generated Metrics
 
-`python -m app.ml.train` (`n=30000, seed=42`, `scikit-learn 1.5.2`):
+Run `python -m app.ml.train` to generate holdout metrics for the current code and dependency versions. The default command uses `n=30000`, `seed=42`, and an 80/20 stratified split.
 
-```
-Trained on 24000 rows, evaluated on 6000 holdout rows (base recovery rate: 37%)
-  ROC-AUC:   0.7756
-  Log loss:  0.4715
-  Brier:     0.1597
-  Accuracy:  0.7510 (at 0.5)
-  Fingerprint: <build-specific SHA-256 prefix>  (model recovery-v1, schema v1)
-```
-
-- **Brier** `0.1597` indicates reasonable calibration for a histogram GBDT on synthetic data; no Platt/isotonic calibration applied. Synthetic holdout (6k) and GBDT's native isotonic-ish boosting make explicit calibration unnecessary for utility ordering at this scale. If holdout grew or real data showed miscalibration (reliability diagram, ECE), sigmoid/isotonic would be considered — but not before.
+The command prints ROC-AUC, log loss, Brier score, accuracy, holdout base rate, and the generated artifact fingerprint. The same values are written to `manifest.json`. They are intentionally not copied into this document because generated metrics can change with implementation or dependency updates.
 
 ROC-AUC is **not** the business metric. The experiment runner is.
 
@@ -126,7 +117,7 @@ ROC-AUC is **not** the business metric. The experiment runner is.
 
 ## Friction is a first-class objective
 
-Previously `expected_value = p*amount - ACTION_COST` with `COST = {WAIT 0, CREATE 5, CONTACT 15, PTP 15, ESCALATE 50}` — at `amount ~5000`, `p*amount` (2500) dominates `cost` (15), so adaptive always preferred contact and doubled interventions (`474 vs 253` per 1000 synthetic cases) for `+1.3pp` recovery.
+Using only `expected_value = p*amount - ACTION_COST` makes small action-cost values insignificant relative to typical payment amounts and can over-favor customer contact. RecoveryOS therefore models friction separately.
 
 Now:
 
@@ -201,74 +192,24 @@ Both surfaces (`experiment_runner.run_experiment` and `scripts/evaluate_policies
 
 ---
 
-## Current performance characteristics — honest, with friction (seed 11 was design)
+## Evaluating Policy Tradeoffs
 
-`seed=11` with `count 500/1000` was the **exploratory/design seed** that motivated the frozen weights `revenue_first:4, balanced:18, low_friction:45` (heuristic, not empirical optima). It was used to make friction materially affect choice (initial 0.3/1/2.5 had no effect). After freezing, separate validation uses `seed 7,42,101`.
+The profile weights `revenue_first:4`, `balanced:18`, and `low_friction:45` are policy preferences rather than empirically optimal values. Compare them with the same scenario count and seed:
 
-**Design seed (frozen weights, for reference only, not a claim):**
+```powershell
+$env:ADAPTIVE_POLICY_PROFILE="revenue_first"
+python scripts/evaluate_policies.py --count 1000 --seed 11
+
+$env:ADAPTIVE_POLICY_PROFILE="balanced"
+python scripts/evaluate_policies.py --count 1000 --seed 11
+
+$env:ADAPTIVE_POLICY_PROFILE="low_friction"
+python scripts/evaluate_policies.py --count 1000 --seed 11
 ```
-                        Baseline                  Balanced Adaptive (weight 18)
-Revenue at risk         21,726,382                21,726,382
-Revenue recovered        9,217,944                 9,189,944  (-28k)
-Recovery rate                42.4%                     42.3%  (-0.1pp)
-Contact actions              240                       288  (+20%)
-Escalations                  275                       212  (-23%)
-```
 
-For `count 500, seed 11` (same seed, balanced): `Revenue recovered 4,566,467 → 4,614,971 (+48k), Recovery 42.3%→42.7% (+0.4pp), Contacts 125→149 (+19%), Escalations 134→107 (-20%)`.
+Repeat with multiple fixed seeds and compare recovered amount, contact rate, escalations, friction score, and realized policy utility together. Do not treat any synthetic difference as expected production lift.
 
-**Validation — frozen weights, separate seeds, `count 100` (synthetic, not production, post-RNG-fix canonical):**
-
-*Baseline is now identical across profiles for same seed/count (RNG fix). Seed 11 remains exploratory/design.*
-
-| Seed | Profile (`weight`) | Baseline recovered / rate / contacts / esc | Adaptive recovered / rate / contacts / esc / friction | Δ recovered | Δ contacts | Δ esc |
-|------|--------------------|--------------------------------------------|------------------------------------------------------|-------------|------------|-------|
-| 7 | `balanced` `18` | `798,995 35.6% 28 (28%) 25` | `799,992 35.6% 41 (41%) 24` | **+997** | **+13** | **-1** |
-| 42 | `balanced` `18` | `706,496 36.2% 27 (27%) 26` | `711,497 36.5% 30 (30%) 23` | **+5,001** | **+3** | **-3** |
-| 101 | `balanced` `18` | `910,496 41.0% 21 (21%) 23` | `994,997 44.8% 30 (30%) 18` | **+84,501** | **+9** | **-5** |
-| **Mean (100, balanced)** | — | — | — | **+30,166.33** (`+997` to `+84,501`) | **+8.33** (`+3` to `+13`) | **-3** (`-5` to `-1`) |
-
-Full 9-row `count 100` matrix (each run's `realized_policy_utility = recovered - cost - persisted_weight * friction`):
-
-| Seed | Profile | Baseline (rec / rate / contacts / esc) | Adaptive (rec / rate / contacts / esc / friction / utility) |
-|------|---------|----------------------------------------|--------------------------------------------------------------|
-| 7 | `revenue_first` `4` | `798,995 35.6% 28 25` | `806,993 35.9% 51 25` |
-| 7 | `balanced` `18` | `798,995 35.6% 28 25` | `799,992 35.6% 41 24` |
-| 7 | `low_friction` `45` | `798,995 35.6% 28 25` | `706,994 31.5% 34 18` |
-| 42 | `revenue_first` `4` | `706,496 36.2% 27 26` | `732,495 37.6% 45 24` |
-| 42 | `balanced` `18` | `706,496 36.2% 27 26` | `711,497 36.5% 30 23` |
-| 42 | `low_friction` `45` | `706,496 36.2% 27 26` | `648,997 33.3% 26 16` |
-| 101 | `revenue_first` `4` | `910,496 41.0% 21 23` | `1,005,994 45.3% 40 21` |
-| 101 | `balanced` `18` | `910,496 41.0% 21 23` | `994,997 44.8% 30 18` |
-| 101 | `low_friction` `45` | `910,496 41.0% 21 23` | `1,018,497 45.8% 26 14` |
-
-Baseline columns are **identical** across the three profiles for each seed (verified). Adaptive trade-off is explicit: `revenue_first` recovers most but contacts most; `low_friction` contacts least but can recover most on some seeds; `balanced` is a defensible middle. No production lift claimed.
-
-Revenue-first (`weight 4`) would still push contacts toward `~1.6×` baseline for `+50–70k` incremental; low-friction (`weight 45`) pushes contacts **below** baseline (`-10%`) while giving up `~1–2pp` recovery — the Pareto frontier is explicit (see next).
-
----
-
-## Sensitivity / Pareto — do not cherry-pick
-
-`scripts/evaluate_policies.py` can be run with `ADAPTIVE_POLICY_PROFILE` to expose the tradeoff (set `RECOVERY_POLICY=adaptive` env, or pass profile to a future CLI; current script uses config profile):
-
-| Profile (`weight`) | Recovered Δ vs baseline | Contacts Δ | Escalations Δ | Friction Δ | Recovered / contact |
-|--------------------|------------------------|------------|---------------|------------|---------------------|
-| `revenue_first` (4) | `+50–80k` (500), `+…` (1000) | `+60–100` | `~flat` | high | `~19k` |
-| `balanced` (18, **default**) | `+48k` (500), `-28k` (1000) | `+24` / `+48` | `-20%` | medium | `~31k` |
-| `low_friction` (45) | `-30–60k` | `-15` | `-30%` | lowest | `~38k` |
-
-(Numbers illustrative for `seed 11`; run `python scripts/evaluate_policies.py --count 1000 --seed {11,7,42}` for validation — synthetic robustness ≠ production validation, but multiple fixed seeds reduce cherry-picking.)
-
-The default is **balanced** — defensible, not empirically optimal, and not tuned to prettify one seed.
-
----
-
-## Calibration audit
-
-- Holdout `n=6000`, `Brier 0.1597`, `log loss 0.4715`, `ROC-AUC 0.7756`.
-- No Platt/isotonic calibration applied. Reason: synthetic holdout is large enough to detect gross miscalibration, but GBDT's native probability ranking is sufficient for utility ordering (`p*amount` dominates). Reliability diagram (not shown) on synthetic holdout shows no systematic over/under-confidence >0.05 in the `0.2–0.8` band where decisions are sensitive.
-- If real data showed ECE >0.05, we would add `CalibratedClassifierCV(method="sigmoid")` and re-validate with `scorer.get_model_info()` fingerprint bump (`recovery-v2`) — not before.
+No additional probability calibration is applied. Calibration should be reassessed with reliability diagrams and expected calibration error once real holdout data is available; `CalibratedClassifierCV` can be introduced if the real-data results justify it.
 
 ---
 

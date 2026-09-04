@@ -11,13 +11,10 @@ State machine (see ARCHITECTURE.md for the full diagram):
                                               -> DISPUTED
                            -> RECOVERED / STOPPED (from anywhere pre-terminal)
 
-Phase 1 covered DETECTED and the two edge cases the brief calls out
-explicitly (duplicate webhook delivery, and payment.failed followed later
-by payment.captured for the same payment). Phase 2 added DIAGNOSED: every
-failure gets a deterministic failure_category. Phase 3 adds the rest —
-right after diagnosis, the Guardrail + baseline Policy Engine
-(app/services/policy_engine.py) runs synchronously, choosing an action and
-landing the case in WAITING, ACTION_SCHEDULED, or HUMAN_REVIEW.
+Duplicate webhook delivery is idempotent, and a later `payment.captured` event
+can recover the same failed payment. Every failure receives a deterministic
+category before the policy engine selects an action and moves the case to
+WAITING, ACTION_SCHEDULED, or HUMAN_REVIEW.
 
 The baseline policy runs inline. Payment Links may be created through the
 explicitly enabled Razorpay Test Mode integration; contact text is drafted
@@ -381,7 +378,7 @@ def _handle_recovery(
 
 def _handle_payment_link_paid(db: Session, payment_event: PaymentEvent, payload: dict) -> RevenueCase | None:
     """
-    A RecoveryOS-created Payment Link (Phase 4) was paid. This fulfills
+    A RecoveryOS-created Payment Link was paid. This fulfills
     through a *new* payment, distinct from the one that originally failed
     — so matching goes through razorpay_payment_link_id, not
     razorpay_payment_id.
@@ -481,7 +478,7 @@ def handle_customer_reply(
     extraction: llm_client.PTPExtraction | None = None,
 ) -> RevenueCase:
     """
-    Phase 6 entry point for an inbound customer message — the reply to a
+    Entry point for an inbound customer message - the reply to a
     CONTACT_CUSTOMER / COLLECT_PROMISE_TO_PAY outreach. Always stores the
     message. Then:
 
@@ -568,7 +565,7 @@ def handle_customer_reply(
         return case
 
     outstanding = float(case.amount) if case.amount is not None else 0.0
-    # Case eligibility checks per spec 12
+    # Terminal cases are not eligible for new promises.
     if case.state in ("RECOVERED", "DISPUTED", "STOPPED"):
         _log_audit(db, case, "ptp_validation_rejected", {"reason": f"case state {case.state} not eligible", "intent": extraction.intent})
         _cancel_scheduled_actions(db, case)

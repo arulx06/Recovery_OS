@@ -1,4 +1,4 @@
-# RecoveryOS — Public Webhook Manual Plan
+# RecoveryOS - Public Webhook Setup
 
 > Vendor-neutral, no dependency. Secret never appears in docs.
 
@@ -11,7 +11,7 @@ Expose `POST /webhooks/razorpay` (signature-authenticated, idempotent) for real 
 ### 1. Prepare local backend
 
 ```powershell
-cd D:\Razorpay\backend
+cd backend
 Copy-Item .env.example .env
 # set RAZORPAY_WEBHOOK_SECRET to a fresh random string, e.g. (32+ chars)
 # leave RAZORPAY_API_ENABLED=false unless you intend to test real Payment Links
@@ -101,9 +101,9 @@ python scripts/send_test_webhook.py payment.failed --url "$tunnel/webhooks/razor
 # second should return {"status":"ignored","reason":"duplicate_event"}
 ```
 
-### 5. WebSocket/intervals are not required
+### 5. WebSockets are not required
 
-Polling covers judge demo; no `WebSocket` needed.
+The frontend uses polling, so no WebSocket connection is required.
 
 ### 6. Fallback when tunnel unavailable
 
@@ -112,7 +112,7 @@ Use local `send_test_webhook.py` with `DEFAULT_URL=http://localhost:8000/webhook
 ### 7. Teardown
 
 - Remove webhook URL from Razorpay Dashboard when demo ends.
-- `docker compose down` or stop tunnel.
+- Run `docker compose down` and stop the tunnel.
 - Rotate `RAZORPAY_WEBHOOK_SECRET` if it was ever exposed.
 - Do not leave `DEMO_ADMIN_TOKEN` hard-coded in env or frontend build (sessionStorage only).
 

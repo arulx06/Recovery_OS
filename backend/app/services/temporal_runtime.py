@@ -252,7 +252,7 @@ def _handle_ambiguous_payment_link(action_id: str, now, error_detail: str) -> st
     if action_type != "CREATE_PAYMENT_LINK":
         return _record_external_failure(action_id, now)
 
-    # Reload authoritative case state before provider lookup (spec 38).
+    # Reload authoritative case state before the provider lookup.
     with SessionLocal() as db:
         case = db.query(RevenueCase).filter(RevenueCase.id == case_snapshot.id).first()
         if not case or case.state in TERMINAL_CASE_STATES:
@@ -544,8 +544,7 @@ def reconcile_actions(now=None, limit: int | None = None) -> dict:
         db.rollback()
 
     for action_id in stale_ids:
-        # Provider-aware path for stale CREATE_PAYMENT_LINK — check provider
-        # before blindly resetting to SCHEDULED (spec: 14, 17).
+        # Check the provider before resetting a stale payment-link action.
         stale_snapshot = _execution_snapshot(action_id)
         if stale_snapshot and stale_snapshot[1] == "CREATE_PAYMENT_LINK":
             outcome = _reconcile_stale_payment_link(action_id, now, stale_before)

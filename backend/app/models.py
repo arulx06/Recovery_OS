@@ -1,14 +1,7 @@
-"""
-Day 1 schema lock.
+"""SQLAlchemy models for recovery cases, decisions, actions, and experiments.
 
-These tables exist so migrations can run and the dashboard shell has
-something real to point at. Columns get filled in as each phase needs
-them (Phase 1: payment_events; Phase 2: failure taxonomy fields on
-revenue_cases; Phase 3: decisions/actions; Phase 6: promises_to_pay /
-customer_messages; Phase 7: experiment_cases).
-
-Nothing here is a migration substitute — Alembic owns schema changes
-from Phase 1 onward. This file is the source of truth for model shape.
+This file is the source of truth for the model shape. Alembic owns all database
+schema changes.
 """
 import uuid
 
@@ -57,7 +50,7 @@ class RevenueCase(Base):
     source = Column(String, nullable=False, default="razorpay")  # razorpay | synthetic
     razorpay_payment_id = Column(String, nullable=True)
     razorpay_subscription_id = Column(String, nullable=True)
-    # Set when a CREATE_PAYMENT_LINK action is executed (Phase 4). The
+    # Set when a CREATE_PAYMENT_LINK action is executed. The
     # payment eventually made through that link gets its own, different
     # razorpay_payment_id — so payment_link.paid webhooks are matched
     # against this column instead.
@@ -66,7 +59,7 @@ class RevenueCase(Base):
     amount = Column(Numeric(12, 2), nullable=False)
     currency = Column(String, default="INR")
 
-    # filled in Phase 2 (failure intelligence)
+    # Failure intelligence derived from the provider event.
     failure_category = Column(String, nullable=True)
     error_source = Column(String, nullable=True)
     error_step = Column(String, nullable=True)
@@ -204,7 +197,7 @@ class CustomerMessage(Base):
 
 
 class AuditEvent(Base):
-    """Append-only explanation/history trail — the thing judges/compliance can read end to end."""
+    """Append-only explanation and history trail for operators and audits."""
     __tablename__ = "audit_events"
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
@@ -233,7 +226,7 @@ class ExperimentRun(Base):
 
 
 class ExperimentCase(Base):
-    """Control/treatment assignment for the baseline-vs-RecoveryOS batch evaluation (Phase 7)."""
+    """Control or treatment assignment for a synthetic policy evaluation."""
     __tablename__ = "experiment_cases"
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)

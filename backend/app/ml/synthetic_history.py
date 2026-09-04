@@ -1,13 +1,12 @@
 """
-Synthetic recovery-history generator (Phase 5).
+Synthetic recovery-history generator.
 
 Produces a table of {context, action_taken, recovered} rows that
 train.py fits the recovery-probability model on. Every row's outcome comes
 from ground_truth.sample_outcome() — so the model is learning to
 reconstruct the simulator's assumptions, not real Razorpay behavior. Once
-RecoveryOS has run against live traffic, this generator is what gets
-replaced with real historical cases; nothing else in Phase 5 needs to
-change when that happens, since train.py only cares about getting a
+RecoveryOS has run against live traffic, this generator can be replaced
+with real historical cases; `train.py` only requires a
 DataFrame with these columns.
 
 `action_taken` is sampled uniformly across the whole action space (not

@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-Phase 5 exit criteria: "model ranks allowed actions; offline evaluation
-reproducible from repo."
-
 Generates N synthetic-but-realistic scenarios. For each one, runs BOTH the
-baseline policy (Phase 3's fixed ranked-preference engine) and the ML
-policy (Phase 5's expected-value scorer) against an *identical* copy of
+baseline policy (fixed ranked-preference engine) and the adaptive policy
+(expected-value scorer) against an *identical* copy of
 the case — then samples an outcome for whichever action each one chose,
 using the same ground-truth simulator the model was trained against.
 
@@ -48,9 +45,8 @@ def _deterministic_uniform(seed: int, scenario_idx: int, action: str) -> float:
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Same realistic failure-type mix as scripts/run_synthetic_batch.py, so the
-# two Phase 3 / Phase 5 exit-criteria scripts are evaluating a comparable
-# population of cases.
+# Same failure-type mix as scripts/run_synthetic_batch.py so both scripts use
+# a comparable population of cases.
 SCENARIO_PROFILES = [
     ({"failure_category": "INSUFFICIENT_BALANCE"}, 22),
     ({"failure_category": "TRANSIENT_INFRASTRUCTURE"}, 16),

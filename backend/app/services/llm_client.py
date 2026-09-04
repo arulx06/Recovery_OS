@@ -1,5 +1,5 @@
 """
-LLM client (Phase 6 + Stage: LLM-ASSISTED CUSTOMER RECOVERY INTELLIGENCE).
+Optional LLM client for customer-message drafting and intent extraction.
 
 Calls Anthropic's Messages API or OpenCode Zen Responses API only when external
 LLM access is explicitly enabled. Credentials alone never activate network
@@ -79,7 +79,7 @@ BARE_NUMBER_NEAR_PAY_PATTERN = re.compile(
     r"\b(?:pay|send|give|clear|settle)\w*\s+(?:\u20b9|rs\.?|inr)?\s*([\d,]+(?:\.\d+)?)", re.IGNORECASE,
 )
 
-# Valid intents per spec: promise_to_pay | not_a_promise | uncertain | payment_claim
+# Valid intents returned by extraction.
 # We preserve legacy dispute/unclear for backward compat
 VALID_INTENTS = {"promise_to_pay", "not_a_promise", "uncertain", "payment_claim", "dispute", "unclear"}
 # Mapping legacy to canonical where helpful
@@ -226,7 +226,7 @@ class PTPExtraction:
     confidence: float = 0.0
     simulated: bool = True
     raw: dict = field(default_factory=dict)
-    # New fields per spec — optional to preserve backward compat
+    # Structured extraction fields; optional for persisted legacy records.
     promised_amount: float | None = None
     promised_date: str | None = None
     reasoning_code: str | None = None

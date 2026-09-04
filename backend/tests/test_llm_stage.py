@@ -1,7 +1,6 @@
-"""
-LLM-ASSISTED CUSTOMER RECOVERY INTELLIGENCE — hermetic tests for stage.
+"""Hermetic tests for LLM-assisted customer recovery intelligence.
 
-Covers (per spec 56-61):
+Covers:
 - disabled client does no network
 - provider timeout / 429 / 500 / malformed / missing fields / invalid enum / amount / date / confidence / network blocked / fake credentials / schema failure -> typed error / no CoT
 - PTP extraction 20 items

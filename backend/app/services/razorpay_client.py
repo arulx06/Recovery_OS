@@ -1,5 +1,5 @@
 """
-Razorpay Payment Links client (Phase 4).
+Razorpay Payment Links client.
 
 This client uses a clearly-labeled local simulation unless Razorpay API
 access is explicitly enabled. Credentials alone never activate network

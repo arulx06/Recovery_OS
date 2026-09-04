@@ -1,5 +1,5 @@
 """
-Ground-truth recovery simulator (Phase 5).
+Ground-truth recovery simulator.
 
 Nobody has real "did this recovery action work" data yet — that only
 exists once RecoveryOS is running against live traffic. Until then, this
@@ -13,9 +13,9 @@ whether the payment is subscription-linked. It's used for two things:
   2. Sampling an outcome for whichever action a policy chooses, in the
      offline baseline-vs-ML evaluation (scripts/evaluate_policies.py).
 
-This is NOT a claim about real recovery rates. Every place that uses this
-module's output should be labeled "synthetic simulation benchmark" — see
-ARCHITECTURE.md's evaluation design and the plan's own caution about this.
+This is not a claim about real recovery rates. Every surface that uses this
+module's output must be labeled as a synthetic simulation benchmark; see the
+evaluation design in ARCHITECTURE.md.
 
 The specific numbers encode the same intuition as the failure taxonomy in
 ARCHITECTURE.md: transient/native-retry categories recover well passively;
@@ -152,4 +152,4 @@ __all__ = [
     "BASE_PROBABILITY", "FALLBACK_PROBABILITY", "true_probability", "sample_outcome",
 ]
 
-assert set(a for (_, a) in BASE_PROBABILITY) <= set(ALL_ACTIONS), "ground truth references an action outside the Phase 3 action space"
+assert set(a for (_, a) in BASE_PROBABILITY) <= set(ALL_ACTIONS), "ground truth references an unsupported action"

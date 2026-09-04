@@ -24,13 +24,13 @@ jobs:
       - name: Run tests
         working-directory: backend
         run: DATABASE_URL=sqlite:///./ci.db python -m pytest -q
-      - name: Run 100-case synthetic batch (Phase 3 exit criteria)
+      - name: Run synthetic pipeline smoke test
         working-directory: backend
         run: python scripts/run_synthetic_batch.py --count 100
-      - name: Train recovery-probability model (Phase 5)
+      - name: Train recovery-probability model
         working-directory: backend
         run: python -m app.ml.train
-      - name: Baseline vs ML offline evaluation (Phase 5 exit criteria)
+      - name: Run baseline vs adaptive offline evaluation
         working-directory: backend
         run: python scripts/evaluate_policies.py --count 1000
 

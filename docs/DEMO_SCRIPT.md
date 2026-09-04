@@ -1,11 +1,11 @@
-# RecoveryOS — 4–5 Minute Judge Demo Script (Reproducible)
+# RecoveryOS - Demo Walkthrough
 
-> All steps assume `backend/` venv activated, `docker compose up -d` running, `alembic upgrade head` done, `python -m app.ml.train` done, and `python scripts/seed_demo.py --reset-demo` has been run. No real money, no external delivery. RAZORPAY TEST MODE is optional — offline SIMULATED fallback is always available.
+> Start from the repository root with the backend virtual environment activated. This walkthrough uses no real money or external message delivery. Razorpay Test Mode is optional; the simulated fallback is always available.
 
 ## 0. Reset to known state (30s)
 
 ```powershell
-cd D:\Razorpay\backend
+cd backend
 python scripts/seed_demo.py --reset-demo   # deletes only pay_demo_* rows, then reseeds
 python scripts/seed_demo.py --check        # verify A,B,C,C_NATIVE,E (+ D,F if model exists)
 ```
@@ -20,7 +20,7 @@ curl.exe http://localhost:8000/ready | python -m json.tool    # readiness: datab
 curl.exe http://localhost:8000/dashboard/summary | python -m json.tool | Select-Object -First 30
 ```
 
-Open `http://localhost:5173` — header must say `backend healthy`, `TEST MODE · SYNTHETIC · DRAFT NOT SENT`, `backend healthy` pill. Overview shows revenue at risk/recovered, open/recovered/waiting/human-review counts.
+Open `http://localhost:5173`. Confirm the header shows `Healthy`, the expected `SIMULATED` or `TEST MODE` label, and the active policy. Synthetic experiments and stored customer messages retain their own `SYNTHETIC` and `DRAFT / NOT SENT` disclosures.
 
 ## 1. Silent recovery — WAIT does nothing (45s)
 
@@ -31,7 +31,7 @@ Open `http://localhost:5173` — header must say `backend healthy`, `TEST MODE �
 - Guardrails: PASS (no contacts).
 - Decision Inspector: candidate `WAIT` selected, friction 0, utility highest.
 - Timeline: `Payment failed → Diagnosed TRANSIENT → Decision WAIT → WAIT scheduled → WAITING`.
-- Explain: *“RevenueOS sometimes does nothing — waiting for native retry is cheaper than contacting the customer.”*
+- Explain: *“RecoveryOS sometimes does nothing because waiting for a native retry can be cheaper and less intrusive than contacting the customer.”*
 
 ## 2. Payment Link — authoritative then recovery (60s)
 
@@ -104,7 +104,7 @@ Open any case detail, scroll through:
 
 `Why payment failed → Guardrails → Decision Inspector → Timeline → Temporal runtime → Provider truth → Customer intelligence → PTP → Audit provenance`
 
-Each judge question (“What failed? Why? What was alternative? Why was this chosen? Was it executed? Did Razorpay confirm?”) is answered without opening raw JSON.
+The case detail answers the key operational questions: what failed, which alternatives were considered, why an action was selected, whether it executed, and whether Razorpay confirmed recovery.
 
 ## Offline fallback (if Wi-Fi fails)
 
@@ -121,7 +121,7 @@ With `FAILURE_INJECTION_ENABLED=true`:
 - Send webhook with header `X-Failure-Inject: razorpay_timeout` → Payment Link path shows `provider_outcome_ambiguous` → `GET ?reference_id=` reconciliation before retry.
 - Or `rq_enqueue_failure` → Action stays `SCHEDULED` with `action_enqueue_failed` audit → `reconcile_actions.py` republishes.
 
-Never enable injection in public demo without explicit flag.
+Enable failure injection only in a controlled development environment.
 
 ## Public webhook (if internet available)
 

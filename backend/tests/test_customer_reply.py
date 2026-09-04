@@ -34,7 +34,7 @@ def send_webhook(client, event_type: str, entity: dict, event_id: str):
 
 def fail_with_contact_action(client, payment_id: str, amount: int, event_id: str) -> str:
     """otp_incorrect -> CUSTOMER_AUTHENTICATION -> baseline picks CONTACT_CUSTOMER,
-    which the Phase 6 executor actually runs, landing the case in
+    which the action executor runs, landing the case in
     AWAITING_OUTCOME with an outbound message on record. Returns the case id."""
     resp = send_webhook(
         client, "payment.failed",

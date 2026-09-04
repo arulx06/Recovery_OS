@@ -156,7 +156,7 @@ export default function ExperimentPanel() {
   const hasPolicyUtility = baseline?.realized_policy_utility !== undefined && adaptive?.realized_policy_utility !== undefined;
   const baselineScore = baseline ? (hasPolicyUtility ? (baseline.realized_policy_utility ?? baseline.realized_net_value) : baseline.realized_net_value) : 0;
   const adaptiveScore = adaptive ? (hasPolicyUtility ? (adaptive.realized_policy_utility ?? adaptive.realized_net_value) : adaptive.realized_net_value) : 0;
-  const winner = adaptiveScore > baselineScore ? "Adaptive" : baselineScore > adaptiveScore ? "Baseline" : null;
+  const leadingPolicy = adaptiveScore > baselineScore ? "Adaptive" : baselineScore > adaptiveScore ? "Baseline" : null;
   const frictionDelta = baseline?.friction_score !== undefined && adaptive?.friction_score !== undefined
     ? adaptive.friction_score - baseline.friction_score
     : undefined;
@@ -183,7 +183,7 @@ export default function ExperimentPanel() {
               <input
                 type="number"
                 min={1}
-                max={5000}
+                max={1000}
                 value={count}
                 onChange={(e) => setCount(Number(e.target.value))}
                 className="w-24 rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-400/60 focus:ring-2 focus:ring-cyan-400/10"
@@ -246,13 +246,13 @@ export default function ExperimentPanel() {
 
         {result && baseline && adaptive && (
           <div className="space-y-4">
-            <section aria-live="polite" className={`relative overflow-hidden rounded-2xl border px-5 py-4 ${winner === "Adaptive" ? "border-emerald-400/30 bg-emerald-400/[0.07]" : winner === "Baseline" ? "border-violet-400/30 bg-violet-400/[0.07]" : "border-slate-500/30 bg-white/[0.04]"}`}>
+            <section aria-live="polite" className={`relative overflow-hidden rounded-2xl border px-5 py-4 ${leadingPolicy === "Adaptive" ? "border-emerald-400/30 bg-emerald-400/[0.07]" : leadingPolicy === "Baseline" ? "border-violet-400/30 bg-violet-400/[0.07]" : "border-slate-500/30 bg-white/[0.04]"}`}>
               <div className="absolute inset-y-0 right-0 w-64 bg-gradient-to-l from-white/[0.04] to-transparent" aria-hidden />
               <div className="relative flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                 <div>
-                  <div className={`text-xs font-semibold uppercase tracking-[0.2em] ${winner === "Adaptive" ? "text-emerald-300" : winner === "Baseline" ? "text-violet-300" : "text-slate-400"}`}>Simulation verdict</div>
+                  <div className={`text-xs font-semibold uppercase tracking-[0.2em] ${leadingPolicy === "Adaptive" ? "text-emerald-300" : leadingPolicy === "Baseline" ? "text-violet-300" : "text-slate-400"}`}>Simulation comparison</div>
                   <h3 className="mt-1 text-2xl font-semibold tracking-tight text-white">
-                    {winner ? `${winner} policy won this run` : "The policies tied this run"}
+                    {leadingPolicy ? `${leadingPolicy} produced higher simulated utility` : "The policies produced equal simulated utility"}
                   </h3>
                   <p className="mt-1.5 text-base text-slate-300">{buildComparisonStatement(result)}</p>
                 </div>
@@ -261,7 +261,7 @@ export default function ExperimentPanel() {
                   <div className={`mt-1 font-mono text-2xl font-semibold ${result.incremental_recovered >= 0 ? "text-emerald-300" : "text-rose-300"}`}>
                     {formatSignedRupees(result.incremental_recovered)}
                   </div>
-                  <div className="mt-0.5 text-xs text-slate-500">Winner by {hasPolicyUtility ? "realized policy utility" : "realized net value"}</div>
+                  <div className="mt-0.5 text-xs text-slate-500">Compared by {hasPolicyUtility ? "realized policy utility" : "realized net value"}</div>
                 </div>
               </div>
             </section>

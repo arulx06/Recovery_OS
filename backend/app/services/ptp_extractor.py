@@ -1,5 +1,5 @@
 """
-Promise-to-Pay validation (Phase 6 + Stage: LLM-ASSISTED).
+Deterministic promise-to-pay validation.
 
 The LLM's extracted {promised_amount, promised_date, confidence} is a guess.
 Before anything gets recorded as PromiseToPay, deterministic checks run:

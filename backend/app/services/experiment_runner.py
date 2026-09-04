@@ -1,13 +1,11 @@
 """
-Experiment runner (Phase 7).
+Persisted synthetic policy experiment runner.
 
 Same matched-scenario, common-random-numbers design as
 scripts/evaluate_policies.py (see that file for the methodology writeup),
 but persisted: every case in every run gets an ExperimentCase row grouped
-by run_id, so the dashboard can show "the last run" and a case-level CSV
-can be downloaded for the audit trail. This is what
-"one-click 500+ case experiment with reproducible metrics and downloadable
-audit" (Phase 7's exit criteria) actually runs.
+by run_id, so the dashboard can show recent runs and provide a case-level CSV
+for the audit trail.
 
 Deliberately reuses policy_engine.decide / ml_policy.decide_ml exactly as
 they are — this module doesn't reimplement the recovery logic, only adds
@@ -66,13 +64,10 @@ def run_experiment(db: Session, count: int = 500, seed: int | None = None) -> st
     so a huge run can be persisted without holding aggregates in memory
     beyond what SQL aggregation needs.
 
-    Note: if seed is None, a random seed is chosen and NOT persisted —
-    such runs are not reproducible via run_id alone. Callers should pass
-    an explicit seed for reproducibility (see docs/ML_AND_EVALUATION.md).
+    If seed is None, a random seed is generated and persisted as
+    ExperimentRun.resolved_seed so the scenario set can be reproduced.
     """
-    # Use explicit seed for reproducibility; if None, generate one but warn
-    # that historical runs without an explicit seed cannot be reproduced
-    # from run_id alone (see docs).
+    # Persist an automatically generated seed so every run is reproducible.
     seed = seed if seed is not None else random.randrange(2**31)
     # Capture provenance at run time — historical runs must be immutable
     model_info = scorer.get_model_info()

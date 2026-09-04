@@ -28,14 +28,13 @@ class Settings(BaseSettings):
     ACTION_JOB_TIMEOUT_SECONDS: int = 30
     MERCHANT_TIMEZONE: str = "Asia/Kolkata"
 
-    # Razorpay (test mode) — filled in during Phase 1
+    # Razorpay Test Mode configuration
     RAZORPAY_KEY_ID: str = ""
     RAZORPAY_KEY_SECRET: str = ""
     RAZORPAY_WEBHOOK_SECRET: str = ""
     RAZORPAY_API_ENABLED: bool = False
 
-    # LLM provider — filled in during Phase 6 (Promise-to-Pay)
-    # Optional second provider: opencode_zen (Muse Spark, free tier)
+    # Optional LLM provider for drafting and promise-to-pay extraction
     LLM_PROVIDER: str = "anthropic"
     LLM_API_KEY: str = ""
     LLM_API_ENABLED: bool = False

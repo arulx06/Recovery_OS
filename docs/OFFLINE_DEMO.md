@@ -1,6 +1,6 @@
-# RecoveryOS — Offline Demo Fallback
+# RecoveryOS - Offline Demo
 
-> If internet disappears during judging, every core story remains provable locally.
+Core workflows can be demonstrated locally without internet access.
 
 ## What still works without internet
 
@@ -24,8 +24,10 @@
 
 ## How to run entirely offline
 
+This procedure assumes dependencies are already installed and the PostgreSQL and Redis container images are available locally.
+
 ```powershell
-Set-Location D:\Razorpay
+# Run from the repository root.
 docker compose up -d            # postgres + redis local
 Set-Location backend
 Copy-Item .env.example .env     # RAZORPAY_API_ENABLED=false, LLM_API_ENABLED=false
@@ -37,23 +39,21 @@ python scripts/seed_demo.py --reset-demo
 Then start the long-running processes in separate PowerShell terminals:
 
 ```powershell
-# Terminal 1, from D:\Razorpay\backend
+# Terminal 1, from backend/
 uvicorn app.main:app --reload --port 8000
 ```
 
 ```powershell
-# Terminal 2, from D:\Razorpay\backend
+# Terminal 2, from backend/
 rq worker --worker-class app.worker.WindowsWorker --with-scheduler --url redis://localhost:6379/0 recoveryos
 ```
 
 ```powershell
-# Terminal 3
-Set-Location D:\Razorpay\frontend
-npm install
+# Terminal 3, from frontend/ (dependencies already installed)
 npm run dev                    # http://localhost:5173
 ```
 
-Then demonstrate via the 4-minute script — all steps work offline using SIMULATED labels.
+Then follow the demo walkthrough. All steps work offline and retain `SIMULATED` labels.
 
 ## How to signal offline vs TEST MODE
 

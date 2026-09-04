@@ -72,9 +72,8 @@ def get_experiment(run_id: str, db: Session = Depends(get_db), _auth: bool = Dep
 @router.get("/{run_id}/export.csv")
 def export_experiment_csv(run_id: str, db: Session = Depends(get_db), _auth: bool = Depends(require_demo_admin)):
     """
-    Phase 7 exit criteria: downloadable audit. One row per synthetic case
-    per arm — exactly what a judge (or a skeptical teammate) would want to
-    inspect to check the aggregate numbers aren't being fudged.
+    Export one row per synthetic case and policy arm so aggregate results can
+    be independently inspected.
     """
     rows = (
         db.query(ExperimentCase)

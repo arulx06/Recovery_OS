@@ -1,16 +1,16 @@
 """
-Failure Intelligence Engine (Phase 2).
+Deterministic failure intelligence engine.
 
 Deterministic on purpose — per ARCHITECTURE.md, don't spend an LLM call on
 structured fields. Razorpay already gives us `error_source`, `error_step`,
 and `error_reason` on every failed payment; this module's only job is to
 turn that triple (plus a little context) into one of a small, fixed set of
-categories that the guardrail/policy engine (Phase 3) can act on.
+categories that the guardrail and policy engines can act on.
 
 Rules are evaluated in order — first match wins — because some fields are
 more diagnostic than others (a specific error_reason beats a generic
 error_source). Anything that matches nothing falls through to UNKNOWN,
-which Phase 3's policy engine will treat conservatively (human review)
+which the policy engine treats conservatively (human review)
 rather than guessing.
 """
 import re

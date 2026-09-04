@@ -102,7 +102,7 @@ def test_execute_is_noop_for_already_executed_action(db_session):
     assert action.result is None  # untouched — execute() didn't run again
 
 
-# ---- Phase 6: CONTACT_CUSTOMER / COLLECT_PROMISE_TO_PAY execution ----
+# CONTACT_CUSTOMER / COLLECT_PROMISE_TO_PAY execution
 
 @pytest.mark.parametrize("action_type", ["CONTACT_CUSTOMER", "COLLECT_PROMISE_TO_PAY"])
 def test_execute_contact_actions_draft_and_store_a_message(db_session, action_type):

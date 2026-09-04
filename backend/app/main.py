@@ -17,8 +17,8 @@ if settings.ENV != "test":
         raise RuntimeError("Startup validation failed: " + "; ".join(fatal))
 
 # Schema is now owned by Alembic (backend/alembic/versions/). Run
-# `alembic upgrade head` before starting the app — see README.md
-# "Running it locally". Tests use a separate sqlite create_all path
+# `alembic upgrade head` before starting the app - see README.md
+# "Quick Start". Tests use a separate SQLite create_all path
 # (tests/conftest.py) so they don't require a migration run.
 
 app = FastAPI(
@@ -65,4 +65,4 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.get("/")
 def root():
-    return {"service": settings.APP_NAME, "phase": "8 - release hardening", "version": "0.1.0"}
+    return {"service": settings.APP_NAME, "version": "0.1.0"}

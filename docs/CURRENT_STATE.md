@@ -1,37 +1,21 @@
 # RecoveryOS — Current State
 
-**Canonical living document for "what exists RIGHT NOW." Future implementation phases must update this file before any other documentation.**
+This document summarizes implemented behavior, operational boundaries, and known limitations. Update it whenever runtime behavior changes.
 
 > Status legend — see [Documentation Status Language](#documentation-status-language).
 
 ---
 
-## Repository baseline
+## Verification Summary
 
-| Property | Value |
-|----------|-------|
-| Branch | `feat/release-hardening-e2e` |
-| Baseline ancestry | Verified baseline `3debc27` + reconciliation `1a980d6` + adaptive `a624341` + LLM intelligence `4e64c1c` + observability `d5474c5` |
-| Backend tests | 471 passed (hermetic, `sqlite://` temp DB, external network and Redis denied) — includes 37 release-hardening tests |
-| Frontend `npm run build` | PASS (24 modules, 268kB) |
-| Frontend `npm run lint` (`oxlint`) | PASS (warnings only) |
-| Database | PostgreSQL (required); SQLite for tests/CI — head `c9d0e1f2a3b4` (LLM provenance) — hardening adds no migration (middleware, auth, logging, readiness are code-only) |
-| Redis/RQ | Implemented as reconstructable action transport; PostgreSQL remains authoritative — hardening adds failure-injection guard + stale EXECUTING reconciliation already verified |
-| Model artifact | `backend/app/ml/artifacts/model.joblib` + `manifest.json` — gitignored for source runs; `backend/.dockerignore` also excludes host artifacts, then `backend/Dockerfile` trains and validates a fresh artifact during image build |
-
-> Do not hardcode a commit hash here. The branch name is the stable reference. If a specific hash must be cited for a report, add it locally and do not commit it.
-
-### How this branch was verified
-
-- `python -m pytest -q` -> 471 passed (hermetic, `sqlite://` temp DB, external network and Redis denied, 37 release-hardening tests); hardening includes sensitive read auth, public health/webhook exemptions, CORS wildcard validation, demo safety, resilience, and sanitization.
-- `npm run build` and `npm run lint` pass on Node 22 / Vite 8 (console build: 24 modules, ~268kB, with polling and sessionStorage operator token).
-- `alembic upgrade head` clean at `c9d0e1f2a3b4` — hardening adds **no migration** (middleware, auth, logging, readiness are code-only; `validate_startup_config` is stateless).
-- A real Redis/RQ smoke test verified an ID-only `WAIT` job through `app.worker.WindowsWorker`; the default RQ worker is not Windows-compatible.
-- Razorpay TEST MODE path is implemented and hermetically tested (`payment.failed` → `CREATE_PAYMENT_LINK`, request shape, `reference_id=Action.id`, and reconciliation lookup). A real provider smoke was **NOT PERFORMED** during the current corrective pass; use `docs/PUBLIC_WEBHOOK.md` only with `rzp_test_*` credentials.
-- Adaptive policy verified: `RECOVERY_POLICY=baseline` (default), `shadow` (baseline executes + `shadow_adaptive_recommendation` audit, no second Action), `adaptive` (friction-aware `P*amount - cost - weight*friction`, provenance, fallback to baseline on model failure). The `recovery-v1` manifest records Brier 0.1597 and the SHA-256 of the generated artifact; the fingerprint is build-specific rather than a hard-coded release identifier.
-- LLM-assisted intelligence verified: `LLM_API_ENABLED=false` (default) → deterministic templates + regex extraction; `LLM_API_ENABLED=true` with mocked Anthropic → structured PTP extraction `{intent, promised_amount, promised_date, confidence, reasoning_code}` + draft with `[[PAYMENT_LINK]]` placeholder substituted deterministically with authoritative `short_url`; prompt versions `ptp-v1`/`message-v1` and provenance stored; provider failure or malformed response → deterministic fallback; injection downgraded; `/health` and `/ready` sanitized (no secrets).
-- Observability verified: `GET /dashboard/summary` computes revenue at risk/recovered, state/case counts, PTP, policy/model, queue, Razorpay, LLM without inventing values; `GET /cases` supports state/category/latest-action/latest-policy/search + pagination; `GET /cases/{id}` enriches with failure explanation, persisted decision-time inspectors, explicitly current guardrail/friction surfaces, chronological timeline, and exact-Action provider reconciliation truth; `scripts/seed_demo.py` always creates five core rows and adds genuine adaptive/shadow D/F rows only when a trained model is available; frontend passes build with Revenue-vs-friction Pareto, polling (10s case detail, 30s dashboard), and operator token (sessionStorage); no secret/CoT exposure.
-- Hardening verified: `/health` liveness vs `/ready` readiness, optional `DEMO_ADMIN_TOKEN_ENABLED` protects sensitive reads and mutations while `/webhooks/razorpay` remains HMAC-only, request correlation, structured logging, startup validation, bounded experiments, unambiguous CORS, failure injection, queue orphan recovery, Docker context secret exclusion, and offline SIMULATED fallback.
+| Area | Current state |
+|------|---------------|
+| Backend tests | Hermetic suite passes with a temporary SQLite database and external network access denied |
+| Frontend | `npm run lint` and `npm run build` complete successfully |
+| Database | PostgreSQL in normal operation; SQLite in tests; Alembic head `c9d0e1f2a3b4` |
+| Redis/RQ | Reconstructable action transport; PostgreSQL remains authoritative |
+| Model artifact | Generated by `python -m app.ml.train` and intentionally excluded from Git |
+| External integrations | Razorpay restricted to Test Mode; LLM integration optional; simulations are the defaults |
 
 ---
 
@@ -46,15 +30,15 @@
 | Baseline guardrail + policy engine | **IMPLEMENTED / VERIFIED** | `app/services/policy_engine.py:176`, `tests/test_policy_engine.py` | `max_contacts_per_case=3`, `max_contacts_per_7_days=2`, `min_contact_interval_hours=12`, `max_automated_amount=₹25,000`, `max_total_attempts=5`; contact limits use `Action` history |
 | Deterministic guardrails around adaptive policy | **IMPLEMENTED** | `app/services/ml_policy.py:71` reuses `policy_engine.check_action_allowed` + `record_decision` | Adaptive scorer never bypasses guardrails |
 | Payment Link creation — simulated | **IMPLEMENTED / VERIFIED** | `app/services/razorpay_client.py:65`, `tests/test_razorpay_client.py:35`, `tests/test_webhooks.py:176` | Default; `id=plink_sim_*`, `short_url=https://rzp.io/simulated/*`, `simulated=true` |
-| Payment Link creation — Razorpay Test Mode live call | **TEST_MODE_ONLY / MANUAL SMOKE PENDING** | `app/services/razorpay_client.py` and hermetic `tests/test_razorpay_client.py` | Gated by `RAZORPAY_API_ENABLED=true` and `rzp_test_*`; live keys rejected; request/response/reconciliation behavior tested without network; no current-pass provider call |
+| Payment Link creation — Razorpay Test Mode live call | **TEST_MODE_ONLY / MANUAL SMOKE PENDING** | `app/services/razorpay_client.py` and hermetic `tests/test_razorpay_client.py` | Gated by `RAZORPAY_API_ENABLED=true` and `rzp_test_*`; live keys rejected; request, response, and reconciliation behavior tested without network; current version not manually exercised against the provider |
 | Payment Link provider reconciliation | **IMPLEMENTED / VERIFIED** | `app/services/razorpay_client.py:184` (`list_payment_links_by_reference`), `app/services/temporal_runtime.py:234` (`_handle_ambiguous_*`, `_reconcile_stale_*`), `tests/test_payment_link_reconciliation.py:100`, `scripts/reconcile_payment_links.py` | Finds existing provider link by `reference_id=Action.id`; validates `amount`/`currency`/`notes`/`status` before adoption; `expired`/`cancelled` → `HUMAN_REVIEW`; lookup itself is `RazorpayAmbiguousError`-aware; bounded by `max_attempts` |
 | Ambiguous provider outcome handling | **IMPLEMENTED / VERIFIED** | `app/services/razorpay_client.py:27` (`RazorpayAmbiguousError`), `app/services/temporal_runtime.py:235`, `tests/test_payment_link_reconciliation.py:136` | `Timeout`/`NetworkError`/`5xx`/`429`/`duplicate reference_id` → `RazorpayAmbiguousError` → reconcile before retry; definite `400` validation → `RazorpayAPIError` → bounded retry then `HUMAN_REVIEW`; never blindly creates another link |
 | Action executor (`CREATE_PAYMENT_LINK`, `CONTACT_CUSTOMER`, `COLLECT_PROMISE_TO_PAY`) | **IMPLEMENTED / VERIFIED** | `app/services/action_executor.py`, `app/services/temporal_runtime.py`, `tests/test_temporal_runtime.py` | Worker commits its claim before provider calls; provider HTTP is outside any DB transaction; contact actions store but do not deliver messages; payment-link success/failure is sanitized (`_sanitize_link`) and audited as `action_executed` vs `action_reconciled` |
 | Payment recovery (`payment.captured` / `subscription.charged` -> `RECOVERED`) | **IMPLEMENTED / VERIFIED** | `app/services/orchestrator.py`, `tests/test_temporal_runtime.py` | Correlates payment or subscription IDs; also recovers `STOPPED`; cancels scheduled actions and marks pending promises `KEPT` |
 | Payment Link paid (`payment_link.paid` → `RECOVERED`) | **IMPLEMENTED / VERIFIED** | `app/services/orchestrator.py:215`, `tests/test_webhooks.py:219` | Matches on `RevenueCase.razorpay_payment_link_id` (different payment than original failure); `payment_link.paid` with unknown `link_id` is a noop |
 | Dispute handling (`payment.dispute.created` + customer reply `dispute`) | **IMPLEMENTED / VERIFIED** | `app/services/orchestrator.py:248`, `tests/test_customer_reply.py:68`, `tests/test_webhooks.py:250` | Dispute **overrides** terminal states (including `RECOVERED`); cancels all `SCHEDULED` actions |
-| LLM PTP extraction (structured + deterministic validation) | **IMPLEMENTED / OPTIONAL** ( `LLM_API_ENABLED=false` deterministic, `LLM_API_ENABLED=true` + `LLM_PTP_EXTRACTION_ENABLED` → Anthropic structured) | `app/services/llm_client.py:470` (`PTPExtraction` `{intent, promised_amount, promised_date, confidence, reasoning_code}` `ptp-v1`/`ptp-schema-v1`), `app/services/ptp_extractor.py:38`, `tests/test_llm_stage.py`, `tests/test_customer_reply.py` | Deterministic fallback always available; structured output validated (enum, amount >0, date YYYY-MM-DD, confidence 0..1); direct malformed output raises `LLMInvalidResponseError`, while the wrapper records deterministic fallback provenance; ambiguous or injection-marked text → `uncertain`/`HUMAN_REVIEW`; LLM never invents amount — omitted stays `HUMAN_REVIEW` with `amount_method=customer_explicit` provenance |
-| LLM message drafting (safe, DRAFT only) | **IMPLEMENTED / OPTIONAL** ( `LLM_API_ENABLED=false` templated, `LLM_API_ENABLED=true` + `LLM_MESSAGE_DRAFT_ENABLED` → Anthropic with `[[PAYMENT_LINK]]` placeholder) | `app/services/llm_client.py:88` (`MESSAGE_DRAFT_PROMPT_VERSION=message-v1`, `draft_with_fallback`), `app/services/action_executor.py:43`, `tests/test_llm_stage.py` | Stores `CustomerMessage(status=DRAFT, generation_method, provider, model, prompt_version)` — never `SENT/DELIVERED`; authoritative `short_url` substituted deterministically; no invented amount/discount/fee; no internal IDs in prompt |
+| LLM PTP extraction (structured + deterministic validation) | **IMPLEMENTED / OPTIONAL** (`LLM_API_ENABLED=false` deterministic; enabling `LLM_PTP_EXTRACTION_ENABLED` uses the configured Anthropic or OpenCode Zen provider) | `app/services/llm_client.py`, `app/services/ptp_extractor.py`, `tests/test_llm_stage.py`, `tests/test_customer_reply.py` | Deterministic fallback always available; structured output validated (enum, amount >0, date YYYY-MM-DD, confidence 0..1); malformed output raises `LLMInvalidResponseError` at the provider boundary, while the wrapper records deterministic fallback provenance; ambiguous or injection-marked text → `uncertain`/`HUMAN_REVIEW`; omitted amount stays `HUMAN_REVIEW` |
+| LLM message drafting (safe, DRAFT only) | **IMPLEMENTED / OPTIONAL** ( `LLM_API_ENABLED=false` templated, `LLM_API_ENABLED=true` + `LLM_MESSAGE_DRAFT_ENABLED` enables provider drafting with a `[[PAYMENT_LINK]]` placeholder) | `app/services/llm_client.py`, `app/services/action_executor.py`, `tests/test_llm_stage.py` | Stores `CustomerMessage(status=DRAFT, generation_method, provider, model, prompt_version)` — never `SENT/DELIVERED`; authoritative `short_url` substituted deterministically; no invented amount/discount/fee; no internal IDs in prompt |
 | Deterministic fallback | **IMPLEMENTED / VERIFIED** | `app/services/llm_client.py:658` (`draft_with_fallback`/`extract_with_fallback`, `LLMUnavailableError`/`LLMInvalidResponseError` → template/uncertain) + `app/routers/cases.py:190` (extraction outside DB tx) | LLM disabled/unavailable/timeout/malformed → deterministic template or `uncertain`/`HUMAN_REVIEW`; no HTTP 500 caused solely by LLM; recovery workflow continues |
 | Promise-to-Pay validation | **IMPLEMENTED / VERIFIED** | `app/services/ptp_extractor.py:38` (`DEFAULT_HORIZON_DAYS=14`, `MAX_HORIZON=90`), `tests/test_ptp_extractor.py`, `tests/test_llm_stage.py` | Checks intent=`promise_to_pay`, confidence ≥0.6, amount positive ≤ outstanding (`customer_explicit`), date parseable, not past, ≤ horizon, not absurdly far, case eligible (not RECOVERED/DISPUTED/STOPPED); invalid → `HUMAN_REVIEW` with `ptp_validation_failed` audit |
 | Promise-to-Pay provenance | **IMPLEMENTED / VERIFIED** | `app/models.py:PromiseToPay` (`extraction_method, llm_provider, llm_model, prompt_version, schema_version, amount_method, reasoning_code, source_message_id`), `a1b2c3d4e5f6`→`c9d0e1f2a3b4`, `tests/test_llm_stage.py:560` | Full provenance: `deterministic` vs `llm`/`llm_fallback_template`, provider/model/prompt/schema, confidence, amount_method, source message linkage; `HUMAN_REVIEW` fallback clearly not `llm` |
@@ -67,7 +51,7 @@
 | Customer delivery | **NOT IMPLEMENTED / MANUAL_ONLY** | — | `CustomerMessage` is `DRAFT` / stored only; no Twilio/SendGrid/WhatsApp; dashboard shows `DRAFT / NOT SENT` |
 | LLM action selection | **NOT ALLOWED** | `app/services/llm_client.py` + `app/services/policy_dispatcher.py` | LLM never chooses financial/recovery actions; deterministic/guardrails + guarded adaptive remain sole controllers; tests prove isolation |
 | LLM payment-state change | **NOT ALLOWED** | `app/services/orchestrator.py` | LLM cannot set `RECOVERED`/`DISPUTED` directly beyond conservative `DISPUTED` classification; `STOP`/`RECOVERED` only via orchestrator/webhook truth |
-| Live adaptive policy (HistGradientBoostingClassifier, friction-aware utility) | **IMPLEMENTED / VERIFIED** | `app/ml/train.py` + `manifest.json`, `app/ml/scorer.py` (manifest + fingerprint), `app/ml/features.py` (canonical), `app/ml/friction.py`, `app/services/ml_policy.py`, `app/services/policy_dispatcher.py`, `tests/test_adaptive_policy.py` | `RECOVERY_POLICY=baseline` (default), `shadow` (baseline+audited recommendation), `adaptive` (balanced profile `weight 18`); model `recovery-v1`, build-specific SHA-256, Brier 0.1597; synthetic-only training/evaluation retained |
+| Live adaptive policy (HistGradientBoostingClassifier, friction-aware utility) | **IMPLEMENTED / VERIFIED** | `app/ml/train.py` + `manifest.json`, `app/ml/scorer.py` (manifest + fingerprint), `app/ml/features.py` (canonical), `app/ml/friction.py`, `app/services/ml_policy.py`, `app/services/policy_dispatcher.py`, `tests/test_adaptive_policy.py` | `RECOVERY_POLICY=baseline` (default), `shadow` (baseline+audited recommendation), `adaptive` (balanced profile `weight 18`); model `recovery-v1`, build-specific SHA-256; synthetic-only training/evaluation retained |
 | Policy dispatcher + safe fallback | **IMPLEMENTED / VERIFIED** | `app/services/policy_dispatcher.py`, `app/services/ml_policy.py:184`, `tests/test_adaptive_policy.py` | Stopping rule + guardrails remain authoritative; adaptive failure → `adaptive_fallback` audit + baseline `Decision` (never stranded `DIAGNOSED`); incompatible manifest → fallback |
 | Model provenance & fingerprint | **IMPLEMENTED / VERIFIED** | `app/ml/manifest.py`, `app/ml/train.py`, `app/ml/scorer.py:get_model_info`, `app/models.py:Decision` provenance columns, `a1b2c3d4e5f6` | `manifest.json` (`model_version recovery-v1`, `feature_schema v1`, `fingerprint` sha256, `metrics` incl. Brier, `synthetic_data_notice`); `Decision.policy_mode/model_version/fingerprint/friction_*` + `alternatives[_provenance]` + `AuditEvent(adaptive_decision)` + `/health` + `/cases/{id}` |
 | One canonical feature pipeline | **IMPLEMENTED / VERIFIED** | `app/ml/features.py`, `app/ml/scorer.py`, `app/ml/train.py`, `tests/test_adaptive_policy.py::test_train_serve_parity` | Same `FEATURE_COLUMNS` + `validate_feature_row` for train, offline eval, live scoring; hour/day_of_week from decision clock; `LIVE_AVAILABLE` only, no leakage |
@@ -117,28 +101,14 @@ The request transaction commits `PaymentEvent`, case, decision, and action befor
 ## Known technical debt
 
 1. **Worker/reconciliation processes are operational dependencies** - committed actions remain safe if they stop, but execution is delayed until a worker and periodic reconciliation resume (reconcile via `python scripts/reconcile_actions.py` or prod compose healthcheck).
-2. **Provider exactly-once remains bounded by provider primitive** - Razorpay enforces uniqueness on `reference_id` (400 on duplicate) and supports `list?reference_id=` filtering, which this stage uses for reconciliation. A provider crash between `POST /payment_links` commit on Razorpay's side and response transmission still requires one extra `GET /payment_links?reference_id=` to discover the already-created link. DB claim + `reference_id` + reconciliation reduce ambiguity to a single validated lookup, but true exactly-once still depends on Razorpay's documented uniqueness guarantee, not on DB idempotency alone.
+2. **Provider exactly-once remains bounded by provider primitive** - Razorpay enforces uniqueness on `reference_id` (400 on duplicate) and supports `list?reference_id=` filtering for reconciliation. A provider crash between `POST /payment_links` commit on Razorpay's side and response transmission still requires one extra `GET /payment_links?reference_id=` to discover the already-created link. DB claim + `reference_id` + reconciliation reduce ambiguity to a single validated lookup, but true exactly-once still depends on Razorpay's documented uniqueness guarantee, not on DB idempotency alone.
 3. **`DECISION_READY` is vestigial in reply handling** - it is an ephemeral policy state.
 4. **Customer identity is synthetic** - `Customer` rows are not enriched from Razorpay customer/subscription entities.
 5. **Contact fatigue is per-case only** - limits are not aggregated per customer or merchant.
 6. **Database timestamps remain naive UTC** - merchant-local conversion is explicit only for PTP business dates.
 7. **Model artifact is derived** - source runs must run `python -m app.ml.train`; container builds always train and validate their own artifact after excluding any host artifact from the build context.
 8. **Demo-grade auth only** - webhook authenticity relies on signature and event ID; sensitive operator reads and mutations use optional `DEMO_ADMIN_TOKEN` (not production IAM). See `docs/PUBLIC_WEBHOOK.md`.
-9. **Case-detail renderer was built in prior stage** — `frontend/src/components/CaseDetail.tsx` renders `action_reconciled` / `payment_link_reconciliation_*`, shadow, fallback, and provider truth distinctly; remaining debt is pre-existing (see below).
-
----
-
-## Next planned subsystem
-
-**SUBMISSION FINALIZATION** — the next and final stage after this release-hardening stage.
-
-Release hardening is now **IMPLEMENTED**: liveness/readiness, demo safety (optional token, webhook exempt), startup validation, CORS, structured logging + correlation, bounded experiments, failure injection (dev-only), queue/worker orphan recovery, deployment artifacts (Dockerfiles + `docker-compose.prod.yml`), and reproducible judge demo (`docs/DEMO_SCRIPT.md`, `docs/OFFLINE_DEMO.md`, `docs/PUBLIC_WEBHOOK.md`) are live and verified. The system now shows:
-
-    Razorpay failure → diagnosis → guardrails → baseline/adaptive decision → friction-adjusted candidate comparison → durable Action → temporal execution → Razorpay reconciliation → customer draft / PTP → provider-authoritative recovery → dashboard explains everything
-
-with guardrails, shadow/fallback, provider truth, and synthetic `SYNTHETIC SIMULATION` labeling visible. See `docs/DECISIONS.md` and `docs/ML_AND_EVALUATION.md` for remaining synthetic-evaluation and real-outcome learning gaps.
-
-Remaining gaps for submission stage: final README polish, architecture graphic, screenshots, demo video script, hackathon submission text, pitch, judging Q&A.
+9. **Case-detail timelines are derived at read time** - this avoids a second source of truth but may require pagination or caching at larger scale.
 
 ---
 
@@ -158,12 +128,6 @@ Remaining gaps for submission stage: final README polish, architecture graphic, 
 
 ---
 
-## Anti-drift rule
+## Documentation Maintenance
 
-**Documentation is part of the implementation.** A future subsystem is not considered complete until its canonical documentation still describing the previous behavior has been updated. Every implementation report must list:
-
-- documentation files that **changed**,
-- documentation files **intentionally unchanged**,
-- and the **reason**.
-
-Avoid repeating volatile numbers (test count, metrics) in more than one document — the canonical home for the current verified test count is this file.
+Documentation is part of the implementation. Update the relevant architecture, flow, runbook, integration, and status documents whenever behavior changes. Avoid copying volatile test counts or generated metrics across multiple files.

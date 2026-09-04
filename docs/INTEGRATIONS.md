@@ -19,7 +19,7 @@
   - `payment.dispute.created` → `_handle_dispute` (matched on `RevenueCase.razorpay_payment_id`)
   - Anything else → `return None` (acknowledged but no case change; historically `unknown` payloads may carry odd wrappers; `_entity_from_payload` iterates `payload.payload.values()`).
 
-**Bounded manual Test Mode smoke (not performed in the current corrective pass):**
+**Manual Test Mode smoke test:**
 
 ```
 payment.failed { error_reason: "card_expired" }
@@ -33,7 +33,7 @@ payment_link.paid { payload.payment_link.entity.id == <that plink_*> }
   → state RECOVERED, audit case_recovered_silently
 ```
 
-The flow above is the expected manual verification procedure and is covered by hermetic request-shape/reconciliation tests. It was not sent to Razorpay during the current corrective pass. No production Razorpay API surface is used and no subscriptions/orders mutation exists.
+The flow above is covered by hermetic request-shape and reconciliation tests but has not been manually exercised against Razorpay Test Mode in the current version. No production Razorpay API surface is used, and no subscription or order mutation exists.
 
 ### Payment Links — gates, identity, and verified provider semantics
 
@@ -103,7 +103,7 @@ Do not include actual values in documentation.
 ### Provider claim
 
 - **Two providers supported:** `anthropic` (default) and `opencode_zen` (free-tier `muse-spark-1.2-contributor-free`). `llm_client.py` defines `ANTHROPIC_MODEL=claude-3-5-haiku-latest` and `OPENCODE_ZEN_MODEL=muse-spark-1.2-contributor-free` with defaults `OPENCODE_ZEN_API_URL=https://opencode.ai/zen/v1/responses` and `ANTHROPIC_API_URL=https://api.anthropic.com/v1/messages`; `LLM_BASE_URL` optionally overrides. `_require_live_config` raises `LLMAPIError` for any other `LLM_PROVIDER`. See `ARCHITECTURE.md` LLM boundary.
-- OpenCode Zen is **optional and free**; its availability may be temporary. Runtime API access (`https://opencode.ai/zen/v1/responses` with `Authorization: Bearer <key>`) is separate from an OpenCode coding-agent session. Do not use `opencode/<model-id>` in the API request — use `muse-spark-1.2-contributor-free` exactly. Real customer/financial data should not be used with the experimental free model; use synthetic data only.
+- OpenCode Zen is **optional** and its free-model availability may change. Use `https://opencode.ai/zen/v1/responses` with `Authorization: Bearer <key>` and the model ID `muse-spark-1.2-contributor-free`. Do not use real customer or financial data with the experimental free model; use synthetic data only.
 
 ### Gates and fallbacks
 
@@ -112,7 +112,7 @@ Identical philosophy to Razorpay: explicit gate, never implicit. LLM is downstre
 ```python
 if not settings.LLM_API_ENABLED or not LLM_MESSAGE_DRAFT_ENABLED:  # backend/.env.example:22
     return _simulated_draft  # deterministic, generation_method=deterministic
-_require_live_config()         # provider == anthropic, key non-empty
+_require_live_config()         # supported provider and non-empty key
 # then httpx.post with bounded timeout + retries outside DB transaction
 ```
 

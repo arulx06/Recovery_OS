@@ -14,7 +14,7 @@
 | **Steps** | `handle_event` extracts an event-specific entity (`payment`, `subscription`, or `dispute`). Payment failures correlate by unique payment ID; subscription-only events use the latest open subscription case, so a recovered billing cycle is not reused for a new payment. New failures create and diagnose a case. Repeated active failures cancel stale scheduled work, reclassify, and create a fresh decision, except while a valid PTP is pending: diagnosis metadata is refreshed but the promise and deadline remain authoritative. `HUMAN_REVIEW` does not resume automation. The webhook commits first, then publishes ID-only jobs. |
 | **State transition** | `∅ -> DETECTED -> DIAGNOSED -> DECISION_READY ->` one of `WAITING | ACTION_SCHEDULED | HUMAN_REVIEW | STOPPED`; a worker later moves executable actions to `AWAITING_OUTCOME` or retries/fails them. |
 | **Side effects** | None occur inside the webhook transaction. Provider calls happen in workers after an atomic claim commit. |
-| **External services** | Redis is contacted only after PostgreSQL commit. Razorpay/Anthropic are contacted only by claimed worker actions. |
+| **External services** | Redis is contacted only after PostgreSQL commit. Razorpay and configured LLM providers are contacted only by claimed worker actions. |
 | **Failure behavior** | Invalid input -> `400`; duplicate event ID -> `200 ignored`. Redis publish failure leaves the committed action `SCHEDULED`, records a sanitized enqueue failure, and is repaired by reconciliation. |
 | **Current limitation** | Correlation uses exact provider IDs; malformed/nonstandard provider identifiers can still open separate cases. |
 
@@ -84,7 +84,7 @@ Payment Link creation **does not deliver** the link to the customer — no SMS/e
 | **Trigger** | `payment.failed` where `error_reason ∈ {otp, authentication, 3ds, incorrect_pin, …}` or `error_step == payment_authentication` → `CUSTOMER_AUTHENTICATION` (`failure_diagnosis.py:52`) |
 | **Baseline choice** | `CUSTOMER_AUTHENTICATION → [CONTACT_CUSTOMER, ESCALATE]` — `CONTACT_CUSTOMER` wins if guardrails allow |
 | **Persisted** | `Decision(chosen_action=CONTACT_CUSTOMER)` + `Action(SCHEDULED)`. The worker later creates `CustomerMessage(direction=outbound, channel=simulated|llm, body=...)` and `AuditEvent(action_executed)`. |
-| **Execution** | Same claim/commit/perform/finalize path as Payment Links. LLM drafting occurs with no open DB transaction. Simulated default returns templated text; live Anthropic returns message content. |
+| **Execution** | Same claim/commit/perform/finalize path as Payment Links. LLM drafting occurs with no open DB transaction. The simulated default returns templated text; a configured provider returns generated content. |
 | **State** | `ACTION_SCHEDULED → AWAITING_OUTCOME` on success, `→ HUMAN_REVIEW` on `LLMAPIError`. |
 | **Current limitation** | Draft is **stored, not delivered** — no messaging transport exists. The message is visible at `GET /cases/{id}.messages`. The PTP collection path (`COLLECT_PROMISE_TO_PAY`) uses a distinct second template. |
 
@@ -126,7 +126,7 @@ Verification: `tests/test_webhooks.py:237` unknown `link_id` is a noop.
 | **Persisted (always)** | `CustomerMessage(direction=inbound, channel=simulated|llm, body, extracted={intent, amount, date, confidence})` — even when the case is terminal or extraction fails (audit completeness). |
 | **Steps** | The router first confirms the case exists and closes that read transaction. PTP extraction then runs outside a DB transaction using merchant-local time. The case is re-read with a row lock. Valid promises supersede previous pending promises and cancel their linked follow-ups. A new `FOLLOW_UP_PTP` links by `promise_to_pay_id` and is scheduled at the exclusive end of the promise date in `MERCHANT_TIMEZONE`; commit precedes enqueue. |
 | **State transitions** | `WAITING | AWAITING_OUTCOME | HUMAN_REVIEW → AWAITING_OUTCOME` (promise) or `→ DISPUTED` or `→ HUMAN_REVIEW`. Terminal `RECOVERED/STOPPED/DISPUTED` stay put but inbound message + ignored-state audit are still stored. |
-| **Failure behavior** | Malformed Anthropic JSON raises `LLMInvalidResponseError` from the direct provider boundary. The router calls `extract_with_fallback`, which catches typed LLM errors and produces a deterministic extraction (`provider=null`, `fallback_from_llm=true`) before persistence; ambiguous fallback becomes `HUMAN_REVIEW` without an LLM-caused HTTP 500. Unexpected application or DB errors still propagate. |
+| **Failure behavior** | Malformed provider JSON raises `LLMInvalidResponseError` at the provider boundary. The router calls `extract_with_fallback`, which catches typed LLM errors and produces a deterministic extraction (`provider=null`, `fallback_from_llm=true`) before persistence; ambiguous fallback becomes `HUMAN_REVIEW` without an LLM-caused HTTP 500. Unexpected application or DB errors still propagate. |
 | **Current limitations** | Message delivery does not exist. Bare weekdays resolve to the next occurrence; amount parsing does not support spelled-out amounts. Historical unlinked follow-ups are repaired only when exactly one pending promise makes linkage unambiguous. |
 
 Verification: `tests/test_customer_reply.py:46` (clear promise → pending + scheduled follow-up), `...:68` (dispute immediate), `...:85` (dispute overrides pending promise), `...:98` (over-amount → `HUMAN_REVIEW`), `...:116` (reply on `RECOVERED` is recorded but ignored).
@@ -138,7 +138,7 @@ Verification: `tests/test_customer_reply.py:46` (clear promise → pending + sch
 Same mechanism as flow 6 step 4, exposed separately because it is a terminal transition worth calling out:
 
 - Regex/keyword list `DISPUTE_PHRASES` (`llm_client.py:35`: `already paid`, `double charge`, `fraud`, …) → `PTPExtraction(intent=dispute)`.
-- Anthropic path: system prompt frames `dispute` as "charge is wrong / already paid / unauthorized" (`llm_client.py:216`).
+- Provider-backed path: the system prompt frames `dispute` as "charge is wrong / already paid / unauthorized".
 - Effect: identical to `payment.dispute.created` (`orchestrator._handle_dispute` → `_dispute_case`), including cancellation of any `SCHEDULED FOLLOW_UP_PTP`. Dispute always wins, even over `RECOVERED`.
 
 Verification: `tests/test_customer_reply.py:68`, `tests/test_webhooks.py:250`.
@@ -149,9 +149,9 @@ Verification: `tests/test_customer_reply.py:68`, `tests/test_webhooks.py:250`.
 
 | Aspect | Detail |
 |--------|--------|
-| **Trigger** | `POST /experiments {count: 1…5000, seed?: int}` (`routers/experiments.py:22`) or `scripts/evaluate_policies.py --count N --seed S`. Requires a trained `model.joblib`. |
+| **Trigger** | `POST /experiments {count: 1…1000, seed?: int}` (`routers/experiments.py`) or `scripts/evaluate_policies.py --count N --seed S`. The API maximum is configurable through `EXPERIMENT_MAX_COUNT` and defaults to 1000. Requires a trained `model.joblib`. |
 | **Persisted** | `ExperimentCase × (count×2)` rows: one per scenario per arm (`baseline` / `adaptive`), grouped by `run_id=uuid4()`, keyed with `failure_category`, `chosen_action`, `amount_at_risk`, `amount_recovered`, `contacts_made`, `recovered` (`services/experiment_runner.py:95`). Each scenario also creates two transient `RevenueCase` rows (`source=experiment`, `state=DIAGNOSED`) that are immediately decided and never surfaced. |
-| **Method** | For each scenario: pick a weighted `failure_category` + `amount` (`SCENARIO_PROFILES`, `AMOUNTS` — same mix as `evaluate_policies.py`); run `policy_engine.decide` and `ml_policy.decide_ml` on **identical** cloned cases at a fixed `evaluation_time=2026-01-07 12:00`; sample one outcome per distinct `chosen_action` from `ground_truth.sample_outcome` using a shared `random.Random(seed)` and an **outcome cache keyed by action** — so when both arms choose the same action they get the identical Bernoulli draw (common random numbers). Contacts counted as `1 if action ∈ CONTACT_ACTIONS else 0` (`CONTACT_ACTIONS={CONTACT_CUSTOMER, CREATE_PAYMENT_LINK, COLLECT_PROMISE_TO_PAY}`). |
+| **Method** | For each scenario: pick a weighted `failure_category` and `amount` from a seeded scenario RNG; run `policy_engine.decide` and `ml_policy.decide_ml` on identical cloned cases at a fixed evaluation time; compute `true_probability` and compare it with a SHA-256-derived uniform value keyed by seed, scenario, and action. Both arms therefore receive the same outcome when they choose the same action, independent of policy-path RNG consumption. Contacts count as `1` when the action is in `CONTACT_ACTIONS`. |
 | **Returned** | `summarize_run` aggregates per-arm: `amount_at_risk`, `amount_recovered`, `recovery_rate`, `contacts`, `escalations`, `action_cost_proxy` (sum of `ACTION_COST`), `realized_net_value = recovered - action_cost_proxy`, `action_distribution`; plus `incremental_recovered = adaptive.recovered - baseline.recovered` (`experiment_runner.py:114`). |
 | **API surface** | `POST /experiments` (run), `GET /experiments` (recent `run_id` list), `GET /experiments/{run_id}` (summary), `GET /experiments/{run_id}/export.csv` (`arm, failure_category, chosen_action, amount_at_risk, amount_recovered, recovered, contacts_made`). See `routers/experiments.py`. |
 | **Failure behavior** | No model → `503 ModelNotTrainedError` — nothing persisted. `count` out of range → `400`. |
@@ -211,7 +211,7 @@ Same flow as `2`/`2a`–`2c` — adaptive `CREATE_PAYMENT_LINK` creates a `SCHED
 |--------|--------|
 | **Trigger** | Controller has already chosen `CONTACT_CUSTOMER` / `COLLECT_PROMISE_TO_PAY` / `CREATE_PAYMENT_LINK` → `ACTION_SCHEDULED` → worker claims `EXECUTING` |
 | **Steps** | Snapshot `{amount, currency, failure_category, case_id, has_payment_link, authoritative short_url}` (no IDs, friction, risk scores) → release DB txn → LLM draft with `[[PAYMENT_LINK]]` placeholder (system prompt: concise, neutral, no threats/discounts) → deterministic `[[PAYMENT_LINK]]` → authoritative `short_url` substitution → persist `CustomerMessage(DRAFT, generation_method=llm/deterministic/llm_fallback_template, provider, model, prompt_version)` + audit `llm_message_draft_generated` / `llm_message_draft_fallback` → `AWAITING_OUTCOME` |
-| **External** | Anthropic `POST /v1/messages` only when `LLM_API_ENABLED=true` + `LLM_MESSAGE_DRAFT_ENABLED=true` + key; `timeout=LLM_TIMEOUT_SECONDS(10)`, `max_retries=LLM_MAX_RETRIES(2)` — only transient 429/5xx/timeout retried; no DB lock held |
+| **External** | The configured Anthropic or OpenCode Zen endpoint is called only when `LLM_API_ENABLED=true`, `LLM_MESSAGE_DRAFT_ENABLED=true`, and a key is present. Only transient 429/5xx/timeout failures are retried; no DB lock is held. |
 | **Failure** | `LLMUnavailableError`/`LLMTimeoutError`/`LLMInvalidResponseError` → `draft_with_fallback` returns deterministic template (not `FAILED`); Action still `EXECUTED`; no `SENT` claim; no external delivery |
 | **Safety** | Amount/date/discount/fee never invented — authoritative fields rendered deterministically outside LLM; every model-provided HTTP(S) URL is removed and the authoritative `short_url` is inserted exactly once |
 
@@ -289,7 +289,7 @@ Same as flow 10 — linked `PROMISE_TO_PAY_ID`, `scheduled_for = end_of_local_da
 |--------|--------|
 | **Input** | `"I'll pay 8000 Friday"` with frozen `business_now` (Friday) → explicit `promised_amount=8000`, `promised_date=YYYY-MM-DD` (next Friday) |
 | **Validation** | `8000 >0` and `8000 ≤ outstanding` and `date ≥ today` and `≤ horizon` → `valid` with `amount_method=customer_explicit` |
-| **Persisted** | `PromiseToPay(promised_amount=8000, prominent_date, confidence, extraction_method, provider/model/prompt_version, amount_method=customer_explicit, source_message_id)` + `Action(FOLLOW_UP_PTP)` |
+| **Persisted** | `PromiseToPay(promised_amount=8000, promised_date, confidence, extraction_method, provider/model/prompt_version, amount_method=customer_explicit, source_message_id)` + `Action(FOLLOW_UP_PTP)` |
 
 ---
 
@@ -308,7 +308,7 @@ Same as flow 10 — linked `PROMISE_TO_PAY_ID`, `scheduled_for = end_of_local_da
 
 | Aspect | Detail |
 |--------|--------|
-| **Trigger** | `GET /dashboard/summary` (`app/routers/dashboard.py:17`) — read-only, derived from PostgreSQL; no Redis/Razorpay/Anthropic call |
+| **Trigger** | `GET /dashboard/summary` (`app/routers/dashboard.py`) - read-only, derived from PostgreSQL; no Redis, Razorpay, or LLM provider call |
 | **Persisted** | None — derives from `RevenueCase` (source=razorpay) + `PromiseToPay` + `Decision` provenance + `scorer.get_model_info()` + `health` primitives |
 | **Returned** | `revenue_at_risk` (sum open), `revenue_recovered` (sum RECOVERED), `total/open/recovered/waiting/human_review/stopped/disputed`, `active_ptps`, `by_state`, `by_category`, `policy_mode`, `model {available,version,fingerprint}`, `friction {profile,weight}`, `queue {status,enabled}`, `razorpay {mode_label SIMULATED vs TEST MODE}`, `llm`, `database` |
 | **Current limitation** | Revenue is `SUM(amount)`; no separate recovered-amount ledger — acceptable for demo but not settlement-accurate |
@@ -387,6 +387,6 @@ Verification: `tests/test_observability.py::test_demo_seed_script_idempotent`, `
 
 - **Idempotency:** Webhook event IDs are unique. Action jobs contain only `action_id`; atomic `SCHEDULED -> EXECUTING` updates ensure only one worker claims a generation. Deterministic job IDs use `(action_id, attempt_count)`.
 - **Audit trail:** Every mutation is recorded as an `AuditEvent` (`case_detected`, `case_diagnosed`, `decision_made`, `action_executed`/`action_reconciled`, `adaptive_decision`/`adaptive_fallback`/`shadow_adaptive_recommendation`, `payment_link_reconciliation_*`, `case_recovered_silently`, …). Payloads live in `detail` JSON; `Decision` carries first-class `policy_mode/model_version/fingerprint/friction_*` plus `alternatives[_provenance]` with per-candidate `p_recovery`, `expected_value`, `utility`, `friction_score`.
-- **No external network from tests:** tests force provider and queue gates off, use a temp SQLite DB, point `REDIS_URL` at an inert local port, deny external sockets, and mock `httpx` — 434 tests pass with fake test credentials.
+- **No external network from tests:** tests force provider and queue gates off, use a temporary SQLite database, point `REDIS_URL` at an inert local port, deny external sockets, and mock `httpx` with fake test credentials.
 - **Failure isolation:** expected provider failures retry with bounded exponential delay and sanitized persisted errors. Lease expiry is repaired by reconciliation; exhausted attempts become `FAILED + HUMAN_REVIEW`. Adaptive model failure never strands a case — `adaptive_fallback` → baseline `Decision` in same transaction.
-- **Transaction boundary:** no Redis, Razorpay, or Anthropic call is made while a production request/worker DB transaction remains open; adaptive scoring is `scorer.rank_actions_with_friction` batched (one `predict_proba` per decision), provenance is flushed after `record_decision`.
+- **Transaction boundary:** no Redis, Razorpay, or LLM provider call is made while a production request or worker database transaction remains open; adaptive scoring batches one `predict_proba` call per decision, and provenance is flushed after `record_decision`.

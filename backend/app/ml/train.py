@@ -1,5 +1,5 @@
 """
-Train the recovery-probability model (Phase 5).
+Train the recovery-probability model.
 
     P(recovered | failure_category, action, amount, days_overdue,
                   previous_contacts, subscription_linked, hour, day_of_week)
@@ -82,7 +82,7 @@ def train(n: int = 30000, seed: int = 42, save: bool = True, save_path: Path = M
         "log_loss": float(log_loss(y_test, proba)),
         "accuracy": float(accuracy_score(y_test, preds)),
         "brier_score": float(brier_score_loss(y_test, proba)),
-        "base_rate": float(y.mean()),
+        "base_rate": float(y_test.mean()),
     }
 
     if save:

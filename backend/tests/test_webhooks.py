@@ -202,7 +202,7 @@ def test_payment_failed_is_diagnosed_with_a_failure_category(client):
     assert resp.status_code == 200
     # INVALID_INSTRUMENT's top-ranked baseline action is CREATE_PAYMENT_LINK,
     # which is unblocked (no prior contacts, amount under the automated cap)
-    # and, as of Phase 4, actually gets executed (simulated, since no
+    # and is executed in simulation because no
     # Razorpay test-mode credentials are configured here) — landing the
     # case in AWAITING_OUTCOME rather than just ACTION_SCHEDULED.
     assert resp.json()["case_state"] == "ACTION_SCHEDULED"

@@ -3,10 +3,9 @@
 Demo seed script — idempotent, local/demo only.
 
 Creates a curated set of RecoveryOS cases demonstrating the full recovery
-journey for judges. Each scenario uses deterministic demo IDs (prefixed
+workflow. Each scenario uses deterministic demo IDs (prefixed
 `demo_*`) and tolerates prior runs via upsert-or-skip. No external API is
-required by default (simulation mode); Razorpay Test Mode still works
-simulated path.
+required by default. Razorpay Test Mode can be enabled separately.
 
 Scenarios covered (A-F; seven rows because C has two variants):
   A. CUSTOMER_AUTHENTICATION → CONTACT_CUSTOMER → PTP → FOLLOW_UP_PTP

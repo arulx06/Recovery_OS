@@ -13,7 +13,7 @@
 | Docker Desktop | any recent | `docker --version` |
 | Git | any recent | `git --version` |
 
-This runbook assumes the repository root is `D:\Razorpay` (or wherever you cloned to) and that you are on branch `feat/observability-demo-ux` (`git branch --show-current`).
+Run repository-level commands from the directory where you cloned RecoveryOS.
 
 ---
 
@@ -175,7 +175,7 @@ If `database` is `unreachable`, check `docker compose ps` and that `backend/.env
 
 ```bash
 python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/').read().decode())"
-# {"service":"RecoveryOS","phase":"7 - measurement + explainability dashboard"}
+# {"service":"RecoveryOS","version":"0.1.0"}
 ```
 
 ---
@@ -236,7 +236,6 @@ Working directory: **`backend/`** with the venv activated.
 
 ```bash
 python -m pytest -q
-# 471 passed
 ```
 
 What "hermetic" means here (`tests/conftest.py`):
@@ -598,7 +597,7 @@ cat app/ml/artifacts/manifest.json | python -m json.tool
 # {model_version, feature_schema_version, fingerprint, metrics {roc_auc, log_loss, brier_score, ...}, synthetic_data_notice}
 ```
 
-The artifact directory is gitignored (`backend/.gitignore:8` — `model.joblib` + `manifest.json`). A fresh clone requires this step before any `POST /experiments` or `scripts/evaluate_policies.py` call — otherwise they return `503 ModelNotTrainedError`.
+The artifact directory is excluded by the root `.gitignore`. A fresh clone requires this step before any `POST /experiments` or `scripts/evaluate_policies.py` call; otherwise they return `503 ModelNotTrainedError`.
 
 ---
 
@@ -643,7 +642,7 @@ python scripts/run_synthetic_batch.py --count 100 --seed 7
 
 See `docs/SYSTEM_FLOWS.md` flow 8 and `app/routers/experiments.py`:
 
-- `POST /experiments` body: `{"count": 1..5000, "seed": int?}` → `ExperimentSummary` with `run_id`, `arms.baseline|adaptive`, `incremental_recovered`.
+- `POST /experiments` body: `{"count": 1..1000, "seed": int?}` by default. `EXPERIMENT_MAX_COUNT` controls the upper bound. The response is an `ExperimentSummary` with `run_id`, `arms.baseline|adaptive`, and `incremental_recovered`.
 - CSV header: `run_id,arm,revenue_case_id,failure_category,chosen_action,amount_at_risk,amount_recovered,recovered,contacts_made,created_at` — one row per `(scenario, arm)`.
 
 ---
@@ -729,7 +728,7 @@ After a restart: start Compose, run `alembic upgrade head`, run `python scripts/
 
 ---
 
-## 14. Troubleshooting (only issues still relevant as of this branch)
+## 14. Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
@@ -742,11 +741,11 @@ After a restart: start Compose, run `alembic upgrade head`, run `python scripts/
 | RQ fails with `os.fork` or `signal.SIGALRM` on Windows | Use `--worker-class app.worker.WindowsWorker`; `SimpleWorker` alone still uses the Unix timeout class. |
 | Actions remain `EXECUTING` after a worker crash | After `ACTION_CLAIM_TIMEOUT_SECONDS`, run reconciliation. It resets attempts still within budget and fails exhausted work to human review. |
 | `npm run lint` fails | `oxlint` (not eslint) — run `npm install` first; check Node 22+. |
-| `alembic upgrade head` says `already at head` | Fine - current head is `a1b2c3d4e5f6` (decision provenance). CI verifies migrations against SQLite and local verification uses PostgreSQL. |
+| `alembic upgrade head` says `already at head` | No action is required. The current head is `c9d0e1f2a3b4`; CI verifies migrations against SQLite and local verification uses PostgreSQL. |
 
 ---
 
-## 15. Release hardening — health/readiness, demo safety, deployment (this pass)
+## 15. Health, Access Control, And Deployment
 
 **Health vs readiness:**
 

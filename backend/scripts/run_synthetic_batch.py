@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """
-Phase 3 exit criteria: "100 synthetic cases complete from detection -> action
-correctly."
-
-This is NOT the Phase 5 synthetic history generator (which will simulate
-realistic outcome probabilities for ML training) and it's NOT the Phase 7
-measurement dashboard (which will report real recovered money). All this
-script proves is that the deterministic pipeline — diagnosis, guardrails,
-baseline policy — runs to completion on a wide spread of inputs without
+Runs synthetic cases through the deterministic diagnosis, guardrail, and
+baseline-policy pipeline. This is separate from the synthetic history generator
+used for ML training and from persisted policy experiments. The script verifies
+that the pipeline runs to completion on a wide spread of inputs without
 raising, without leaving a case stuck in DETECTED/DIAGNOSED, and without
 a guardrail silently letting through something it shouldn't.
 

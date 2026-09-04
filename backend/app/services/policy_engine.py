@@ -1,10 +1,8 @@
 """
-Guardrail Engine + Recovery Policy Engine (Phase 3).
+Guardrail Engine and deterministic baseline recovery policy.
 
-This is the deterministic "baseline policy" the plan calls for — the thing
-Phase 5's ML model will later have to beat. It has to exist and be correct
-on its own before any prediction gets layered on top of it, and it doubles
-as the safety rail an ML-chosen action still has to pass through later.
+This policy operates independently and also provides the safety rules that
+every adaptive-policy action must pass.
 
 Order of operations, every time a case is diagnosed:
 
@@ -252,7 +250,7 @@ def decide(db: Session, case: RevenueCase, config: GuardrailConfig = DEFAULT_GUA
 
 
 # ---------------------------------------------------------------------------
-# Public API for reuse by other policy engines (Phase 5's ml_policy.py).
+# Public API reused by other policy engines.
 # These wrap the private helpers above rather than duplicating their logic,
 # so both the baseline and the ML policy check guardrails and record
 # decisions identically — the only thing that should differ between them is

@@ -70,7 +70,7 @@ flowchart LR
 | PTP Follow-up `app/services/ptp_followup.py` | [IMPLEMENTED · VERIFIED] | Resolve the exact linked promise after its merchant-local due day | No |
 | Windows Worker `app/worker.py` | [IMPLEMENTED · VERIFIED] | RQ `SimpleWorker` with timer timeout, avoiding unsupported fork/SIGALRM | Redis/PostgreSQL |
 | Experiment Runner `app/services/experiment_runner.py` | [IMPLEMENTED] | Matched-scenario baseline vs adaptive with `run_id` + CSV audit | No |
-| Dashboard `frontend/src/**` | [IMPLEMENTED · PARTIAL] | Health, case list, experiment panel; `GET /cases/:id` exists without a rendered view | No |
+| Dashboard `frontend/src/**` | [IMPLEMENTED] | Health, case list, case detail, decision inspection, timeline, provider status, and experiment panel | No |
 
 Money-moving decisions are made by deterministic code (guardrails + policy), never by an LLM.
 
@@ -425,7 +425,7 @@ ground_truth.py: BASE_PROBABILITY[(category, action)]  ──┤
 - **Live path:** `orchestrator._diagnose` → `policy_dispatcher.decide_for_case` → `RECOVERY_POLICY=baseline` (default, safe) or `adaptive` (validated manifest + batched scoring) or `shadow` (baseline executes, adaptive audited). Adaptive respects stopping rule and guardrails; `Razorpay` never called directly from policy.
 - **Provenance:** `manifest.json` beside `model.joblib` (`model_version=recovery-v1`, `feature_schema_version`, `fingerprint`, `metrics` incl. Brier, `synthetic_data_notice`); `Decision.policy_mode / model_version / fingerprint / friction_*` plus `decision.alternatives[_provenance]` and `AuditEvent(adaptive_decision / adaptive_fallback / shadow_*)`.
 - **Cost vs friction:** `ACTION_COST` is financial proxy (`WAIT 0 … ESCALATE 50`); `BASE_FRICTION` is customer-intervention score (dimensionless) converted via `friction_weight` (profile-dependent, INR-equivalent). They are not double-counted: guardrails block, friction ranks.
-- **Calibration:** `train.py` reports `ROC-AUC 0.7756, log loss 0.4715, Brier 0.1597` on holdout; no Platt/isotonic calibration applied — synthetic holdout and GBDT native probabilities are sufficient for utility ordering (see `ML_AND_EVALUATION.md`).
+- **Calibration:** `train.py` reports ROC-AUC, log loss, Brier score, and accuracy for each generated artifact. No additional probability calibration is applied; see `ML_AND_EVALUATION.md` for methodology and limitations.
 
 ---
 
@@ -433,7 +433,7 @@ ground_truth.py: BASE_PROBABILITY[(category, action)]  ──┤
 
 | Concern | Truth |
 |---------|-------|
-| Provider | **Anthropic** (`claude-3-5-haiku-latest`, `https://api.anthropic.com/v1/messages`, `x-api-key`) **and OpenCode Zen** (`muse-spark-1.2-contributor-free`, `https://opencode.ai/zen/v1/responses`, `Authorization: Bearer`, `LLM_BASE_URL` override). `LLM_PROVIDER` in `anthropic|opencode_zen`; others raise `LLMAPIError`. OpenCode Zen free availability may be temporary; runtime API is separate from coding-agent session; use synthetic data only; secrets only in `backend/.env`. |
+| Provider | **Anthropic** (`claude-3-5-haiku-latest`, `https://api.anthropic.com/v1/messages`, `x-api-key`) **and OpenCode Zen** (`muse-spark-1.2-contributor-free`, `https://opencode.ai/zen/v1/responses`, `Authorization: Bearer`, `LLM_BASE_URL` override). `LLM_PROVIDER` accepts `anthropic|opencode_zen`; other values raise `LLMAPIError`. OpenCode Zen free availability may be temporary; use synthetic data only and keep secrets in `backend/.env`. |
 | Enablement | `LLM_API_ENABLED=true` **and** `LLM_API_KEY` must both be set; credentials alone never trigger network. Optional sub-gates `LLM_MESSAGE_DRAFT_ENABLED` / `LLM_PTP_EXTRACTION_ENABLED` (default true). When disabled, deterministic behavior is fully operational. `LLM_API_ENABLED=false` default. |
 | Structured output | PTP extraction schema `PTPExtraction {intent: promise_to_pay | not_a_promise | uncertain | payment_claim | dispute | unclear, promised_amount, promised_date (YYYY-MM-DD), confidence 0..1, reasoning_code}` — `PTP_SCHEMA_VERSION=ptp-schema-v1`, prompt `ptp-v1` / `message-v1`. Validated at LLM boundary (`_validate_structured_output`) — invalid enum/amount/date/confidence → `LLMInvalidResponseError` → deterministic fallback. No CoT stored. |
 | Promised amount semantics | LLM extracts only what customer explicitly said. Omitted amount is NOT invented; existing deterministic rule requires explicit amount (amount_method=customer_explicit) — otherwise `HUMAN_REVIEW`. If inference ever allowed, it happens outside LLM with `amount_method=deterministic_full_balance`. Never invent discount/fee/settlement. |
@@ -517,7 +517,7 @@ flowchart TB
 ## Frontend boundary
 
 - Routes: `GET /health` (liveness, sanitized), `GET /ready` (readiness gated), `GET /live` (pure up), `GET /dashboard/summary`, `GET /cases` (filtered), `GET /cases/{id}` (enriched), `POST /cases/{id}/customer-reply` (optionally `DEMO_ADMIN_TOKEN`), `POST/GET /experiments` (optionally gated, bounded by `EXPERIMENT_MAX_COUNT`), `GET /experiments/{id}/export.csv`, `POST /admin/demo-reset` (gated) (`app/main.py:12` + `app/routers/*`).
-- Dashboard is a credible fintech control center: Overview (revenue at risk/recovered, open/recovered/waiting/human-review, PTP, policy/model, queue), filterable case list (state/category/action/policy/search), and full case detail (failure explanation, Decision Inspector with candidate P/EV/friction/utility, guardrails, friction, chronological timeline, temporal runtime, Razorpay TEST MODE/SIMULATED provider truth, customer drafts DRAFT/NOT SENT, PTP lifecycle, provenance) — all derived read-only from PostgreSQL via `explainability.py` and `GET /dashboard/summary` / `GET /cases/{id}`. `?case=<id>` deep-linking.
+- Dashboard includes an overview, filterable case list, and full case detail with failure explanation, candidate scoring, guardrails, timeline, temporal runtime, provider status, message drafts, PTP lifecycle, and provenance. All views are derived from PostgreSQL through `explainability.py`, `GET /dashboard/summary`, and `GET /cases/{id}`; `?case=<id>` supports deep linking.
 - No production IAM; public-demo mode uses optional `DEMO_ADMIN_TOKEN` (header `X-Demo-Admin-Token`, stored `sessionStorage`, never baked) — webhook remains HMAC-only. Polling is bounded: 30s health/dashboard, 10s active case detail (no WebSocket hammering).
 
 ---
@@ -535,7 +535,7 @@ flowchart TB
 
 ---
 
-## Frontend observability read-model (observability stage — IMPLEMENTED)
+## Frontend Observability Read Model
 
 ```
 PostgreSQL truth (cases, decisions, actions, audit, messages, PTP)
@@ -555,7 +555,7 @@ React merchant console (frontend/src/** — Overview/Cases/Experiments/System)
 
 The dashboard is not the decision-maker. All business semantics (taxonomy, guardrails, policy, temporal, reconciliation, PTP, LLM boundary) remain in orchestrator/policy/temporal. The read-model only explains persisted truth; missing fields render as unavailable, never fabricated.
 
-## Hardening (release-hardening-e2e — IMPLEMENTED)
+## Reliability And Access Control
 
 - **Liveness vs readiness:** `/health` sanitized liveness, `/ready` gated readiness (DB+Redis required, LLM/Razorpay optional never degrades), `/live` pure up. `X-Request-ID` on every response, structured JSON logs (`app/core/logging_config.py`, `app/core/middleware.py`) redacting secrets.
 - **Public-demo safety:** Optional `DEMO_ADMIN_TOKEN_ENABLED` gates sensitive reads (`GET /cases*`, `/dashboard/summary`, `/experiments*`) and operator mutations with `X-Demo-Admin-Token`; root/health/readiness remain public and webhook remains HMAC-only; token entered at runtime via `sessionStorage` (never baked).
@@ -571,6 +571,6 @@ The dashboard is not the decision-maker. All business semantics (taxonomy, guard
 
 ---
 
-## Build order
+## Design Evolution
 
-Event pipeline → state machine → guardrails + baseline → real recovery action (Payment Links) → ML policy (friction-aware live via dispatcher, RECOVERY_POLICY) → LLM + Promise-to-Pay → measurement dashboard → reliability. Each stage depends on the prior one being trustworthy before the next layer is added. This is historical context for maintainers, not a reopened plan.
+The system evolved from the event pipeline and state machine through guardrails, payment-link execution, adaptive policy, promise-to-pay intelligence, observability, and reliability controls. Each layer retains explicit boundaries so later capabilities do not bypass earlier safety guarantees.

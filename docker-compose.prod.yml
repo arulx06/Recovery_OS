@@ -3,7 +3,7 @@
 services:
   migrate:
     build: ./backend
-    image: recoveryos/backend:release-hardening
+    image: recoveryos/backend:0.1.0
     profiles: ["migrate"]
     command: ["alembic", "upgrade", "head"]
     env_file: ["./backend/.env"]
@@ -15,7 +15,7 @@ services:
 
   api:
     build: ./backend
-    image: recoveryos/backend:release-hardening
+    image: recoveryos/backend:0.1.0
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -36,7 +36,7 @@ services:
 
   worker:
     build: ./backend
-    image: recoveryos/backend:release-hardening
+    image: recoveryos/backend:0.1.0
     restart: unless-stopped
     command: ["rq", "worker", "--with-scheduler", "--url", "redis://redis:6379/0", "recoveryos"]
     working_dir: /app
@@ -51,7 +51,7 @@ services:
       REDIS_URL: "${REDIS_URL:-redis://redis:6379/0}"
 
   frontend:
-    image: recoveryos/frontend:release-hardening
+    image: recoveryos/frontend:0.1.0
     build:
       context: ./frontend
       args:

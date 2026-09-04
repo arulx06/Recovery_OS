@@ -9,12 +9,12 @@
 | Field | Value |
 |-------|-------|
 | **Status** | Accepted |
-| **Date** | 2026-08-21 (Day 1 skeleton — see `backend/app/main.py` single FastAPI app) |
+| **Date** | 2026-08-21 |
 | **Context** | Buildathon track requires shipping in 14 days with credible revenue-recovery measurement, not an infrastructure showcase. Split services (payment ingestion, policy, ML, LLM) have no independent deploy/scale owner. |
 | **Decision** | Ship a modular monolith: one FastAPI app (`app/main.py:12`), one Postgres, one React build. Modules separated by import boundaries (`services/orchestrator`, `services/policy_engine`, `services/ml_policy`, `services/llm_client`) rather than processes or RPC. |
 | **Why** | Faster local bring-up (`docker compose up -d` + `uvicorn`), single migration history, easier atomic transactions (webhook → diagnosis → decision → action in one DB commit), no inter-service auth/secrets to rotate. |
-| **Consequences** | Positive: phase order composable (each phase depends on previous phase being trustworthy); simple CI. Negative: no independent deploy of ML scorer; `WAIT` wake-up must be added carefully to avoid synchronous hot-path contention. |
-| **Reference** | `README.md: Tech stack "Deliberately not using: microservices, Kafka, Kubernetes"`; `ARCHITECTURE.md: Future components` |
+| **Consequences** | Positive: simple CI, atomic transactions, and straightforward local operation. Negative: no independent deployment of the ML scorer; delayed `WAIT` execution requires the worker and scheduler. |
+| **Reference** | `backend/app/main.py`, `ARCHITECTURE.md` |
 
 ---
 
@@ -41,7 +41,7 @@
 | **Context** | A learned policy could propose arbitrary contact or links; contacting a customer for a `₹100,000` failed payment ten times has legal/goodwill cost that outweighs a model score. |
 | **Decision** | Every decision — baseline or adaptive — passes through `policy_engine.check_action_allowed` (amount cap `max_automated_amount=25000`, contact limits `max_contacts_per_case=3`, rolling window `max_contacts_per_7_days=2`, cooldown `12h`, stopping rule `max_total_attempts=5`). `ml_policy.decide_ml` reuses `record_decision` + `ACTION_TO_STATE`, never bypassing guardrails. |
 | **Why** | Guardrails are the single safety rail that makes "offline experiments are safe" true. The scorer never picks an action; it only ranks the guardrail-allowed set — see `app/ml/scorer.py:99` `expected_value = P̂·amount − cost`. |
-| **Consequences** | Positive: adaptive policy is intrinsically safe; synthetic contact inflation (474 vs 253 in 1000-scenario run) is directly observable as `contacts_made` because guardrails emit `alternatives: {action: {allowed, reason}}`. Negative: some ML-preferred actions are currently muted by `max_automated_amount` → conservative `ESCALATE` on large invoices — desired but worth documenting. |
+| **Consequences** | Positive: adaptive policy remains bounded, and contact frequency is observable through `contacts_made` and guardrail alternatives. Negative: some model-preferred actions are muted by `max_automated_amount`, resulting in conservative escalation for large invoices. |
 | **Reference** | `app/services/policy_engine.py:107`, `app/services/ml_policy.py:35` |
 
 ---
@@ -54,8 +54,8 @@
 | **Date** | 2026-08-21 (pitch line "Money-moving decisions are made by deterministic code" baked into `ARCHITECTURE.md:60`) |
 | **Context** | LLMs are good at language and bad at being consistently correct about money; an LLM that hallucinates "pay now" into a policy decision would be a loss of auditability and a liability. |
 | **Decision** | The LLM (`app/services/llm_client.py`) is restricted to: (a) drafting one short, compliant outbound message given `{amount, failure_category, action_type}`, and (b) classifying one inbound message into `{promise_to_pay, dispute, unclear} + {amount, date, confidence}`. Both are wrapped by non-LLM checks: drafting failures fall back to templated text + flag `simulated=true`; extraction is validated by `ptp_extractor.validate_promise` before any `PromiseToPay` is recorded. Disputes go through the same `_dispute_case` path as Razorpay's `payment.dispute.created`. |
-| **Why** | Keeps action authority in `orchestrator.py`/`policy_engine.py` and preserves the append-only `AuditEvent` trail; the interaction that judges can audit is "LLM guessed → deterministic rule checked → deterministic state change", not "LLM decided". |
-| **Consequences** | Positive: `action_executor.perform` can be exercised hermetically with `LLM_API_ENABLED=false`. Negative: outbound copy quality is templated-by-default; improving tone requires explicit enablement of the Anthropic path, not a new model position. |
+| **Why** | Keeps action authority in `orchestrator.py`/`policy_engine.py` and preserves the append-only `AuditEvent` trail; the auditable interaction is "LLM proposed → deterministic rule checked → deterministic state change", not "LLM decided". |
+| **Consequences** | Positive: `action_executor.perform` can be exercised hermetically with `LLM_API_ENABLED=false`. Negative: outbound copy quality is templated by default; provider-backed drafting requires explicit enablement. |
 | **Reference** | `app/services/llm_client.py:12`, `app/services/ptp_extractor.py:38`, `ARCHITECTURE.md: LLM boundary` |
 
 ---
@@ -67,7 +67,7 @@
 | **Status** | Accepted |
 | **Date** | 2026-08-22 (`razorpay_client.py:65` gate landed with Payment Links; `llm_client.py:109` parallel gate for Anthropic) |
 | **Context** | Non-empty credentials in `.env` are easy to leave on a developer machine; turning them into implicit live calls during `pytest` would silently hit external providers and leak secrets into tests. |
-| **Decision** | No external traffic occurs unless the **explicit** flag `*_API_ENABLED=true` is set — regardless of whether `*_KEY_ID`/`*_KEY` is non-empty. Simulation (`plink_sim_*` with `simulated=true` / `_TEMPLATES` or regex extraction) is the default. Live gates further enforce `RAZORPAY_KEY_ID.startswith("rzp_test_")` and `LLM_PROVIDER==anthropic`. |
+| **Decision** | No external traffic occurs unless the **explicit** flag `*_API_ENABLED=true` is set, regardless of whether credentials are present. Simulation is the default. Razorpay additionally requires an `rzp_test_*` key; LLM access requires a supported provider (`anthropic` or `opencode_zen`). |
 | **Why** | Tests can ship fake but non-empty keys (`conftest.py:13` `rzp_test_fake_hermetic`) without fear; CI never needs a secret; the `payment_link.paid` recovery path is exercised via the same handler for simulated and genuine links. |
 | **Consequences** | Positive: `tests/test_razorpay_client.py:101` "Non-blank credentials do not enable network implicitly" is an enforced invariant. Negative: developers must remember to set the flag **and** restart `uvicorn` — two conditions rather than one to get live Test Mode. |
 | **Reference** | `app/services/razorpay_client.py:48`, `app/services/llm_client.py:56`, `backend/.env.example:8`, `docs/INTEGRATIONS.md` |
@@ -81,8 +81,8 @@
 | **Status** | Accepted |
 | **Date** | 2026-08-22 (`razorpay_client.py:72` `rzp_test_*` gate) |
 | **Context** | Buildathon evaluation is against Razorpay Test Mode API; production live-money is out of scope but the codebase must prevent misleading "it works" claims or accidental live calls. |
-| **Decision** | `create_payment_link` rejects any non-`rzp_test_*` key at call time with `RazorpayAPIError("RecoveryOS only permits Razorpay Test Mode API keys")`, even when `RAZORPAY_API_ENABLED=true`. Docs state `TEST MODE ≠ production` as a top-level disclaimer (`README.md: Two disclaimers`, `docs/INTEGRATIONS.md: TEST MODE ≠ production`). |
-| **Why** | Verification path needed to demonstrate the real Razorpay REST call (`POST /v1/payment_links` → genuine `plink_*`) without moving real money; production readiness is a separate future phase with explicit environment/secret management. |
+| **Decision** | `create_payment_link` rejects any non-`rzp_test_*` key at call time with `RazorpayAPIError("RecoveryOS only permits Razorpay Test Mode API keys")`, even when `RAZORPAY_API_ENABLED=true`. The README and integration guide clearly separate Test Mode from production operation. |
+| **Why** | The Test Mode path verifies the Razorpay REST call (`POST /v1/payment_links` → genuine `plink_*`) without moving real money. Production operation would require separate credentials, environment controls, and secret management. |
 | **Consequences** | Positive: any future `plink_*` / `rzp.io` smoke is constrained to Test Mode and labelled; automated coverage remains network-hermetic. Negative: a production cut-over would touch `razorpay_client.py`, `config.py`, and `INTEGRATIONS.md` at minimum — not a one-line flip. |
 | **Reference** | `app/services/razorpay_client.py:48`, `docs/CURRENT_STATE.md: Capability matrix footnote` |
 
@@ -96,7 +96,7 @@
 | **Date** | 2026-08-23 (`app/ml/ground_truth.py:1` "This is NOT a claim about real recovery rates") |
 | **Context** | Until live outcome logs exist, training and evaluation share the same `ground_truth` simulator — the model's only claim is "I reconstruct the simulator's hand-set probabilities better than the fixed policy does for a synthetic population." Presenting that as production lift would be dishonest. |
 | **Decision** | Every synthetic surface is labeled: file docstrings ("SYNTHETIC SIMULATION BENCHMARK", `ground_truth.py:16`, `evaluate_policies.py:12`, `experiment_runner.py:4`), HTTP/JSON contracts (`ExperimentPanel.tsx:75` banner, `README` disclaimer), CLI echo (`evaluate_policies.py:148` "SYNTHETIC SIMULATION BENCHMARK — not production Razorpay lift"), and `docs/ML_AND_EVALUATION.md` circularity section. The 1000-scenario adaptive-vs-baseline comparison is always reported alongside **both** `revenue recovered` and `contacts made` — the revenue↑+contacts↑ tradeoff is first-class, not a footnote. |
-| **Why** | Keeps reviewers and future phases honest about `BASE_PROBABILITY` sensitivity and `ACTION_COST` non-calibration; prevents synthetic-weight tuning to look favorable. |
+| **Why** | Makes `BASE_PROBABILITY` sensitivity and uncalibrated action costs explicit and discourages tuning synthetic weights solely for favorable results. |
 | **Consequences** | Positive: the `Incremental gross recovered (synthetic)` headline in the dashboard/API is always accompanied by the per-arm contact and cost rows, plus a downloadable audit CSV. Negative: the synthetic numbers cannot be used to promise lift on real traffic. |
 | **Reference** | `app/ml/ground_truth.py:33` hand-set table, `docs/ML_AND_EVALUATION.md: Shared simulator for train and evaluate` |
 
@@ -121,12 +121,12 @@
 | Field | Value |
 |-------|-------|
 | **Status** | Accepted |
-| **Date** | 2026-08-23 (`backend/.gitignore:8` `app/ml/artifacts/`) |
-| **Context** | The model is a derived artifact (weights + preprocessor) from synthetic history; committing it would pin a specific build without pinning the simulator assumptions that produced it, and would make judging reproducibility harder (`git diff` on a binary). |
+| **Date** | 2026-08-23 |
+| **Context** | The model is a derived artifact (weights + preprocessor) from synthetic history; committing it would pin a specific build without pinning the simulator assumptions that produced it, and binary diffs would make reproducibility harder to review. |
 | **Decision** | Artifact lives at `backend/app/ml/artifacts/model.joblib` (written by `python -m app.ml.train`), gitignored, reproduced deterministically via `train.py` with `--n` + `--seed`. CI trains from scratch each run (`ci.yml: Train recovery-probability model`). `scorer._load` is protected by a `stat(mtime,size)` cache; tests use an isolated `tmp_path_factory` artifact. |
 | **Why** | Keeps the repository source-first; the trained artifact is small (KBs) but intentionally rebuildable. |
 | **Consequences** | Positive: a fresh clone must `python -m app.ml.train` before any `/experiments` or `evaluate_policies.py` call — missing model is a `503 ModelNotTrainedError` with a clear message. Negative: the CI step adds seconds to the build. |
-| **Reference** | `backend/.gitignore:8`, `app/ml/train.py:37`, `app/ml/scorer.py:38`, `ci.yml` |
+| **Reference** | `.gitignore`, `app/ml/train.py`, `app/ml/scorer.py`, `.github/workflows/ci.yml` |
 
 ---
 
@@ -135,7 +135,7 @@
 | Field | Value |
 |-------|-------|
 | **Status** | Accepted and implemented |
-| **Date** | 2026-09-03 (this documentation pass) |
+| **Date** | 2026-09-03 |
 | **Context** | Delayed waits and PTP deadlines must survive request completion, process restarts, duplicate delivery, and Redis loss without letting stale work reopen recovered/disputed cases. Provider calls must not run inside webhook transactions. |
 | **Decision** | `Action` is the durable job record. Requests commit it before publishing. RQ jobs contain only `action_id` and use deterministic IDs per attempt. A worker locks the case and conditionally claims `SCHEDULED -> EXECUTING`, commits before external I/O, and finalizes in a new transaction after rechecking state. Expected failures retry with bounded exponential delay; stale claims use a configurable lease. `scripts/reconcile_actions.py` resets expired claims and republishes every scheduled queueable action. |
 | **Why** | A separate job table would duplicate the existing action lifecycle. Redis-as-authority creates a dual-write loss window. Holding a DB transaction across provider I/O increases lock time and still cannot provide provider exactly-once semantics. |
@@ -177,7 +177,7 @@
 |-------|-------|
 | **Status** | Accepted and implemented |
 | **Date** | 2026-09-04 |
-| **Context** | Friction-unaware adaptive doubled contacts (`474 vs 253` per 1000 synthetic cases) for `+1.3pp` recovery. Letting ML bypass `max_contacts`/`cooldown`/`max_amount` would trade goodwill for model-favored outreach. |
+| **Context** | A friction-unaware adaptive policy can increase customer contact for a comparatively small synthetic recovery gain. Letting ML bypass contact limits, cooldowns, or amount caps would trade customer goodwill for model-favored outreach. |
 | **Decision** | Adaptive scores only the guardrail-allowed set (`policy_engine.check_action_allowed`) plus semantic filter (`WAIT_FOR_NATIVE_RETRY` only if `subscription_linked`). `scorer.rank_actions_with_friction` is batched and `policy_dispatcher` is the single dispatch point; `RECOVERY_POLICY=baseline` (default) never loads the model. |
 | **Why** | Guardrails are merchant-safety, friction is preference ranking — conflating them would hide blocks as huge penalties. Keeping them separate makes `HUMAN_REVIEW` auditable and prevents ML from spending past limits. |
 | **Consequences** | Positive: adaptive cannot bypass hard limits; shadow and adaptive share identical guardrail semantics; fallback remains deterministic. Negative: some model-preferred actions are muted by guardrails (e.g., large amount → `ESCALATE`). |
@@ -208,7 +208,7 @@
 | **Context** | `ACTION_COST = {WAIT 0, CREATE 5, CONTACT 15, PTP 15, ESCALATE 50}` is too small vs `amount` to restrain revenue-first adaptive; tuning it until a benchmark looks good would hide the tradeoff. |
 | **Decision** | Introduce `friction_score` (`BASE_FRICTION: WAIT 0, WAIT_NATIVE 2, CREATE 25, CONTACT 40, PTP 60, ESCALATE 80` plus `+12 per prior contact` for contact types) and `utility = p*amount - cost - weight*friction` with explicit `PROFILE_WEIGHTS = {revenue_first:4, balanced:18 (default), low_friction:45}` INR per point. Dashboards show `recovered`, `cost`, and `friction` separately. |
 | **Why** | Makes intervention frequency a first-class, testable, documentable objective distinct from hard guardrails (`max_contacts`). Weight is a policy preference, not a measured monetary cost — honest about `synthetic_data_notice`. |
-| **Consequences** | Positive: balanced profile recovers `≈+48k` on `500/seed11` with `+19%` contacts (vs old `+87%`) and consistently reduces escalations; low_friction can go below baseline contacts; `recovered_per_contact` is reported. Negative: no weight is empirically optimal; merchant research and real outcome `recovered_per_contact` must set the production profile. |
+| **Consequences** | Positive: profiles make recovery-versus-contact tradeoffs explicit, and `recovered_per_contact` is reported. Negative: no weight is empirically optimal; merchant research and real outcomes must inform any production profile. |
 | **Reference** | `app/ml/friction.py`, `app/ml/scorer.py:rank_actions_with_friction`, `app/services/ml_policy.py`, `docs/ML_AND_EVALUATION.md: Friction is a first-class objective` |
 
 ---
@@ -220,8 +220,8 @@
 | **Status** | Accepted and implemented |
 | **Date** | 2026-09-04 |
 | **Context** | `ground_truth` is the only labeled data; training on it and evaluating on the same assumptions is circular if presented as lift. |
-| **Decision** | Keep synthetic `ground_truth`/`synthetic_history` but document circularity, add Brier score (`0.1597`) and no-calibration rationale, keep one canonical `features.py` pipeline (`FEATURE_SCHEMA_VERSION=v1`) validated at train and serve, require `manifest.json` (`model_version recovery-v1`, `fingerprint` sha256, `synthetic_data_notice`) with fingerprint exposed in `Decision`, `AuditEvent`, `/health`, `/cases/{id}`, and `common-random` matched scenarios. Real validation (temporal split, IPS/DR, controlled rollout) is documented as a roadmap, not implemented. |
-| **Why** | A lower honest metric (e.g., balanced adaptive `-28k` on one seed) is better than a high invalid claim; friction-aware evaluation reports `contacts`, `contact_rate`, `friction`, `recovered_per_contact` alongside `recovered`. |
+| **Decision** | Keep synthetic `ground_truth`/`synthetic_history` but document circularity, generate Brier score and other holdout metrics per artifact, keep one canonical `features.py` pipeline (`FEATURE_SCHEMA_VERSION=v1`) validated at train and serve, require `manifest.json` with fingerprint and synthetic-data notice, and use common-random matched scenarios. Real validation remains a documented roadmap. |
+| **Why** | Reproducible methodology is more useful than a favorable but stale benchmark. Friction-aware evaluation reports contacts, contact rate, friction, and recovered-per-contact alongside recovered amount. |
 | **Consequences** | Positive: seeded training prints stable evaluation metrics and a SHA-256 fingerprint for the generated artifact; `GET /health` shows `model_available` without requiring Razorpay; `train_serve_parity` guards drift. The byte fingerprint is build-specific, not a release constant. Negative: synthetic robustness ≠ production validation — still needs logged `Decision` provenance + outcome timestamps for future real learning. |
 | **Reference** | `app/ml/train.py`, `app/ml/scorer.py`, `app/ml/features.py`, `app/ml/manifest.py`, `app/services/experiment_runner.py`, `docs/ML_AND_EVALUATION.md` |
 
@@ -235,8 +235,8 @@
 | **Date** | 2026-09-05 |
 | **Context** | LLMs are good at language, bad at consistently correct financial decisions; allowing a model to choose `WAIT` vs `CREATE_PAYMENT_LINK` would be unauditable and a liability. |
 | **Decision** | LLM (`app/services/llm_client.py`) is optional downstream support only: (a) draft one `DRAFT` message with `[[PAYMENT_LINK]]` placeholder after controller has chosen `CONTACT_CUSTOMER`/`COLLECT_PROMISE_TO_PAY`/`CREATE_PAYMENT_LINK`, (b) extract one structured `PTPExtraction` `{intent, promised_amount, promised_date, confidence, reasoning_code}` from customer free text. Both are wrapped by non-LLM checks: drafting substitution uses authoritative `short_url`; extraction is validated by `ptp_extractor.validate_promise` before any `PromiseToPay` is recorded. LLM never calls `policy_engine`/`ml_policy` nor mutates `RevenueCase.state` directly. |
-| **Why** | Keeps action authority in `orchestrator`/`policy_dispatcher`/`temporal_runtime` and preserves append-only `AuditEvent` trail; interaction judges audit is "LLM guessed → deterministic validation → deterministic state change", not "LLM decided". Deterministic fallback (`draft_with_fallback`/`extract_with_fallback`) ensures no case stuck when provider down. |
-| **Consequences** | Positive: `action_executor.perform` hermetic with `LLM_API_ENABLED=false`; `CONTACT_CUSTOMER` still `EXECUTED` with fallback draft; injection cannot change policy mode/guardrails. Negative: outbound copy quality is templated-by-default; improving tone requires explicit enablement of Anthropic path. |
+| **Why** | Keeps action authority in `orchestrator`/`policy_dispatcher`/`temporal_runtime` and preserves the append-only `AuditEvent` trail; the auditable interaction is "LLM proposed → deterministic validation → deterministic state change", not "LLM decided". Deterministic fallback (`draft_with_fallback`/`extract_with_fallback`) prevents provider outages from stranding cases. |
+| **Consequences** | Positive: `action_executor.perform` remains hermetic with `LLM_API_ENABLED=false`; `CONTACT_CUSTOMER` still completes with a fallback draft; injection cannot change policy mode or guardrails. Negative: provider-backed copy requires explicit configuration. |
 | **Reference** | `app/services/llm_client.py:43` (prompt/schema versions, placeholder), `app/services/action_executor.py:43`, `app/services/orchestrator.py:475`, `ARCHITECTURE.md: LLM boundary`, `docs/CURRENT_STATE.md: LLM PTP extraction / LLM message drafting` |
 
 ---
@@ -275,9 +275,9 @@
 |-------|-------|
 | **Status** | Accepted and implemented |
 | **Date** | 2026-09-05 |
-| **Context** | Adding Twilio/SendGrid/WhatsApp in this hackathon would imply delivered messages without a real transport and would require consent, opt-out, and delivery-proof. |
+| **Context** | Adding Twilio, SendGrid, or WhatsApp without a complete transport would imply delivered messages without consent, opt-out handling, and delivery evidence. |
 | **Decision** | All outbound `CustomerMessage` are `status=DRAFT` / `MANUAL_ONLY` (`generation_method=deterministic|llm|llm_fallback_template`, `channel=simulated|llm`, `prompt_version=message-v1`). No SMS/email/WhatsApp call. Dashboard shows `DRAFT / NOT SENT`. Delivery transport is `PLANNED` future component. |
-| **Why** | Keeps demo honest: judges see stored draft and provenance, not a false `DELIVERED` claim; no external side effect to mock/test. |
+| **Why** | Keeps the product state accurate: users see a stored draft and provenance, not a false `DELIVERED` claim; there is no external side effect to mock or test. |
 | **Consequences** | Positive: `action_executor.apply_success` idempotent and always `DRAFT`; no delivery retry needed. Negative: operator must manually share `short_url` until transport exists. |
 | **Reference** | `app/models.py:CustomerMessage`, `app/services/action_executor.py:107`, `frontend/src/App.tsx:154`, `docs/CURRENT_STATE.md: Customer delivery` |
 
@@ -288,11 +288,11 @@
 | Field | Value |
 |-------|-------|
 | **Status** | Accepted and implemented |
-| **Date** | 2026-09-06 |
-| **Context** | Judges need to see failure → diagnosis → guardrails → friction-aware candidate comparison → temporal → reconciliation → PTP → recovered, but the system already has 6 persisted tables with provenance. Adding a second timeline table or letting the frontend compute financial truth would create drift and fake values. |
+| **Date** | 2026-09-05 |
+| **Context** | Operators need to follow failure → diagnosis → guardrails → candidate comparison → temporal execution → reconciliation → PTP → recovery, but the system already has persisted tables with provenance. Adding a second timeline table or letting the frontend compute financial truth would create drift and fabricated values. |
 | **Decision** | Build `app/services/explainability.py` as a deterministic, read-only derivation layer: `failure_explanation` (taxonomy → human meaning), `normalize_decision` (allowed/blocked + P/EV/friction/utility, missing → null/unavailable), `guardrail_visibility`, `friction_breakdown`, `build_timeline` (chronological merge of PaymentEvent+Decision+Action+Message+PTP+AuditEvent, no duplicate table), `provider_truth_summary` (SIMULATED vs TEST MODE). Backend exposes `GET /dashboard/summary` and enriches `GET /cases` / `GET /cases/{id}`; frontend in `frontend/src/components/**` (Overview/Cases/Experiments/System with `?case=<id>` deep-link) only renders what the read-model returns, never invents scores. |
 | **Why** | Keeps PostgreSQL authoritative; avoids GraphQL/analytics duplication; timeline built at read time stays consistent with audit trail; historical Decisions without adaptive fields render “Not recorded” instead of fabricated values; synthetic metrics stay labeled `SYNTHETIC SIMULATION`; no LLM-generated controller explanation. Alternative of persisting a duplicate timeline or letting frontend derive `P*amount` would break auditability and risk inventing lift. |
-| **Consequences** | Positive: single coherent `GET /cases/{id}` with timeline/decision_inspectors/provider_truth, server-side filtered case list, revenue-vs-friction Pareto and action distribution without heavy charting; `scripts/seed_demo.py` demos are idempotent and source-scoped; corrective tests cover the real CLI, FK deletion order, latest-Decision SQL filtering, and exact-Action reconciliation. Negative: timeline and current friction surface are computed per request (acceptable for hackathon scale; no Redis caching added); no new migration — reads only. |
+| **Consequences** | Positive: single coherent `GET /cases/{id}` with timeline/decision inspectors/provider truth, server-side filtered case list, and revenue-vs-friction analysis; `scripts/seed_demo.py` is idempotent and source-scoped. Negative: timeline and current friction surfaces are computed per request and may require caching at larger scale. |
 | **Reference** | `app/services/explainability.py`, `app/routers/dashboard.py`, `app/routers/cases.py`, `frontend/src/App.tsx` + `frontend/src/components/**`, `scripts/seed_demo.py`, `tests/test_observability.py`, `docs/CURRENT_STATE.md` capability rows, `ARCHITECTURE.md` read-model diagram, `docs/SYSTEM_FLOWS.md` flows 23–29 |
 
 ---
@@ -303,10 +303,10 @@
 |-------|-------|
 | **Status** | Accepted and implemented |
 | **Date** | 2026-09-03 |
-| **Context** | Hackathon demo must survive missing Wi-Fi, wrong keys, hung workers, and judge clicking. Prior passes added capability; remaining risk was operational fragility, secret leakage, and overstated claims. |
-| **Decision** | Harden without new AI: (a) split `/health` liveness vs `/ready` readiness (DB/Redis gated, LLM/Razorpay optional, sanitized), (b) optional `DEMO_ADMIN_TOKEN_ENABLED` for sensitive operator reads and mutations (webhook stays HMAC-only, token in `sessionStorage` never baked), (c) `validate_startup_config` fail-fast, including ambiguous mixed-wildcard CORS, (d) structured JSON logging + `X-Request-ID` correlation, (e) bounded experiments and dev-only failure injection, (f) queue orphan recovery, (g) secret-safe Docker contexts with a build-generated model and native dependency healthchecks, and (h) reproducible judge script + offline fallback. |
+| **Context** | The demo environment must tolerate missing network access, invalid keys, and unavailable workers without leaking secrets or overstating system state. |
+| **Decision** | Add separate liveness and readiness endpoints, optional operator-token protection, startup configuration validation, structured logging and request correlation, bounded experiments, development-only failure injection, queue orphan recovery, secret-safe Docker contexts, and an offline demo path. |
 | **Why** | Keeps PostgreSQL authoritative and Razorpay provider-authoritative; Redis/RQ stays at-least-once transport with stale-`EXECUTING` reconciliation already proven. Smallest correct public-demo protection beats building IAM; header-gated injection beats unauthenticated public crash endpoints; one-time migrate beats raced workers. Synthetic evaluation stays labeled `SYNTHETIC SIMULATION`. |
-| **Consequences** | Positive: 460 hermetic tests, health never leaks secrets, live keys rejected, duplicate reconciliation idempotent, demo seed/reset safe, frontend survives API outage with honest errors and bounded polling, deployment reproducible. Negative: no production IAM, no live-money path — documented as `DEMO-GRADE` and `TEST_MODE_ONLY`. |
+| **Consequences** | Positive: health responses do not leak secrets, live keys are rejected, reconciliation is idempotent, demo reset is scoped, and the frontend handles API outages explicitly. Negative: production IAM and live-money operation remain out of scope. |
 | **Reference** | `app/core/config.py:validate_startup_config`, `app/main.py`, `app/core/middleware.py`, `app/core/logging_config.py`, `app/core/demo_auth.py`, `app/routers/health.py`, `app/routers/admin.py`, `app/services/failure_injection.py`, `docker-compose.prod.yml`, `docs/DEMO_SCRIPT.md`, `docs/OFFLINE_DEMO.md`, `docs/PUBLIC_WEBHOOK.md`, `tests/test_release_hardening.py` |
 
 ---
