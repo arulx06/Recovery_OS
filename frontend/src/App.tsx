@@ -76,7 +76,7 @@ function CaseNavigator({
           <span className="shrink-0 text-sm font-semibold text-white">{formatRupees(currentAmount)}</span>
           <span className="truncate text-sm font-medium text-slate-300">{failureLabel(currentFailure)}</span>
         </span>
-        <span className="mt-0.5 flex min-w-0 items-center gap-2 pr-8 text-[11px] text-slate-500">
+        <span className="mt-0.5 flex min-w-0 items-center gap-2 pr-8 text-2xs text-slate-500">
           <span className="truncate text-blue-200">{actionLabel(currentAction)}</span>
           <span aria-hidden>·</span>
           <span className="shrink-0">{stateLabel(currentState)}</span>
@@ -95,7 +95,7 @@ function CaseNavigator({
           {cases.map((item) => <option key={item.id} value={item.id}>{caseOptionLabel(item)}</option>)}
         </select>
       </label>
-      <div className="flex shrink-0 items-center gap-2 px-2 text-[11px] text-slate-500" aria-live="polite">
+      <div className="flex shrink-0 items-center gap-2 px-2 text-2xs text-slate-500" aria-live="polite">
         <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" aria-hidden />
         Detail refreshes every 10s
       </div>
@@ -265,7 +265,7 @@ export default function App() {
               <details className="rounded-xl border border-[#242d3b] bg-[#11161f]">
                 <summary className="cursor-pointer px-5 py-4 text-sm font-semibold text-slate-300">Operator access</summary>
                 <div className="border-t border-[#242d3b] p-5">
-                  <p className="text-sm leading-relaxed text-slate-400">If demo-token protection is enabled, store the operator token transiently in this browser session.</p>
+                  <p className="text-base leading-relaxed text-slate-400">If demo-token protection is enabled, store the operator token transiently in this browser session.</p>
                   <div className="mt-4 flex gap-2"><input value={demoTokenInput} onChange={(event) => setDemoTokenInput(event.target.value)} placeholder="Demo admin token" type="password" className="h-10 flex-1 rounded-md border border-slate-700 bg-[#090d13] px-3 text-sm text-slate-200" /><button onClick={() => { setDemoToken(demoTokenInput || null); setTokenSaved(true); window.setTimeout(() => setTokenSaved(false), 2000); }} className="rounded-md bg-slate-100 px-4 text-sm font-semibold text-slate-900">Save</button><button onClick={() => { setDemoToken(null); setDemoTokenInput(""); }} className="rounded-md border border-slate-700 px-4 text-sm font-semibold text-slate-300">Clear</button></div>
                   {tokenSaved && <div className="mt-2 text-xs text-emerald-300">Stored in sessionStorage.</div>}
                 </div>

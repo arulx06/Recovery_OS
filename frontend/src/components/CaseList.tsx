@@ -117,7 +117,7 @@ export function CaseList({
         <div>
           <p className="text-sm font-semibold uppercase tracking-[0.16em] text-blue-300">Recovery cases</p>
           <h1 className="mt-2 text-2xl font-semibold tracking-tight text-white sm:text-3xl">What failed, and what happens next?</h1>
-          <p className="mt-2 text-sm text-slate-400">Open a case to inspect diagnosis, safety checks, alternatives, and provider evidence.</p>
+          <p className="mt-2 text-base text-slate-400">Open a case to inspect diagnosis, safety checks, alternatives, and provider evidence.</p>
         </div>
         <button
           onClick={fetchCases}
@@ -196,11 +196,11 @@ export function CaseList({
                   </span>
                   <span className="mt-3 grid grid-cols-2 gap-3">
                     <span>
-                      <span className="block text-[11px] font-medium uppercase tracking-wide text-slate-600">Recovery action</span>
+                      <span className="block text-2xs font-medium uppercase tracking-wide text-slate-600">Recovery action</span>
                       <span className="mt-1 block text-sm font-medium text-blue-200">{actionLabel(item.chosen_action)}</span>
                     </span>
                     <span className="text-right">
-                      <span className="block text-[11px] font-medium uppercase tracking-wide text-slate-600">Last activity</span>
+                      <span className="block text-2xs font-medium uppercase tracking-wide text-slate-600">Last activity</span>
                       <span className="mt-1 block text-xs text-slate-500">{formatDate(item.updated_at ?? item.created_at)}</span>
                     </span>
                   </span>

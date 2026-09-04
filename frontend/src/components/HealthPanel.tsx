@@ -26,7 +26,7 @@ export function HealthPanel({
   healthError: boolean;
 }) {
   if (healthError) {
-    return <Card><h2 className="text-xl font-semibold">Runtime unavailable</h2><p className="mt-2 text-sm text-rose-300">The frontend cannot reach the RecoveryOS API.</p></Card>;
+    return <Card><h2 className="text-xl font-semibold">Runtime unavailable</h2><p className="mt-2 text-base text-rose-300">The frontend cannot reach the RecoveryOS API.</p></Card>;
   }
   if (!health && !dashboard) return <Card><div className="text-sm text-slate-500">Loading runtime state…</div></Card>;
 
@@ -38,7 +38,7 @@ export function HealthPanel({
       <div>
         <p className="text-sm font-semibold uppercase tracking-[0.16em] text-blue-300">System</p>
         <h1 className="mt-2 text-3xl font-semibold tracking-tight text-white">Operational state and authority</h1>
-        <p className="mt-2 text-sm text-slate-400">Detailed infrastructure, policy, and integration metadata lives here, away from the recovery workflow.</p>
+        <p className="mt-2 text-base text-slate-400">Detailed infrastructure, policy, and integration metadata lives here, away from the recovery workflow.</p>
       </div>
 
       <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-4">
@@ -61,14 +61,14 @@ export function HealthPanel({
           <div className="mb-5"><div className="text-sm font-semibold uppercase tracking-[0.12em] text-slate-500">External integrations</div><h2 className="mt-1 text-xl font-semibold text-white">Provider boundaries</h2></div>
           <RuntimeRow name="Razorpay" status={dashboard?.razorpay.is_test_mode ? "ready" : dashboard?.razorpay.simulated ? "disabled" : "unavailable"} detail={dashboard?.razorpay.mode_label ?? "Unavailable"} />
           <RuntimeRow name="Language model" status={llm?.enabled ? "ready" : "disabled"} detail={llm?.enabled ? `${llm.provider} · ${llm.model ?? "model"}` : "Deterministic fallback active"} />
-          <div className="mt-4 rounded-lg bg-slate-800/50 px-3 py-3 text-xs leading-relaxed text-slate-400">Razorpay events establish payment truth. The optional LLM assists language only.</div>
+          <div className="mt-4 rounded-lg bg-slate-800/50 px-3 py-3 text-sm leading-relaxed text-slate-400">Razorpay events establish payment truth. The optional LLM assists language only.</div>
         </Card>
 
         <Card>
           <div className="mb-5"><div className="text-sm font-semibold uppercase tracking-[0.12em] text-slate-500">Safety</div><h2 className="mt-1 text-xl font-semibold text-white">Demo boundaries</h2></div>
           <div className="space-y-3">
             {["Razorpay Test Mode only", "Messages remain DRAFT / NOT SENT", "Synthetic evaluation data", "Deterministic guardrails are authoritative"].map((item) => (
-              <div key={item} className="flex items-start gap-3 text-sm text-slate-300"><span className="mt-0.5 text-emerald-300">✓</span><span>{item}</span></div>
+              <div key={item} className="flex items-start gap-3 text-base text-slate-300"><span className="mt-0.5 text-emerald-300">✓</span><span>{item}</span></div>
             ))}
           </div>
         </Card>

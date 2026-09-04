@@ -82,7 +82,7 @@ function CaseHeader({ detail, inspector }: { detail: CaseDetail; inspector: Deci
             <span className="hidden text-slate-700 sm:inline" aria-hidden>•</span>
             <span className="text-slate-400">Selected: <strong className="font-semibold text-blue-200">{actionLabel(chosenAction)}</strong></span>
           </div>
-          <p className="mt-1 max-w-4xl text-xs leading-relaxed text-slate-500">{detail.failure_explanation.category_meaning}</p>
+          <p className="mt-1 max-w-4xl text-sm leading-relaxed text-slate-500">{detail.failure_explanation.category_meaning}</p>
         </div>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500 lg:max-w-96 lg:justify-end">
           <span className="truncate font-mono" title={detail.razorpay_payment_id ?? detail.id}>{detail.razorpay_payment_id ?? "Payment ID unavailable"}</span>
@@ -94,7 +94,7 @@ function CaseHeader({ detail, inspector }: { detail: CaseDetail; inspector: Deci
           <span>{inspector?.policy_mode ? humanize(inspector.policy_mode) : "Baseline"} policy</span>
         </div>
       </div>
-      <div className="border-t border-[#242d3b] bg-[#0e131b] px-4 py-2.5 text-xs leading-relaxed text-slate-400 sm:px-5">
+      <div className="border-t border-[#242d3b] bg-[#0e131b] px-4 py-2.5 text-sm leading-relaxed text-slate-400 sm:px-5">
         <span className="font-semibold text-slate-200">Why it won: </span>{actionReason(chosenAction, detail)}
       </div>
     </Card>
@@ -114,7 +114,7 @@ function DecisionComparison({ inspector }: { inspector: DecisionInspector | null
         <p className="text-xs font-semibold uppercase tracking-[0.14em] text-blue-300">Recovery decision</p>
         <div className="mt-3 rounded-lg border border-dashed border-white/10 px-4 py-6 text-center">
           <div className="text-sm font-medium text-slate-300">No decision recorded yet</div>
-          <div className="mt-1 text-xs text-slate-500">This case has been detected but no recovery action has been selected.</div>
+          <div className="mt-1 text-sm text-slate-500">This case has been detected but no recovery action has been selected.</div>
         </div>
       </section>
     );
@@ -127,7 +127,7 @@ function DecisionComparison({ inspector }: { inspector: DecisionInspector | null
           <p className="text-xs font-semibold uppercase tracking-[0.14em] text-blue-300">Why this action?</p>
           <h2 id="decision-title" className="mt-0.5 text-base font-semibold text-white">Recovery alternatives</h2>
         </div>
-        <span className="text-[11px] text-slate-600">Decision snapshot · {formatDate(inspector.created_at)}</span>
+        <span className="text-2xs text-slate-600">Decision snapshot · {formatDate(inspector.created_at)}</span>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full min-w-[720px] text-left text-xs">
@@ -149,16 +149,16 @@ function DecisionComparison({ inspector }: { inspector: DecisionInspector | null
                 </td>
                 <td className="px-3 py-2.5">
                   {candidate.allowed === false ? (
-                    <div><span className="font-medium text-rose-300">Blocked</span><div className="mt-0.5 max-w-36 text-[11px] text-rose-200/60">{blockedReasonLabel(candidate.blocked_reason)}</div></div>
+                    <div><span className="font-medium text-rose-300">Blocked</span><div className="mt-0.5 max-w-36 text-2xs text-rose-200/60">{blockedReasonLabel(candidate.blocked_reason)}</div></div>
                   ) : candidate.allowed === true ? <span className="font-medium text-emerald-300">Yes</span> : <span className="text-slate-600">Unavailable</span>}
                 </td>
                 <td className="px-3 py-2.5">
                   <span className="font-medium text-slate-200">{candidateRecovery(candidate)}</span>
-                  {candidate.expected_recovered_value != null && <div className="mt-0.5 text-[11px] text-slate-600">{formatRupees(candidate.expected_recovered_value)} expected</div>}
+                  {candidate.expected_recovered_value != null && <div className="mt-0.5 text-2xs text-slate-600">{formatRupees(candidate.expected_recovered_value)} expected</div>}
                 </td>
                 <td className="px-3 py-2.5">
                   {candidate.friction_score != null ? (
-                    <><span className="font-medium text-slate-200">{candidate.friction_score.toFixed(0)}</span>{candidate.friction_penalty != null && <div className="mt-0.5 text-[11px] text-slate-600">{formatRupees(candidate.friction_penalty)} penalty</div>}</>
+                    <><span className="font-medium text-slate-200">{candidate.friction_score.toFixed(0)}</span>{candidate.friction_penalty != null && <div className="mt-0.5 text-2xs text-slate-600">{formatRupees(candidate.friction_penalty)} penalty</div>}</>
                   ) : <span className="text-slate-600">Not available</span>}
                 </td>
                 <td className="px-3 py-2.5 font-medium text-slate-200">{candidate.utility != null ? formatRupees(candidate.utility) : <span className="font-normal text-slate-600">Not scored</span>}</td>
@@ -168,7 +168,7 @@ function DecisionComparison({ inspector }: { inspector: DecisionInspector | null
           </tbody>
         </table>
       </div>
-      <div className="border-t border-[#242d3b] bg-[#0e131b] px-4 py-2.5 text-[11px] leading-relaxed text-slate-500 sm:px-5">
+      <div className="border-t border-[#242d3b] bg-[#0e131b] px-4 py-2.5 text-2xs leading-relaxed text-slate-500 sm:px-5">
         {inspector.is_adaptive ? "Utility includes expected recovery, action cost, and customer friction." : "Baseline ordering is shown; model probabilities are intentionally not scored."}
         {inspector.explanation && <span className="ml-2 text-slate-400">{inspector.explanation}</span>}
       </div>
@@ -206,7 +206,7 @@ function DecisionContext({ detail, environmentMode }: { detail: CaseDetail; envi
       <section className="px-4 py-3.5 sm:px-5" data-testid="guardrail-checklist" aria-labelledby="safety-title">
         <div className="flex items-center justify-between gap-3">
           <h2 id="safety-title" className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Safety</h2>
-          <span className="text-[11px] text-slate-600">Current case state</span>
+          <span className="text-2xs text-slate-600">Current case state</span>
         </div>
         <div className="mt-2 space-y-1">
           {rows.map((row) => (
@@ -223,7 +223,7 @@ function DecisionContext({ detail, environmentMode }: { detail: CaseDetail; envi
       <section className="border-t border-[#242d3b] px-4 py-3.5 sm:px-5" data-testid="provider-truth" aria-labelledby="execution-title">
         <div className="flex items-center justify-between gap-3">
           <h2 id="execution-title" className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Execution</h2>
-          {mode && <span className="text-[11px] font-medium text-slate-500">{mode}</span>}
+          {mode && <span className="text-2xs font-medium text-slate-500">{mode}</span>}
         </div>
         <div className="mt-2.5 space-y-2.5">
           <div className="flex items-start justify-between gap-3">
@@ -252,7 +252,7 @@ function DecisionContext({ detail, environmentMode }: { detail: CaseDetail; envi
 
         <details className="mt-3 border-t border-[#242d3b] pt-2.5 text-xs">
           <summary className="cursor-pointer font-medium text-slate-500 hover:text-slate-300">View provider details</summary>
-          <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-[11px]">
+          <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-2xs">
             <dt className="text-slate-600">Action ID</dt><dd className="truncate font-mono text-slate-400" title={latestAction?.id ?? undefined}>{latestAction?.id ?? "Not available"}</dd>
             <dt className="text-slate-600">Payment Link ID</dt><dd className="truncate font-mono text-slate-400" title={provider.payment_link_id ?? undefined}>{provider.payment_link_id ?? "Not available"}</dd>
             <dt className="text-slate-600">Reference</dt><dd className="truncate font-mono text-slate-400" title={provider.reference_id ?? undefined}>{provider.reference_id ?? "Not available"}</dd>
@@ -281,7 +281,7 @@ function CustomerActivity({ detail }: { detail: CaseDetail }) {
   return (
     <div data-testid="customer-conversation">
       {detail.human_review_reason && (
-        <div className="mb-3 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-xs text-amber-100">
+        <div className="mb-3 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-sm text-amber-100">
           <span className="font-semibold">Safety intervention:</span> untrusted instructions were rejected and recovery was routed to human review.
         </div>
       )}
@@ -289,7 +289,7 @@ function CustomerActivity({ detail }: { detail: CaseDetail }) {
         <section aria-labelledby="customer-messages-title">
           <div className="flex items-center justify-between gap-3">
             <h3 id="customer-messages-title" className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Customer interaction</h3>
-            <span className="text-[11px] text-slate-600">{detail.messages.length} {detail.messages.length === 1 ? "message" : "messages"}</span>
+            <span className="text-2xs text-slate-600">{detail.messages.length} {detail.messages.length === 1 ? "message" : "messages"}</span>
           </div>
           <div className="mt-3 space-y-3">
             {detail.messages.map((message) => {
@@ -297,16 +297,16 @@ function CustomerActivity({ detail }: { detail: CaseDetail }) {
               return (
                 <div key={message.id} className={`flex ${outbound ? "justify-start" : "justify-end"}`}>
                   <div className="max-w-3xl">
-                    <div className={`mb-1 flex items-center gap-2 text-[11px] text-slate-500 ${outbound ? "" : "justify-end"}`}>
+                    <div className={`mb-1 flex items-center gap-2 text-2xs text-slate-500 ${outbound ? "" : "justify-end"}`}>
                       <span className="font-semibold text-slate-300">{outbound ? "RecoveryOS" : "Customer"}</span>
                       {message.status && <span className={message.status === "DRAFT" ? "text-amber-300" : "text-emerald-300"}>{message.status === "DRAFT" ? "Draft · not sent" : stateLabel(message.status)}</span>}
                     </div>
-                    <div className={`rounded-md px-3 py-2.5 text-sm leading-relaxed ${outbound ? "bg-slate-800/70 text-slate-200" : "bg-blue-500/10 text-blue-50"}`}>{message.body}</div>
+                    <div className={`rounded-md px-3 py-2.5 text-base leading-relaxed ${outbound ? "bg-slate-800/70 text-slate-200" : "bg-blue-500/10 text-blue-50"}`}>{message.body}</div>
                   </div>
                 </div>
               );
             })}
-            {detail.messages.length === 0 && <div className="rounded-md border border-dashed border-white/10 px-3 py-3 text-xs text-slate-500">No customer messages for this case.</div>}
+            {detail.messages.length === 0 && <div className="rounded-md border border-dashed border-white/10 px-3 py-3 text-sm text-slate-500">No customer messages for this case.</div>}
           </div>
         </section>
 
@@ -381,15 +381,15 @@ function RecoveryTimeline({ detail }: { detail: CaseDetail }) {
     <div data-testid="recovery-timeline">
       <div className="flex items-end justify-between gap-3">
         <div><p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Recovery timeline</p><h3 className="mt-0.5 text-base font-semibold text-white">Important events</h3></div>
-        <span className="text-[11px] text-slate-600">{detail.timeline.length} audit events retained</span>
+        <span className="text-2xs text-slate-600">{detail.timeline.length} audit events retained</span>
       </div>
       {visible.length > 0 ? (
         <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
           {visible.map((event, index) => (
             <div key={`${event.timestamp}-${index}`} className={`border-l-2 pl-3 ${timelineTone(event)}`}>
-              <div className="text-[11px] font-semibold">{String(index + 1).padStart(2, "0")}</div>
+              <div className="text-2xs font-semibold">{String(index + 1).padStart(2, "0")}</div>
               <div className="mt-1 text-sm font-semibold text-slate-200">{timelineTitle(event)}</div>
-              <div className="mt-1 text-[11px] leading-snug text-slate-600">{formatDate(event.timestamp)}</div>
+              <div className="mt-1 text-2xs leading-snug text-slate-600">{formatDate(event.timestamp)}</div>
             </div>
           ))}
         </div>
@@ -399,8 +399,8 @@ function RecoveryTimeline({ detail }: { detail: CaseDetail }) {
         <div className="mt-3 max-h-80 space-y-1.5 overflow-auto pr-2">
           {detail.timeline.map((event, index) => (
             <div key={`${event.timestamp}-${index}`} className="grid gap-1 rounded-md bg-[#0b1017] px-3 py-2 sm:grid-cols-[145px_1fr] sm:gap-3">
-              <div className="text-[11px] text-slate-600">{formatDate(event.timestamp)}</div>
-              <div><div className="text-xs font-medium text-slate-300">{event.title}</div><div className="mt-0.5 text-[11px] text-slate-500">{event.description}</div></div>
+              <div className="text-2xs text-slate-600">{formatDate(event.timestamp)}</div>
+              <div><div className="text-xs font-medium text-slate-300">{event.title}</div><div className="mt-0.5 text-2xs text-slate-500">{event.description}</div></div>
             </div>
           ))}
         </div>
@@ -419,7 +419,7 @@ function TechnicalDetails({ detail, inspector }: { detail: CaseDetail; inspector
       </div>
       <details className="mt-4 border-t border-[#242d3b] pt-3">
         <summary className="cursor-pointer text-xs font-semibold text-slate-400 hover:text-white">View raw case data</summary>
-        <pre className="mt-3 max-h-80 overflow-auto rounded-lg bg-black/30 p-3 text-[11px] leading-relaxed text-slate-500">{JSON.stringify({ actions: detail.actions, decisions: detail.decisions, provider_truth: detail.provider_truth, payment_events: detail.payment_events, audit_trail: detail.audit_trail, friction: detail.friction, shadow: detail.shadow }, null, 2)}</pre>
+        <pre className="mt-3 max-h-80 overflow-auto rounded-lg bg-black/30 p-3 text-2xs leading-relaxed text-slate-500">{JSON.stringify({ actions: detail.actions, decisions: detail.decisions, provider_truth: detail.provider_truth, payment_events: detail.payment_events, audit_trail: detail.audit_trail, friction: detail.friction, shadow: detail.shadow }, null, 2)}</pre>
       </details>
     </div>
   );

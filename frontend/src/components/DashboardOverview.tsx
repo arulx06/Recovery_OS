@@ -47,7 +47,7 @@ export function DashboardOverview({ data, cases }: { data: DashboardSummary | nu
         <p className="text-sm font-semibold uppercase tracking-[0.16em] text-blue-300">Recovery command center</p>
         <div className="mt-2 flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
           <h1 className="text-3xl font-semibold tracking-tight text-white">Recover revenue without contacting everyone.</h1>
-          <p className="max-w-xl text-sm leading-relaxed text-slate-400">Every failed payment gets a reason, a safety check, and the lowest-friction action that still protects recovery value.</p>
+          <p className="max-w-xl text-base leading-relaxed text-slate-400">Every failed payment gets a reason, a safety check, and the lowest-friction action that still protects recovery value.</p>
         </div>
       </div>
 
@@ -66,7 +66,7 @@ export function DashboardOverview({ data, cases }: { data: DashboardSummary | nu
       {activeWithAction.length > 0 && (
         <div className="flex items-center gap-4 rounded-lg border border-blue-500/20 bg-blue-500/[0.08] px-5 py-3" data-testid="hero-insight">
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-blue-400/15 text-lg text-blue-200">↓</div>
-          <div className="text-sm text-slate-300">
+          <div className="text-base text-slate-300">
             <span className="font-semibold text-white">{noImmediateContact.length} of {activeWithAction.length} active cases</span> with a selected action avoid immediate customer contact, protecting <span className="font-semibold text-blue-200">{formatRupees(protectedRevenue)}</span> with quieter interventions.
           </div>
         </div>

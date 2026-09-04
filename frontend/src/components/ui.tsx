@@ -42,7 +42,7 @@ export function SectionTitle({ children, subtitle }: { children: ReactNode; subt
   return (
     <div className="mb-4">
       <h3 className="text-lg font-semibold tracking-tight text-slate-100">{children}</h3>
-      {subtitle && <p className="mt-1 text-sm leading-relaxed text-slate-400">{subtitle}</p>}
+      {subtitle && <p className="mt-1 text-base leading-relaxed text-slate-400">{subtitle}</p>}
     </div>
   );
 }
@@ -51,7 +51,7 @@ export function EmptyState({ title, description }: { title: string; description?
   return (
     <div className="rounded-lg border border-dashed border-white/10 bg-white/[0.02] px-6 py-10 text-center">
       <div className="text-sm font-medium text-gray-300">{title}</div>
-      {description && <div className="mt-1 text-xs text-gray-500">{description}</div>}
+      {description && <div className="mt-1 text-sm text-gray-500">{description}</div>}
     </div>
   );
 }

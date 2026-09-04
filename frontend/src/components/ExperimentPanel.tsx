@@ -175,7 +175,7 @@ export default function ExperimentPanel() {
           <div>
             <div className="mb-1 text-xs font-medium uppercase tracking-[0.2em] text-cyan-400">Policy decision room</div>
             <h2 className="text-xl font-semibold tracking-tight text-white">Baseline vs adaptive recovery</h2>
-            <p className="mt-1 text-sm text-slate-400">Matched scenarios. Same random outcomes. One auditable policy comparison.</p>
+            <p className="mt-1 text-base text-slate-400">Matched scenarios. Same random outcomes. One auditable policy comparison.</p>
           </div>
           <div className="flex flex-wrap items-end gap-2.5">
             <label className="text-[13px] font-medium text-slate-400">
@@ -238,7 +238,7 @@ export default function ExperimentPanel() {
         {!result && !error && (
           <div className="rounded-xl border border-dashed border-white/10 bg-black/20 px-6 py-12 text-center">
             <div className="text-base font-medium text-slate-200">Ready to compare both policies</div>
-            <p className="mx-auto mt-2 max-w-2xl text-sm leading-relaxed text-slate-500">
+            <p className="mx-auto mt-2 max-w-2xl text-base leading-relaxed text-slate-500">
               Run {count} matched scenarios to compare recovered revenue and customer friction. Every case is auditable in the downloadable CSV.
             </p>
           </div>
@@ -254,7 +254,7 @@ export default function ExperimentPanel() {
                   <h3 className="mt-1 text-2xl font-semibold tracking-tight text-white">
                     {winner ? `${winner} policy won this run` : "The policies tied this run"}
                   </h3>
-                  <p className="mt-1.5 text-[15px] text-slate-300">{buildComparisonStatement(result)}</p>
+                  <p className="mt-1.5 text-base text-slate-300">{buildComparisonStatement(result)}</p>
                 </div>
                 <div className="shrink-0 rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-right">
                   <div className="text-xs uppercase tracking-wider text-slate-500">Adaptive recovered delta</div>
@@ -344,7 +344,7 @@ export default function ExperimentPanel() {
               </button>
             </div>
 
-            <p className="px-1 text-xs leading-relaxed text-slate-600">
+            <p className="px-1 text-sm leading-relaxed text-slate-600">
               Policy utility prices recovery, action cost, and customer friction together. This benchmark validates simulator behavior and utility ordering; controlled production measurement is required to establish lift.
             </p>
           </div>
